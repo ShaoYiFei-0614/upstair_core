@@ -1,0 +1,24 @@
+# 训练/评估产物：全部可以重建，不进版本库
+.venv/
+runs/
+logs/
+configs/
+.generated/
+.tmp/
+
+# 渲染中间产物；交付物 output/gifs/ 要留
+output/stills/
+output/frames/
+output/reports/
+output/exports/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
