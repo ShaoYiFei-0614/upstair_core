@@ -38,9 +38,13 @@ env:
   gait_prior: true           # 在 trot 开环先验之上学残差。**别关**：关掉后六级全 0
                              # （原地站到超时，|a|≈0.09），见 train.md §3.6
   gait_file: artifacts/trot_stairs.json
-  # 观测开关；history_len=1 时每帧 42 + 3 + 1 = 46 维，即观测总量 46 维
+  # 观测开关；history_len=1 时每帧 42 + 3 + 1 = 46 维，即观测总量 46 维。
+  # 46 维每一项都有真机出处（编码器 / IMU / 上一步动作 / 本体感觉估计），
+  # 加上一个标量任务参数 step_height。信息来源清单见 agent.md §8.6。
   obs:
     base_lin_vel_body: true
+    # 必须 false，且**不能**改成 true：这一项是「机身相对正下方地形的高度」，
+    # 含地形真值，会破坏盲走。改成 true 会直接抛 ValueError（ObsConfig.__post_init__）。
     base_height: false
     gait_phase: false
     step_height: true

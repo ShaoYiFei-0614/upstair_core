@@ -123,7 +123,7 @@ upstair_core/
 | `action_scale` | 0.30 rad | 残差的权限；先验走 `GaitParams.action_scale`，**两者独立** |
 | 增益 `kp` / 阻尼 `kd` | `[30, 30, 45]` / `[0.6, 0.6, 0.9]` | 关节 PD，力矩 `tau = kp*(target-q) - kd*qd` 后按 `ctrlrange` 截断；选型依据见下 |
 
-目标角（`robotdog/env.py:544` 的 `_target_from_action()`）：
+目标角（`robotdog/env.py:577` 的 `_target_from_action()`）：
 
 ```python
 target = home + gait_gain * gait.radians(phase) + action_scale * action
@@ -137,7 +137,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 #### `kp` / `kd` 是怎么定的
 
 `kp` / `kd` 是**关节 PD** 的增益（`tau = kp*(target-q) - kd*qd`），每条腿三个（hip / thigh / calf）
-再 `tile(..., 4)` 成 12 维（`robotdog/env.py:155` 附近）。它们不是拍脑袋的，而是按**实测关节惯量**
+再 `tile(..., 4)` 成 12 维（`robotdog/env.py:157` 与 `:172-176`）。它们不是拍脑袋的，而是按**实测关节惯量**
 配到目标带宽与阻尼比上的。用 `mujoco.mj_fullM(model, data, M)`（mujoco 3.12 的签名是
 `mj_fullM(model, data, dst)`）在 `home_qpos` 姿态下取关节空间惯量的对角元 `J`：
 
@@ -164,18 +164,24 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 
 **每帧 42 维固定块 + 按开关追加的块**，再沿时间堆叠 `history_len` 帧：
 
-| 块 | 维度 | 默认 | 内容 |
-| --- | --- | --- | --- |
-| 基础块 | 12 + 12 + 3 + 3 + 12 = **42** | 恒开 | 关节角、关节角速度、机身 roll/pitch/yaw、机身角速度（本地系）、上一帧动作 |
-| `base_lin_vel_body` | 3 | **开** | 机身系线速度 |
-| `base_height` | 1 | 关 | 机身相对其正下方地形的高度 |
-| `gait_phase` | 2 | 关 | 步态时钟的 `sin/cos`（残差策略需要知道自己处在周期哪一点） |
-| `step_height` | 1 | **开** | 本回合的台阶高度（m）—— 唯一直接告诉策略「在哪条楼梯上」的量 |
+| 块 | 维度 | 默认 | 内容 | 真机出处 |
+| --- | --- | --- | --- | --- |
+| 基础块 | 12 + 12 + 3 + 3 + 12 = **42** | 恒开 | 关节角、关节角速度、机身 roll/pitch/yaw、机身角速度（本地系）、上一帧动作 | 关节编码器 + IMU + 自己上一步的指令 |
+| `base_lin_vel_body` | 3 | **开** | 机身系线速度 | 本体感觉估计（腿式里程计） |
+| `base_height` | 1 | **禁止打开** | 机身相对其正下方地形的高度 —— **含地形真值**，改成 `true` 会直接抛 `ValueError` | 无（真机拿不到） |
+| `gait_phase` | 2 | 关 | 步态时钟的 `sin/cos`（残差策略需要知道自己处在周期哪一点） | 内部时钟，无需传感器 |
+| `step_height` | 1 | **开** | 本回合的台阶高度（m）—— 唯一直接告诉策略「在哪条楼梯上」的量 | 任务参数（可随任务下发） |
 
 默认 `frame_size = 42 + 3 + 1 = 46`。**`config.yaml` 现在把 `history_len` 设为 `1`**
 ⇒ 观测就是单帧 **46 维**；`PPO` 与 `policy.py` 的维数全部跟着它走。
 （`history_len = 10` 得 460 维，开 `gait_phase` 得 480 维；实测单帧在课程内不差、
 在 3 cm / 6 cm 上还明显更好，见 `train.md` §3.6。）
+
+**本仓是盲走的**：46 维里没有任何触觉、射线或接触力读数，每一项都能在真机上拿到。
+`base_height` 曾经是「默认关掉的开关」，但它算的是 `base_pos[2] − 机身正下方地形高度`，
+等于把地形真值塞进观测，所以现在被 `ObsConfig.__post_init__` **硬性禁止**，
+`_obs_frame()` 里那条分支与 `_height_reference()` 本身都已删除。
+「哪些量是真值、但只进奖励/终止」的完整清单见 `agent.md` §8.6。
 
 帧约定（与 MuJoCo 一致）：`qpos[0:3]` 世界位置、`qpos[3:7]` 四元数 `(w,x,y,z)`、
 `qvel[0:3]` 世界线速度、**`qvel[3:6]` 是机身本地角速度**（IMU 陀螺直接就是这个）。
@@ -193,7 +199,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 | `torque` | -1.5e-4 | `Σ tau²` |
 | `foot_lift` | +0.9 | 三维足端速度门控（阈值 `foot_lift_gate_speed = 0.25 m/s`）× `clip(离地/目标, 0, 1)`，目标 `= max(0.08, 1.4 × 台阶高)` |
 | `air_time` | +0.6 | 落地那一步逐足结算：`(clip(滞空 - 0.30, 0, ∞) - clip(滞空 - 0.60, 0, ∞))`，再对当步落地的足求和 |
-| `base_height` | -2.0 | 机身高度偏离其正下方地形（**只用于奖励**，与观测开关无关） |
+| `base_height` | -2.0 | 机身高度相对**躯干正下方地形**的平方偏差（**只用于奖励**，与观测开关无关；观测侧的 `base_height` 已被禁止） |
 | `joint_vel` | -2.0e-5 | `Σ qd²` |
 | `action_rate` | -0.02 | `Σ (a - a_prev)²` |
 | `joint_limit` | -0.5 | 关节越限程度 |
@@ -207,7 +213,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 两个关键点：
 
 * **所有奖励数学都在 `robotdog/reward.py`**（纯函数 `compute_reward(env, ...)`），
-  `robotdog/env.py:349` 只留一个三行转发方法。为了便于研究与改动，单看那一个文件就够。
+  `robotdog/env.py:368` 只留一个三行转发方法。为了便于研究与改动，单看那一个文件就够。
 * 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
   （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
   拆解可以安全地相加。

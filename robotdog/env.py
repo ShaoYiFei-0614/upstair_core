@@ -67,11 +67,24 @@ class ObsConfig:
     step_height: bool = True            # 1：本回合的楼梯高度
     base_frame_size: int = 42
 
+    def __post_init__(self) -> None:
+        # 这条不是「默认关掉」，而是**禁止打开**。机身相对正下方地形的高度里含
+        # 地形真值（原实现是 ``base_pos[2] - _height_reference()``，而
+        # ``_height_reference()`` 就是 ``terrain_height_under_base``）。盲走策略
+        # 一旦拿到它就不再是盲走。原来这里只有一行注释，结果它被打开过 ——
+        # 所以改成硬错误，并连带删掉了 `_obs_frame` 里那条分支与
+        # `_height_reference()` 本身。
+        if self.base_height:
+            raise ValueError(
+                "obs.base_height 必须为 false：这一项是『机身相对正下方地形的高度』，"
+                "含地形真值，盲走策略不允许拿到（见 agent.md §8.6 的信息来源清单）。"
+                "要观察离地高度请用本体感知的替代品，或保持 step_height 这一项。"
+            )
+
     @property
     def frame_size(self) -> int:
         extra = 0
         extra += 3 if self.base_lin_vel_body else 0
-        extra += 1 if self.base_height else 0
         extra += 2 if self.gait_phase else 0
         extra += 1 if self.step_height else 0
         return self.base_frame_size + extra
@@ -308,6 +321,10 @@ class Go2StairsEnv(gym.Env):
         """每只足端*表面*与其下方地形之间的间隙（m）。
 
         ``geom_xpos`` 是足端球的球心，所以在与地形高度比较之前必须减去半径。
+
+        **这是特权信息，只进奖励。** 它要和 ``stair.height_at()`` 相减，真机上
+        拿不到这个数值；策略能学到的只是「按 ``step_height`` 这一个可观测量把脚
+        抬够高」这一条相关性。**没有**任何观测项直接等于它。
         """
         feet = self.foot_pos
         return feet[:, 2] - self.meta.foot_radius - self._terrain_height(feet[:, 0])
@@ -330,8 +347,10 @@ class Go2StairsEnv(gym.Env):
         ]
         if obs_cfg.base_lin_vel_body:
             parts.append(self.base_lin_vel_body)
-        if obs_cfg.base_height:
-            parts.append(np.array([self.base_pos[2] - self._height_reference()]))
+        # 注意：这里**故意没有** base_height 分支。它原本是
+        # ``base_pos[2] - _height_reference()``，而 ``_height_reference()`` 就是
+        # 机身正下方的地形高度 —— 那会把地形真值塞进观测。``ObsConfig`` 的
+        # ``__post_init__`` 现在直接禁止打开该开关，所以这条分支已整体删除。
         if obs_cfg.gait_phase:
             theta = 2.0 * np.pi * self.cfg.gait.freq * self._gait_phase
             parts.append(np.array([np.sin(theta), np.cos(theta)]))
@@ -360,7 +379,13 @@ class Go2StairsEnv(gym.Env):
         return base + terminal, terms
 
     def _foot_contact_mask(self) -> np.ndarray:
-        """逐足布尔量：这个足端 geom 此刻是否接触地形？"""
+        """逐足布尔量：这个足端 geom 此刻是否接触地形？
+
+        **信息来源：仿真器的接触真值。** 真机上对应的是「用关节力矩残差 / 电流
+        尖峰估计足端触地」，这是标准的 sim-to-real 做法，所以它不是特权信息 ——
+        但它**只进奖励与腾空时间统计，绝不进观测**（``reward.py`` 的 ``air_time``
+        项与 ``clearance`` 的分布都靠它区分摆动相与支撑相）。
+        """
         foot_ids = [int(g) for g in self.meta.foot_geom_ids]
         terrain = {int(self.meta.floor_geom_id)} | {
             int(g) for g in self.meta.stair_geom_ids
@@ -391,6 +416,9 @@ class Go2StairsEnv(gym.Env):
         ``leg_contact`` —— 髋 / 大腿 / 小腿的碰撞形状在躯干没接触时接触了
         地形。在楼梯上，这几乎总是爬升途中胫部蹭到立面：它每步扣
         ``leg_collision``，但回合继续运行，这正是保留试错的原因。
+
+        **只进奖励与终止判定，不进观测。** 真机上躯干碰地靠 IMU 的冲击尖峰 +
+        关节力矩异常即可检测，级别上等同于一阶故障判据。
         """
         trunk = {int(g) for g in self.meta.trunk_geom_ids}
         legs = {int(g) for g in self.meta.leg_geom_ids}
@@ -439,6 +467,11 @@ class Go2StairsEnv(gym.Env):
 
         与 :meth:`terrain_height_under_base` 相对照，后者是躯干 x 位置的
         阶梯函数。
+
+        **这是特权信息，只服务终止判定。** 它读 ``stair.height_at()``（地形几何
+        真值），真机上要靠高程图或触地估计才能得到；因为只用于「判断摔没摔」，
+        而 RL 的终止信号本来就是上帝视角，所以没有问题 —— 但**绝不能**把它写进
+        ``_obs_frame``。
         """
         heights = [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
         return float(min(heights)) if heights else self.terrain_height_under_base
@@ -453,12 +486,12 @@ class Go2StairsEnv(gym.Env):
         heights = [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
         return float(np.mean(heights)) if heights else self.terrain_height_under_base
 
-    def _height_reference(self) -> float:
-        """``obs.base_height`` 的高度参照面：机身正下方的地形。"""
-        return self.terrain_height_under_base
-
     def _fall_reference_height(self) -> float:
         """摔倒判据用来衡量躯干的地形高度。
+
+        **只用于终止判定，绝不进观测。** 它读 ``stair.height_at()``，即地形几何
+        真值；这在 RL 里是允许的（奖励与终止本来就是「上帝视角」），但一旦被写进
+        ``_obs_frame`` 就不再是盲走。三条分支的存在是为了选一个**帧间连续**的参照：
 
         ``"support"`` 用四足下方最低的地形，那才是真正撑住机器人的那个面；
         *机身*下方的地形是躯干 x 位置的阶梯函数，相邻两帧之间会跳一整个立面，

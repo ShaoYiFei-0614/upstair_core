@@ -572,4 +572,69 @@ mini-batches, there will be a truncated mini-batch of size 256
 **教训**：新增一支脚本的时候，要先问「它**不能**抓什么」。`check_lines.py` 从 CRLF 时代
 就一直在报「是空行」，让人误以为文档行号是有守护的——其实守护的只是「越界」。
 
+---
+
+## 11. 观测的信息来源：`base_height` 从「默认关掉」改成「禁止打开」
+
+### 11.1 症状
+
+`obs.base_height` 一直是 `false`，但它是靠**默认值和一行注释**守住的。实地核对时发现：
+
+```python
+# 旧实现（robotdog/env.py 的 _obs_frame）
+if obs_cfg.base_height:
+    parts.append(np.array([self.base_pos[2] - self._height_reference()]))
+
+def _height_reference(self) -> float:
+    return self.terrain_height_under_base      # = stair.height_at(base_x)
+```
+
+也就是说，只要在 `config.yaml` 里把 `base_height` 改成 `true`，**机身正下方的地形几何
+真值就进了观测**。本仓是盲走（blind locomotion）环境，这不只是「多一个特征」——
+它把任务从「凭本体感觉猜台阶」变成了「直接读出地形高度」，训练出来的策略在真机上
+没有对应的传感器。
+
+### 11.2 真因：约定不是保证
+
+「默认关掉 + 注释说明」是一种**约定**，它只对读注释的人有效。这个开关历史上被打开过
+（`experience.md` §3.3 记录过一次「把它同时接进观测和奖励」的事故），说明约定失效的
+代价是可以真实发生的。凡是「打开了就会破坏前提」的开关，都应该在构造时就拒绝。
+
+### 11.3 修法
+
+1. `ObsConfig.__post_init__` 在 `base_height=True` 时**直接抛 `ValueError`**，错误信息
+   说明它为什么含真值、以及正确的替代做法（保持 `step_height`）。
+2. 删除 `_obs_frame()` 里那条分支，并删除 `_height_reference()` 本身 —— 让
+   「往观测里塞地形真值」**在结构上不可能**，而不只是「被禁止」。
+3. `robotdog/policy.py` 的 `_obs_config_for_dim()`（按观测维度反推开关组合）把
+   `base_height` 从枚举里去掉：任何会打开它的组合都不可构造。副作用是旧维数
+   474 反推不出来（返回 `None` 而不是崩），这是刻意的——那些归档 checkpoint 本来
+   就与本仓 46 维观测不兼容。
+4. `config.yaml` 的注释从「观测开关」升级为「**必须 false，且不能改成 true**」。
+
+### 11.4 顺带做的一次全面审计（结论要保留）
+
+把 `Go2StairsEnv` 里每个「看起来可能引入额外信息」的判断都过了一遍：
+
+| 量 | 真值来源 | 进观测吗 | 结论 |
+| --- | --- | --- | --- |
+| `_contact_flags()` | MuJoCo 接触对（躯干/腿 × 地形） | 否，只进奖励与终止 | 可接受 |
+| `_foot_contact_mask()` | MuJoCo 接触对（足端 × 地形） | 否，只进 `air_time` 奖励与腾空统计 | 可接受（真机有标准等价估计：力矩残差 / 电流尖峰 / IMU 冲击） |
+| `_support_height()` / `_support_height_mean()` | `stair.height_at()` 地形几何 | 否，只进摔倒判据 | **特权信息**，但终止信号本来就是上帝视角，允许 |
+| `foot_clearance` | 足端位置 − 地形高 | 否，只进 `foot_lift` 奖励 | **特权信息**，策略只能学到「按 `step_height` 抬够高」的相关性 |
+| `base_height`（观测） | `terrain_height_under_base` | **是** | ⭐ 破坏盲走，已删除并禁止 |
+
+结论：**只有 `base_height` 一项真正破坏了盲走前提**，其余四项都是「真值只进奖励/终止」
+的标准做法。46 维观测逐项都能落到真机传感器上（编码器 / IMU / 上一步动作 / 本体感觉），
+唯一非传感器项是标量任务参数 `step_height`。
+
+### 11.5 教训
+
+* **「默认关掉」不等于「不会开」。** 破坏性开关要用 `__post_init__` 报错封死，并且把
+  实现路径一并删掉——留着代码就是留着被重新接上的可能。
+* 审计「一个方法是否引入了额外信息」时，要区分两件事：**它读了什么**（可能是真值）与
+  **它去了哪里**（观测 / 奖励 / 终止）。本仓允许读真值做奖励与终止，只禁止进观测。
+* 这类审计是一次性的判断题，**不会**被任何自动检查器抓到（就像 §10 的行号漂移）。
+  所以结论要写进文档，而不是只留在当次对话里。
+
 

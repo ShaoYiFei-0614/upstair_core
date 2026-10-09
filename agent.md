@@ -234,7 +234,11 @@ RESULT: ALL CHECKS PASSED
 ### 8.1 观测
 
 * 当前 `config.yaml`：`history_len: 1` ⇒ **46 维**（每帧 46，`base_frame_size=42` + `base_lin_vel_body` 3 + `step_height` 1）。
-* 观测是**盲走**的：没有任何触觉、射线或接触力读数。模块里连 import 都没有。
+* 观测是**盲走**的：46 维全部有真机出处（关节编码器 / IMU / 上一步动作 /
+  本体感觉估计）+ 一个标量任务参数 `step_height`；没有触觉、没有射线、没有接触力读数。
+  逐项出处与「哪些量是真值但只进奖励」见 §8.6。
+* **`obs.base_height` 被硬性禁止**（`ObsConfig.__post_init__` 抛 `ValueError`）：
+  它含地形真值。见 §8.6。
 * **单帧（46 维）不亏**：课程内每级都不差，3 cm 62% → 92%、6 cm 0% → 22%；课程外
   3 cm / 5 cm 都是 100%（10 帧基准是 50% / 0%）。50 Hz 下相邻帧几乎相同，10 帧绝大部分冗余。
   代价是失去帧内的隐式速度信息。
@@ -287,6 +291,47 @@ RESULT: ALL CHECKS PASSED
 * `robotdog/training.py` 的 `load_policy()` **会把 `*_vecnormalize.pkl` 装回模型自带的
   `VecNormalize`**。曾经没装，导致 `model.get_env()` 评估等于喂未归一化观测，
   与 `play.py` 结论相反。**新增任何评估路径都要走 `load_policy()`，不要自己搭。**
+
+### 8.6 策略能看到什么、看不到什么（信息来源清单）
+
+本仓是**盲走**的。任何人碰 `_obs_frame()` / `reward.py` / `_fall_reference_height()`
+之前，先看这张表 —— 「这个量是真机拿得到的吗」是本仓最容易悄悄搞错的一件事。
+
+**`_obs_frame()` 里的 46 维，逐项都有真机出处：**
+
+| 观测块 | 维 | 真机出处 |
+|---|---|---|
+| `joint_pos` | 12 | 关节编码器 |
+| `joint_vel` | 12 | 编码器微分 |
+| `base_rpy` | 3 | IMU 姿态（重力对齐） |
+| `base_ang_vel_body` | 3 | IMU 陀螺 |
+| `_last_action` | 12 | 上一步自己下发的指令 |
+| `base_lin_vel_body` | 3 | 本体感觉估计（腿式里程计） |
+| `step_height` | 1 | **任务参数，不是传感器读数** |
+
+`step_height` 是唯一一个非传感器项，但它是**标量任务参数**：真机上可以随任务下发
+（「现在爬 8 cm 的楼梯」），所以可接受。它**不含**「下一级立面在哪」。
+
+**五个使用真值、但只进奖励/终止、绝不进观测的量**（这是允许的：奖励与终止本来就
+是上帝视角；**一旦写进 `_obs_frame` 就破坏盲走**）：
+
+| 量 | 真值来源 | 只被谁用 |
+|---|---|---|
+| `_contact_flags()` | MuJoCo 接触对（躯干/腿 × 地形） | `body_collision` / `leg_collision` 奖励、`_terminated` |
+| `_foot_contact_mask()` | MuJoCo 接触对（足端 × 地形） | `air_time` 奖励、腾空时间统计 |
+| `_support_height()` | `stair.height_at()` 地形几何 | `_fall_reference_height()` → `_terminated` |
+| `_support_height_mean()` | 同上 | 同上（可选分支） |
+| `foot_clearance` | 足端位置 − 地形高 | `foot_lift` 奖励 |
+
+接触类两项在真机上有标准的等价估计（关节力矩残差 / 电流尖峰 / IMU 冲击），
+属于可接受的 sim-to-real 折衷；**地形几何类三项（`foot_clearance`、两个
+`_support_height*`）是真特权信息**，策略只能学到「按 `step_height` 抬够高」
+这条相关性，拿不到逐点地形。
+
+**`obs.base_height` 现在是硬错误**（`ObsConfig.__post_init__` 抛 `ValueError`）。
+它原来的实现是 `base_pos[2] - _height_reference()`，而 `_height_reference()` 就是
+`terrain_height_under_base` —— 直接把地形真值塞进观测。该分支与
+`_height_reference()` 本身都已删除。**不要再把它加回来。**
 
 ---
 

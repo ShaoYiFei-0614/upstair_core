@@ -23,7 +23,7 @@
 * **不含闭环**：不读 qpos/qvel、不做平衡、不知道台阶，相位纯由外部累加的时间 `t` 决定；
 * 不做 PD 控制、不写 `mjData`、不碰 MuJoCo；
 * 不决定「先验开不开」——`gait_prior` / `gait` / `gait_gain` 都是 `EnvConfig` 的字段，
-  `_gait_action()`（`robotdog/env.py:660-668`）才决定要不要用它；
+  `_gait_action()`（`robotdog/env.py:567-575`）才决定要不要用它；
 * 不决定观测里有没有步态时钟——那是 `ObsConfig.gait_phase`（`robotdog/env.py:65`）；
 * **不做相位随机化**：`gait_phase_randomize` 字段已从 `EnvConfig` 删除，
   `reset()` 里 `_gait_t = _gait_phase = 0.0` 是固定值（`robotdog/env.py:651-652`）。
@@ -47,7 +47,7 @@
 **被否决的方案**：把先验做成一个隐藏的闭环控制器（如相位驱动的足端 IK）。否决原因——
 那条路会让「策略学到什么」不可解释，而且先验变成不可检查的黑盒；本模块的先验是一条
 可打印、可存 JSON、可离线重现的**轨迹**。`EnvConfig.gait_prior` 默认 `False`
-（`robotdog/env.py:144`），所以「纯残差、无先验」的朴素形式依然可用；
+（`robotdog/env.py:157`），所以「纯残差、无先验」的朴素形式依然可用；
 而 `config.yaml` 的 `env.gait_prior` 默认 `true`，训练侧默认是**开**先验的
 （`robotdog/config.py:159-171`；CLI 不再有 `--gait-prior` 开关）。
 
@@ -70,7 +70,7 @@ target = home + gait_gain * gait.radians(t) + action_scale * action
 ```
 
 `gait.action_scale` 说「先验动作多大」（它是搜索出来的一部分），
-`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:544`）。
+`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:577`）。
 `gait_gain` 默认 `1.0` 且**没有 CLI 开关**，只能改 `cfg`。
 
 **被否决的方案**：共用一个 `action_scale`（先验与策略同权）。否决原因就是上面那条实测：
@@ -204,7 +204,7 @@ _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
 
 ```
 EnvConfig()
-  → field(default_factory=GaitParams.default_trot)          # robotdog/env.py:144
+  → field(default_factory=GaitParams.default_trot)          # robotdog/env.py:157
     → GaitParams.from_dict(dict(_FALLBACK_TROT))            # robotdog/gait.py:165-167
       → cls(**kw).normalize()
 ```
@@ -350,7 +350,7 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   所以现在这个坑在结构上不会发生 —— 但「先验越强，别让策略少学」这句话仍然成立。
 * `experience.md` §3.4 —— 残差策略不知道自己处在步态周期的哪一点：叠加在周期先验上
   的残差策略若无法判断相位就不可能是最优的，修法是 `ObsConfig.gait_phase`
-  （sin/cos 两维）。实现就在 `robotdog/env.py:377-379`。
+  （sin/cos 两维）。实现就在 `robotdog/env.py:354-356`。
 * 先验自身的标定数字（在平地、确定性 reset、零动作噪声下用真实 `Go2StairsEnv` 测）：
   `default_trot()` 速度目标 0.550 m/s、8 s 走 4.39 m、100% 存活、机身高度 0.268 m。
   （`fast_trot()` 的 1.702 m/s、6 s 走 10.19 m 是同批标定的另一半，但该 classmethod
@@ -391,7 +391,7 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   `ValueError: {path} has no 'top' entries` 或 `IndexError` 上炸掉。
 * **两个 `action_scale` 同名但不同义**：`GaitParams.action_scale`（出货值 `1.0`）是
   「先验幅度」，`EnvConfig.action_scale`（`0.30`）是「策略权限」。源码里没有任何一处把
-  两者相加或相乘后再 clip；真实实现（`robotdog/env.py:544-562`）是
+  两者相加或相乘后再 clip；真实实现（`robotdog/env.py:577`）是
   `target = clip(home + gait_gain*gait.radians(t) + cfg.action_scale*action, act_low, act_high)`
   ——clip 的是最终关节目标（用 MJCF 关节限位），没有「先求和再 clip 到 ±1」这一步。
   `grep "action_scale"` 会同时命中两处，对账时注意区分。以代码为准。

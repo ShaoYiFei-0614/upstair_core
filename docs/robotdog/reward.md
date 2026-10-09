@@ -50,7 +50,7 @@ def _compute_reward(self, action, trunk_contact, foot_contact=None,
 代价是明细里看不出「原始量有多大」，但那个量在 `info` 里另有一份
 （`base_x` / `forward_vel` / `roll` / `pitch` / `base_z` …）。
 
-**实测**：`robotdog/env.py:349` 的转发方法返回的 `terms` 与
+**实测**：`robotdog/env.py:368` 的转发方法返回的 `terms` 与
 `robotdog/reward.py` 的 `compute_reward()` 的 `terms` 有 14 个共同键；`info["reward_terms"]` 再补一个
 `"terminal"`，共 **15 键**。
 
@@ -153,14 +153,14 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
 ## 5. 内部结构与数据流
 
 ```
-robotdog/env.py:564  step()
-    │  物理推进 decimation 次（env.py:566-574）
+robotdog/env.py:597  step()
+    │  物理推进 decimation 次（env.py:599-607）
     │  trunk_contact, leg_contact = _contact_flags()          env.py:384
     │  foot_contact = _foot_contact_mask()                    env.py:362
     │  terminated, truncated = _terminated(...)               env.py:474
     │  if _success_reached(): _reached_top = True             env.py:242
     ▼
-robotdog/env.py:349  _compute_reward(..., terminated=terminated)
+robotdog/env.py:368  _compute_reward(..., terminated=terminated)
     ▼
 robotdog/reward.py:83  compute_reward(env, action, trunk_contact,
                                       foot_contact, leg_contact, terminated)
@@ -174,10 +174,10 @@ robotdog/reward.py:83  compute_reward(env, action, trunk_contact,
     ▼
 return (sum(terms.values()), terms, terminal)
     ▼
-robotdog/env.py:349  terms["terminal"] = terminal
+robotdog/env.py:368  terms["terminal"] = terminal
                      return base + terminal, terms
     ▼
-robotdog/env.py:564  reward, terms = ...；_advance_foot_air_time(foot_contact)   env.py:377
+robotdog/env.py:597  reward, terms = ...；_advance_foot_air_time(foot_contact)   env.py:402
                      info["reward_terms"] = terms
 ```
 
