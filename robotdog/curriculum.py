@@ -24,7 +24,7 @@ from typing import Any, Sequence
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
-from robotdog.terrain import StairSpec, demo_stairs_spec, flat_spec
+from robotdog.tools.terrain import StairSpec, demo_stairs_spec, flat_spec
 
 # --------------------------------------------------------------------------- #
 # Stage definition

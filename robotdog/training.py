@@ -27,8 +27,8 @@ from stable_baselines3.common.vec_env import (
 )
 
 from robotdog.env import EnvConfig, Go2StairsEnv
-from robotdog.paths import RUNS_DIR
-from robotdog.terrain import StairSpec
+from robotdog.tools.paths import RUNS_DIR
+from robotdog.tools.terrain import StairSpec
 
 # --------------------------------------------------------------------------- #
 # Vectorised environment
@@ -354,7 +354,7 @@ def env_config_from_run(run_dir: str | Path) -> EnvConfig:
     from dataclasses import fields as _fields
 
     from robotdog.env import ObsConfig, RewardConfig
-    from robotdog.touch import TouchConfig
+    from robotdog.tools.touch import TouchConfig
 
     summary_path = Path(run_dir)
     if summary_path.is_dir():

@@ -40,8 +40,8 @@ from robotdog.go2_model import (
     quat_to_mat,
     quat_to_rpy,
 )
-from robotdog.terrain import StairSpec, build_terrain_xml
-from robotdog.touch import (
+from robotdog.tools.terrain import StairSpec, build_terrain_xml
+from robotdog.tools.touch import (
     TouchConfig,
     TouchReading,
     TouchSensor,

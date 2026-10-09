@@ -44,14 +44,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import robotdog  # noqa: F401  (installs the UTF-8 console wrapper)
-from robotdog import paths
+from robotdog.tools import paths
 from robotdog.env import Go2StairsEnv
 from robotdog.evaluate import (
     randomized_terrains,
     trained_terrains,
     unseen_terrains,
 )
-from robotdog.png import downscale, write_png
+from robotdog.tools.png import downscale, write_png
 from robotdog.render import (
     RenderOptions,
     contact_sheet,
@@ -61,7 +61,7 @@ from robotdog.render import (
     save_frames,
     save_gif,
 )
-from robotdog.terrain import StairSpec, flat_spec
+from robotdog.tools.terrain import StairSpec, flat_spec
 from robotdog.training import env_config_for_model, format_duration
 
 
@@ -275,7 +275,7 @@ def render_compare(model_path: Path, vn_path: Path, stair: StairSpec, name: str,
     先验往往在几秒内摔下去，策略则继续向上爬。
     """
     from scripts.eval import SingleEnvPredict, load_policy
-    from robotdog.png import hstack
+    from robotdog.tools.png import hstack
 
     cfg = env_config_for_model(model_path)
     model, venv = load_policy(model_path, vn_path, device=args.device, cfg=cfg)

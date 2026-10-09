@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 import mujoco
 import numpy as np
 
-from robotdog.terrain import TERRAIN_GEOM_GROUP
+from robotdog.tools.terrain import TERRAIN_GEOM_GROUP
 
 #: ``geomgroup`` argument for ``mj_ray``: enable the terrain group only.
 TERRAIN_GEOM_MASK = np.array(
@@ -79,8 +79,12 @@ class TouchConfig:
     probe_range_obs: float = 1.20  # m, distance normalisation for the obs
     # --- foot tactile ------------------------------------------------------ #
     force_norm_ref: float = 75.0  # N, per-foot force that saturates the obs
-    impact_force_target: float = 95.0  # N, hard-landing threshold
-    slip_safe: float = 0.55  # tangential/normal ratio that costs nothing
+    #: Thresholds that only the *reward* consumes live in
+    #: :class:`robotdog.env.RewardConfig` (``touch_impact_target`` /
+    #: ``touch_slip_safe``), which is where the penalty is actually computed.
+    #: These two copies are unused leftovers; editing them changes nothing.
+    impact_force_target: float = 95.0  # N, hard-landing threshold (unused copy)
+    slip_safe: float = 0.55  # tangential/normal ratio that costs nothing (unused copy)
     slip_loaded_force: float = 10.0  # N, below this a foot is not "loaded"
     slip_max: float = 8.0  # cap on the tangential/normal ratio (see feet())
     riser_max_normal_z: float = 0.60  # |n_z| below this == a vertical face
@@ -100,8 +104,7 @@ class TouchReading:
         default_factory=lambda: np.zeros(4, dtype=bool))
     riser_graze: np.ndarray = field(
         default_factory=lambda: np.zeros(4, dtype=bool))
-    #: a downhill-facing ray normal at the contact (0 = flat tread, 1|numeric)
-    probe_hit: bool = False
+    probe_hit: bool = False  # vertical fan found a tread above the one under the base
     probe_range: float = 0.0  # horizontal distance to the step (m)
     probe_height_ahead: float = 0.0  # terrain height at the first rising ray (m)
     probe_step: float = 0.0  # rise of the NEAREST step (m, clipped)
@@ -134,12 +137,15 @@ class TouchReading:
         ``rise``      -- ``clip(step / probe_step_clip, 0, 1)``; how tall the
                          obstacle ahead is relative to the tallest step the robot
                          is ever expected to climb.
-        ``proximity`` -- ``1`` when the obstacle is at the sensor, ``0`` at (or
-                         beyond) ``probe_range_obs``.  Measured **from the cast
-                         origin**, not from the base: the sensor sits
-                         ``probe_forward`` in front of the torso, so a
+        ``proximity`` -- ``1 - clip(ahead_of_sensor / probe_range_obs, 0, 1)``,
+                         i.e. ``1`` at the sensor and ``0`` at (or beyond)
+                         ``probe_range_obs`` = 1.20 m **in front of the
+                         rangefinder**.  The distance used is deliberately
+                         sensor-relative (``probe_range`` minus
+                         ``probe_forward`` = 0.34 m), not base-relative: a
                          base-relative distance could never fall below that
-                         offset and the term would saturate at ~0.45.
+                         0.34 m offset, so the ramp would saturate early and
+                         stop discriminating close obstacles.
         ``hit``       -- the vertical fan found a tread that stands at least
                          ``probe_rise_eps`` above the one under the base.
         """

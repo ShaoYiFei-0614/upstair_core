@@ -15,7 +15,7 @@ file directory to resolve against.
 
 Mesh assets and non-ASCII paths
 -------------------------------
-This workspace lives at ``D:\\项目\\RobortDog\\upstair``. MuJoCo's asset reader
+This workspace lives at ``D:\\项目\\RobortDog\\upstair_core``. MuJoCo's asset reader
 resolves narrow (``const char*``) filenames through the Windows ANSI codepage,
 so pointing ``meshdir`` at a Chinese path fails with::
 
@@ -38,8 +38,8 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from robotdog.paths import GO2_ASSETS_DIR, GO2_XML
-from robotdog.terrain import TERRAIN_GEOM_GROUP
+from robotdog.tools.paths import GO2_ASSETS_DIR, GO2_XML
+from robotdog.tools.terrain import TERRAIN_GEOM_GROUP
 
 # --------------------------------------------------------------------------- #
 # Go2 constants (mirrored from models/unitree_go2/go2.xml, verified at load)
@@ -240,7 +240,7 @@ def default_floor_geom(z: float = 0.0, size: float = 60.0) -> str:
     """A textured infinite plane at height ``z``.
 
     The plane carries ``group=TERRAIN_GEOM_GROUP`` so that the forward
-    rangefinder in :mod:`robotdog.touch` sees the ground but never the robot.
+    rangefinder in :mod:`robotdog.tools.touch` sees the ground but never the robot.
     Pick that group with care -- MuJoCo hides groups 3-5 by default, so a bad
     choice makes the whole world vanish from the renders.
     """
@@ -420,7 +420,7 @@ def compile_scene(
         model = mujoco.MjModel.from_xml_string(xml, assets=go2_assets())
     except Exception as exc:  # surface the generated XML for debugging
         if write_to is None:
-            from robotdog.paths import GENERATED_DIR
+            from robotdog.tools.paths import GENERATED_DIR
 
             GENERATED_DIR.mkdir(parents=True, exist_ok=True)
             dump = GENERATED_DIR / "failed_scene.xml"

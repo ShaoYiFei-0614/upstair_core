@@ -16,8 +16,9 @@ Layouts (walking direction is +x)
 ``pyramid`` : flat ground -> n_up risers -> flat crest -> n_down risers -> ground.
               This directly provides both 上楼 and 下楼 without needing a pit.
 
-The analytic height profile is exposed through :func:`height_at` so that reward
-terms, spawn placement and evaluation metrics all agree with the geometry.
+The analytic height profile is exposed through :meth:`StairSpec.height_at` so
+that reward terms, spawn placement and evaluation metrics all agree with the
+geometry.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ DEFAULT_EDGE_RGBA = "0.95 0.72 0.15 1"
 
 #: MuJoCo geom group reserved for terrain (stairs **and** the ground floor).
 #:
-#: The forward rangefinder in :mod:`robotdog.touch` must be able to look ahead
+#: The forward rangefinder in :mod:`robotdog.tools.touch` must be able to look ahead
 #: without hitting the robot's own front legs, which sweep exactly through the
 #: probed volume.  ``mj_ray`` takes a *geom group mask*, so putting all terrain
 #: geometry in one dedicated group and casting with a mask that enables only
@@ -143,7 +144,7 @@ class StairSpec:
         """Return ``[(name, (cx, cy, cz), (hx, hy, hz)), ...]`` for every block.
 
         The full staircase is emitted front-to-back so that the raycast and the
-        analytic profile in :func:`height_at` line up exactly.
+        analytic profile in :meth:`StairSpec.height_at` line up exactly.
         """
         blocks: list[tuple[str, tuple[float, float, float],
                            tuple[float, float, float]]] = []
@@ -201,7 +202,7 @@ class StairSpec:
         """MJCF ``<geom>`` elements for the whole staircase.
 
         Every block is stamped with :data:`TERRAIN_GEOM_GROUP`.  That is what
-        lets the forward rangefinder in :mod:`robotdog.touch` cast a ray that is
+        lets the forward rangefinder in :mod:`robotdog.tools.touch` cast a ray that is
         blind to the robot's own legs -- the robot's geoms sit in groups 2 and
         3.  Geom groups have no effect on physics, but they *do* decide whether
         the block is rendered at all, so see the constant's docstring before

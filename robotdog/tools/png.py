@@ -1,8 +1,11 @@
 """Minimal dependency-free PNG writer.
 
-The sandbox has no Pillow and installing one just to dump a frame is wasteful,
-so this module hand-rolls the PNG container (zlib + struct only).  It is shared
-by the verification scripts, the evaluation CLI and any future video export.
+Pillow *is* installed (``robotdog/render.py`` uses it for the GIF container and
+the HUD), but this writer deliberately does not use it: dumping a frame from the
+evaluation CLI or a verification script should not drag in an imaging library,
+and a raw 8-bit RGB dump needs nothing beyond ``zlib`` + ``struct``.  So
+``render.py`` keeps two separate paths -- :func:`save_frames` writes PNGs
+through this module, while the animated GIF goes through Pillow.
 
 ``write_png`` handles truecolour 8-bit RGB only, which is exactly what
 ``mujoco.Renderer`` returns.

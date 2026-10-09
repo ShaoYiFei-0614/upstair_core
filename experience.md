@@ -17,7 +17,7 @@
 * **根因**：顶层平台与最后一级踏面共面时，两个 box 沿最小穿透轴反向推脚，
   z 向没有支撑 ⇒ 脚被夹在接缝里。实测 8 cm×8 上两只前脚冻结在
   `x = 5.500 == up_end_x`，持续 700 步，离终点只差 0.114 m。
-* **修法**：`robotdog/terrain.py` 的 `CREST_SEAM_OVERLAP = 1.0`（单位：踏面），
+* **修法**：`robotdog/tools/terrain.py` 的 `CREST_SEAM_OVERLAP = 1.0`（单位：踏面），
   顶层平台向最后一级回伸一个踏面。
 * **效果**：修后 8 cm 从 1/10 → 8/10；9.0 cm 从 0% → 65%。**[原项目]**
 
@@ -41,7 +41,7 @@
 
 * **现象**：爬高台阶时无故判死。
 * **根因**：老判据的高度参照是「机身 x 处的**单点**地形高」
-  （`terrain.py` 的 `height_at`，阶跃函数）。机身跨过立面的一瞬间参考面跳整整
+  （`robotdog/tools/terrain.py` 的 `height_at`，阶跃函数）。机身跨过立面的一瞬间参考面跳整整
   一个台阶高：实测样本 `base_x=1.503 → Δref=+0.1100` 紧接着
   `base_x=1.491 → Δref=-0.1100`，逐帧翻转。
 * **修法**：`terminate_height_ref="support"`（改用四足足下最低地形高）。
@@ -377,3 +377,71 @@
   脚可以抬得很高却落在立面前，照样拿满分。**它可能在奖励一个与任务无关的量**，
   并且与参考奖励同时生效时把稳定的策略推离了工作点。
 * **处理**：没有去调权重让它好看。这条与 §6.4 指向同一件事。
+
+---
+
+## 7. 文档化阶段翻出来的源码级缺陷
+
+给每个模块写设计文档时被迫逐行核对源码，翻出下面几条**源码自身有问题**的地方
+（与奖励/观测设计无关，属于实现与注释/调用不符）。全部已修，修完都通过了
+`.tmp/verify_redirect.py`（证明除该处外没有附带的可执行改动）。
+
+### 7.1 `randomized_terrains()` 必然抛异常（真实崩溃，非文档问题）
+
+`robotdog/evaluate.py` 的 `randomized_terrains()` 把模块级函数当方法调用：
+
+```python
+spec = rand.sample_spec(rng)      # 错
+```
+
+`sample_spec` 在 `robotdog/tools/terrain.py` 里是**模块级**函数
+（`sample_spec(rng, rand, base=None)`），`TerrainRandomization` 上并没有这个方法：
+
+```
+AttributeError: 'TerrainRandomization' object has no attribute 'sample_spec'
+```
+
+**默认路径不会炸**（`all_terrains()` 只有在 `include_random > 0` 或
+`only == "random"` 时才会走到这里），所以它一直没被发现。触发它的是
+`scripts/eval.py` 的 `--n-random > 0` / `--only random`，以及
+`scripts/render_checkpoint.py` 的 `--random-terrains`。修法：
+
+```python
+from robotdog.tools.terrain import (..., sample_spec)
+spec = sample_spec(rng, rand)
+```
+
+**教训**：模块级函数被搬进子包并改名时，`obj.method()` 这种调用点不会被任何
+静态检查抓到（它语法正确、只在运行到那一行时才炸）。测过
+`scripts/eval.py --only random --n-random 3 --episodes 1`，修前抛异常、修后
+3/3 成功。
+
+### 7.2 注释与实现不符（4 处）
+
+| 位置 | 注释说的 | 实际是 |
+| --- | --- | --- |
+| `robotdog/gait.py:19` | `home + action_scale * clip(a_policy + a_gait, -1, 1)` | `home + gait_gain * gait.radians(t) + action_scale * action`，且只 clip 到 MJCF 关节限位，**不 clip ±1** |
+| `robotdog/tools/terrain.py:19,146` | `:func:` 引用 `height_at` | 它是 `StairSpec` 的**方法**，不是模块级函数 |
+| `robotdog/tools/png.py:3` | 「The sandbox has no Pillow」 | Pillow **装了**，`render.py` 的 GIF/HUD 就在用；`png.py` 不依赖它是**设计选择**，不是环境限制 |
+| `robotdog/tools/touch.py` `probe_obs` | proximity「saturate at ~0.45」 | 用的是 `ahead_of_sensor()`（已减 `probe_forward`），按 `probe_range_obs=1.20` 算上限是 `0.34/1.20 ≈ 0.283` |
+
+另外两条应删的残留：`TouchReading.probe_hit` 上方挂着一句描述「downhill-facing
+ray normal」的错位注释（不描述任何字段）；`TouchConfig.impact_force_target` /
+`slip_safe` 是**从不被读取的死常量** —— 真正生效的是
+`RewardConfig.touch_impact_target` / `touch_slip_safe`（同值的另一份副本），
+改 `TouchConfig` 那两个字段没有任何效果。
+
+### 7.3 已知但**故意不改**的注释
+
+* `robotdog/go2_model.py` 声称 `HOME_JOINT_ANGLES` 来自 `go2.xml` 的
+  `<keyframe name="home">` 且「verified at load」：vendored XML 里其实是
+  `<keyframe><key name="home" qpos="…"/></keyframe>`（`<keyframe>` 无 name
+  属性），并且 `extract_meta()` **从不读 keyframe**，`home_qpos` 完全由硬编码
+  常量构造、没有运行期校验。改成「读 keyframe + 校验」会改变 `home_qpos` 的
+  取值，从而改变 reset 与所有已训权重的前提 ⇒ 只记录，不动。
+* `extract_meta()` 的 `floor_geom_id` 用 `mj_name2id` 且**不检查 `< 0`**（其余 id
+  都走 `_resolve_id` 抛 `KeyError`）；`_OPTION` 正则只认自闭合 `<option .../>`，
+  改成非自闭合会**静默失效**。
+* `scripts/verifications/step11_touch.py`（被 `tools/terrain.py` / `tools/touch.py` 引为回归
+  断言）与 `scripts/search_trot.py`（被 `gait.py` 引为先验的搜索脚本）在本仓都
+  **不存在** —— 它们属于完整仓的历史脚本。引用按历史留痕处理。

@@ -30,7 +30,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import robotdog  # noqa: F401  (installs the UTF-8 console wrapper)
-from robotdog import paths
+from robotdog.tools import paths
 from robotdog.env import EnvConfig, Go2StairsEnv
 from robotdog.evaluate import (
     all_terrains,
@@ -144,7 +144,7 @@ def load_policy(model_path: Path, vn_path: Path, device: str = "cpu",
     ``--obs-foot-height --obs-base-height`` 训练的模型是 490 维, 而 ``EnvConfig()``
     默认 420 维, 用默认配置加载会抛 ``ValueError: Observation spaces do not match``。
     """
-    from robotdog.terrain import flat_spec
+    from robotdog.tools.terrain import flat_spec
 
     if cfg is None:
         cfg = EnvConfig()
@@ -213,7 +213,7 @@ def render_video(
     MuJoCo Renderer), and every PNG is written with the dependency-free
     ``write_png`` helper.
     """
-    from robotdog.png import downscale, hstack, write_png
+    from robotdog.tools.png import downscale, hstack, write_png
 
     env = Go2StairsEnv(stair=spec, cfg=cfg, seed=seed)
     max_steps = max_steps or int(env.cfg.episode_length_s / env.cfg.control_dt)

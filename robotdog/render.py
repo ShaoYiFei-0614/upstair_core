@@ -28,8 +28,8 @@ from typing import Any, Protocol, Sequence
 import numpy as np
 
 from robotdog.env import Go2StairsEnv
-from robotdog.png import downscale, hstack, write_png
-from robotdog.terrain import StairSpec
+from robotdog.tools.png import downscale, hstack, write_png
+from robotdog.tools.terrain import StairSpec
 
 __all__ = [
     "RenderOptions",
@@ -316,7 +316,7 @@ def overlay_hud(frame: np.ndarray, lines: Sequence[str], *,
 
 def save_frames(directory: str | Path, frames: Sequence[np.ndarray],
                 *, prefix: str = "f", downscale_factor: int = 1) -> list[Path]:
-    """Write every frame as a dependency-free PNG (see :mod:`robotdog.png`)."""
+    """Write every frame as a dependency-free PNG (see :mod:`robotdog.tools.png`)."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []

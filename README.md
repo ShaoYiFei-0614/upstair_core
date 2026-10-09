@@ -56,18 +56,19 @@ python -m venv .venv
 
 ```
 robotdog\
-    paths.py       所有路径常量（工作区 = 本仓根目录）
-    terrain.py     楼梯地形（解析式高度场 height_at(x) + MuJoCo 几何体）
-    go2_model.py   组装 Go2 MJCF（字符串手术 + 场景编译）
-    gait.py        trot 步态先验（GaitParams）
-    touch.py       触觉/前视探测（足底法向力、滑移、立面擦碰、前方射线扇）
     env.py         Gymnasium 环境（观测/奖励/终止/域随机化）★核心
     curriculum.py  课程（平地 → 3~8 → 8~11 cm，含混合高度）
     training.py    PPO 组装 / 运行目录 / VecNormalize / 断点续训
     evaluate.py    评估矩阵 + ONNX / TorchScript 导出
-    render.py      GIF 写出（纯 Python + Pillow，不需要 ffmpeg）
-    png.py         PNG 写出（zlib）
-    console.py     UTF-8 控制台
+    render.py      渲染与 GIF 写出（GIF 用 Pillow；PNG 帧走 tools\png.py 的纯 zlib 路径）
+    go2_model.py   组装 Go2 MJCF（字符串手术 + 场景编译）
+    gait.py        trot 步态先验（GaitParams）
+    tools\         工具层：不 import robotdog.env、不知道 PPO/课程
+        paths.py       所有路径常量（工作区 = 本仓根目录）
+        terrain.py     楼梯地形（解析式高度场 height_at(x) + MuJoCo 几何体）
+        touch.py       触觉/前视探测（足底法向力、滑移、立面擦碰、前方射线扇）
+        png.py         PNG 写出（zlib，无第三方依赖）
+        console.py     UTF-8 控制台
 scripts\
     train.py               训练入口（所有开关都在这里）
     eval.py                评估 / 导出入口
@@ -78,11 +79,19 @@ tools\
     ab_merge.py  合并多份普查缓存并出表
 models\unitree_go2\          Go2 MJCF + 网格
 artifacts\trot_stairs.json   trot 先验
+docs\robotdog\              每个模块的设计文档（目录与本目录对应）
 ```
 
 训练/评估产物都落在本仓根目录下（`runs\`、`logs\`、`output\gifs\`），目录由
-`robotdog\paths.py` 自己建。`robotdog\__init__.py` **只**导出
+`robotdog\tools\paths.py` 自己建。`robotdog\__init__.py` **只**导出
 `setup_utf8_console`，脚本要显式 `from robotdog.env import ...`。
+
+**分层规则**：`robotdog\tools\` 里的模块**都不 import `robotdog.env`**，所以
+`env → tools` 是单向的；`render.py` 因为要驱动环境而依赖 `env`，因此留在
+`robotdog\` 顶层而不是进 `tools\`（否则 tools↔env 成环）。工具层只有一条导入
+路径 `robotdog.tools.<name>`（没有同名的顶层兼容模块），所以写
+`from robotdog.tools.terrain import StairSpec` 或 `from robotdog.tools import paths`。
+每个模块的设计细节见 `docs\robotdog\` 下对应文件。
 
 ---
 

@@ -26,7 +26,13 @@ from typing import Any, Sequence
 import numpy as np
 
 from robotdog.env import EnvConfig, Go2StairsEnv
-from robotdog.terrain import StairSpec, TerrainRandomization, demo_stairs_spec, flat_spec
+from robotdog.tools.terrain import (
+    StairSpec,
+    TerrainRandomization,
+    demo_stairs_spec,
+    flat_spec,
+    sample_spec,
+)
 
 # --------------------------------------------------------------------------- #
 # Evaluation terrains
@@ -84,7 +90,7 @@ def randomized_terrains(n: int, seed: int = 12345) -> list[tuple[str, StairSpec]
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n):
-        spec = rand.sample_spec(rng)
+        spec = sample_spec(rng, rand)
         out.append((f"rand_{i:02d}_h{int(spec.step_height * 1000):03d}"
                     f"_t{int(spec.tread * 100):03d}", spec))
     return out

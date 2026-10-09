@@ -16,7 +16,7 @@ that by accident.
 So we search for a fixed open-loop trot offline and let the policy learn the
 *residual* on top of it:
 
-    target = home + action_scale * clip(a_policy + a_gait(t), -1, 1)
+    target = home + gait_gain * gait.radians(t) + action_scale * action
 
 This is ordinary residual RL (Johannink et al., "Residual Reinforcement
 Learning", 2019).  Everything about the observation/action interface the user

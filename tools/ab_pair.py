@@ -43,9 +43,9 @@ import numpy as np
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / "robotdog").is_dir())
 sys.path.insert(0, str(ROOT))
 
-from robotdog.console import setup_utf8_console  # noqa: E402
+from robotdog.tools.console import setup_utf8_console  # noqa: E402
 from robotdog.env import Go2StairsEnv  # noqa: E402
-from robotdog.terrain import StairSpec  # noqa: E402
+from robotdog.tools.terrain import StairSpec  # noqa: E402
 from robotdog.training import env_config_from_run  # noqa: E402
 from scripts.eval import load_policy  # noqa: E402
 

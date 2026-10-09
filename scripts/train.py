@@ -50,7 +50,7 @@ from robotdog.curriculum import (  # noqa: E402
 )
 from robotdog.env import EnvConfig  # noqa: E402
 from robotdog.gait import GaitParams, load_gait  # noqa: E402
-from robotdog.paths import LOGS_DIR  # noqa: E402
+from robotdog.tools.paths import LOGS_DIR  # noqa: E402
 from robotdog.training import (  # noqa: E402
     RunDir,
     _find_vecnormalize,
@@ -789,10 +789,9 @@ def main(argv=None) -> int:
     print(f"  {sys.executable} scripts/eval.py --run {run.root} --only trained --episodes 20")
     print(f"  {sys.executable} scripts/eval.py --run {run.root} --only unseen --episodes 20 "
           f"--export both")
-    print(f"  {sys.executable} scripts/diag_reward.py --run {run.root}")
-    print(f"  {sys.executable} scripts/probe_policy_action.py "
-          f"--model {run.best_model} --gait-file artifacts\\trot_stairs.json "
-          f"--episode-length-s {cfg.episode_length_s}")
+    print(f"  {sys.executable} scripts/render_checkpoint.py --run {run.root} "
+          f"--checkpoint {run.best_model} --step-height-cm 5.0 --n-up 8 "
+          f"--episodes 1 --name-tag preview")
     print(f"  {sys.executable} -m tensorboard.main --logdir {run.tensorboard}")
     print("=" * 78)
     return 0

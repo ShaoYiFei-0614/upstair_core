@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# .../upstair
-WORKSPACE: Path = Path(__file__).resolve().parent.parent
+# .../upstair_core  -- this file lives in <workspace>/robotdog/tools/, so walk
+# three levels up.  (It used to be robotdog/paths.py and walked two levels;
+# moving it into the tools subpackage silently broke every derived path until
+# the smoke test caught it, hence the explicit comment.)
+WORKSPACE: Path = Path(__file__).resolve().parents[2]
 
 MODELS_DIR: Path = WORKSPACE / "models"
 GO2_DIR: Path = MODELS_DIR / "unitree_go2"
@@ -20,12 +23,11 @@ ARTIFACTS_DIR: Path = WORKSPACE / "artifacts"
 RUNS_DIR: Path = WORKSPACE / "runs"
 LOGS_DIR: Path = WORKSPACE / "logs"
 
-#: Everything a human is meant to *look at* ends up here.  Since the
-#: twenty-fifth step only :data:`OUTPUT_GIFS_DIR` is a **shipped deliverable**
-#: (``output/`` holds the GIFs and this directory's README, nothing else); the
-#: other four sub-directories are working directories that the tools create on
-#: demand — see ``scripts/render_checkpoint.py`` and
-#: ``scripts/diagnostics/curve.py``.
+#: Everything a human is meant to *look at* ends up here.  Only
+#: :data:`OUTPUT_GIFS_DIR` is a **shipped deliverable** (``output/`` holds the
+#: GIFs and nothing else); the other four sub-directories are working
+#: directories that the tools create on demand — see
+#: ``scripts/render_checkpoint.py``.
 OUTPUT_DIR: Path = WORKSPACE / "output"
 OUTPUT_GIFS_DIR: Path = OUTPUT_DIR / "gifs"
 #: 以下四个都不是交付物，只在对应的工具真的写东西时才被创建。
