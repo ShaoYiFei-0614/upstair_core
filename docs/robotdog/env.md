@@ -6,8 +6,9 @@
 Gymnasium 环境（`Go2StairsEnv`），提供 50 Hz 控制 / 500 Hz 物理的观测、奖励、终止与成功判据，
 并把**残差步态先验**与**离屏渲染**挂在这一个接口上。
 
-它是**盲走（blind locomotion）**环境：`robotdog/env.py:3` 的模块 docstring 逐字写着
-「There is no touch sensor, no ray casting and no contact force reading anywhere in this module.」
+它是**盲走（blind locomotion）**环境：`robotdog/env.py:3-6` 的模块 docstring 逐字写着
+原文是「There is no contact sensor, no ray casting, and no contact force reading anywhere in
+this module.」，现译文为「本模块中没有任何触觉传感器、没有射线投射，也没有任何接触力读取」。
 环境只能通过 `mjData` 里的关节状态、机身位姿与**逐 geom 的接触布尔量**感知世界，
 唯一的几何先验是 `ObsConfig.step_height`（直接告诉策略这一集的台阶高度）。
 
@@ -46,23 +47,25 @@ Gymnasium 环境（`Go2StairsEnv`），提供 50 Hz 控制 / 500 Hz 物理的观
 ### 3.1 残差 RL 的两个尺度必须分开
 
 `target = home_angles + gait_gain * gait.radians(phase) + action_scale * action`
-（`_target_from_action`，`robotdog/env.py:707-728`）。
+（`_target_from_action`，`robotdog/env.py:670-690`）。
 
 `EnvConfig.action_scale`（默认 `0.30`）是**策略权限**，`GaitParams.action_scale`（默认
 `default_trot()` = `0.90`）是**先验幅度**。两者刻意不共用：
 
 * **否决方案**：共用一个 `action_scale`。先验幅度与策略探索噪声会被同一个系数缩放，
-  实测在 2 s 内摔倒（`robotdog/gait.py:133-142` 的 `radians()` docstring；`experience.md` §2）。
+  实测在 2 s 内摔倒（`robotdog/gait.py:94-103` 的 `radians()` docstring；`experience.md` §2）。
 * **否决方案**：直接让策略学绝对关节角。本沙箱禁用 Windows 命名管道，只能 `DummyVecEnv`
   （8 环境单进程），PPO 无从发现步态；两次标定 120k / 150k 步平地训练均 0% 成功、
   位移约 0.02 m，学到的策略比零动作站桩更差（466 vs 496 return；`experience.md` §2）。
   `action_mode="absolute"` 仍作为可选分支保留（映射为 `lo + (action+1)*0.5*(hi-lo)`），
   它**故意忽略先验**。
 * `gait_prior` 默认 `False`，所以「无先验」这条路径仍然可用；`_gait_action()`
-  （`robotdog/env.py:697-705`）在关闭或 `gait_gain == 0.0` 时返回 `zeros(12)`，
+  （`robotdog/env.py:660-668`）在关闭或 `gait_gain == 0.0` 时返回 `zeros(12)`，
   使 `_target_from_action()` 对两种模式是**同一条代码路径**。
-* `set_gait_prior()` 可以在线切换：它只改 PD 目标的构造方式，不改观测维数，
-  所以不需要重建 `observation_space`（只有改观测块才需要）。
+* 先验**只能在构造时定**：`set_gait_prior()`（在线切换先验的旧 API，docstring 曾自称
+  "used by the CLI"，但那个 CLI 开关早已删除）已在死代码清理中删除。要换先验就换
+  `cfg.gait` / `cfg.gait_gain` 后重建环境 —— 反正它本来也只改 PD 目标的构造方式，
+  不改观测维数。
 
 ### 3.2 观测默认**不是**全关：`base_lin_vel_body=True`、`step_height=True`
 
@@ -77,8 +80,8 @@ base_frame_size: int = 42
 
 ⇒ **默认 `frame_size = 42+3+1 = 46`，`size = 460`**。
 
-* `step_height=True` 是刻意的：`robotdog/env.py:411-415` 的注释写着盲走策略「cannot infer
-  step height cheaply」，所以把这一集的台阶高度作为一个**标量**直接喂进去，而不是让策略去估。
+* `step_height=True` 是刻意的：`robotdog/env.py:57-58` 的注释写着盲走策略「无法低成本
+  推断台阶高度」，所以把这一集的台阶高度作为一个**标量**直接喂进去，而不是让策略去估。
 * `base_lin_vel_body=True` 也是默认开的；机身系速度让「前进」永远是分量 `[0]`，
   而世界系版本是「yaw 一变含义就变」的坏特征 —— 所以 `base_lin_vel_world` 现在**根本不再是
   可选项**，只是内部属性。
@@ -94,8 +97,8 @@ base_frame_size: int = 42
 
 `qpos[0:3]` 世界位置、`qpos[3:7]` 四元数 `(w,x,y,z)`、`qvel[0:3]` 世界线速度、
 **`qvel[3:6]` 是机身（local）角速度** —— 这正是真实 IMU 陀螺的输出，所以
-`base_ang_vel_body`（`robotdog/env.py:339-341`）直接返回它，不做任何旋转变换
-（docstring 逐字：「Gyro reading. qvel[3:6] is already in the body frame.」）。
+`base_ang_vel_body`（`robotdog/env.py:321-323`）直接返回它，不做任何旋转变换
+（docstring：「陀螺读数。qvel[3:6] 已经在机体系下。」）。
 
 * **否决方案**：把角速度转到世界系再用，或从四元数数值微分。前者随 yaw 改变含义，
   后者引入差分噪声。
@@ -111,7 +114,7 @@ base_frame_size: int = 42
 * 修法：加**线性**伴项 `forward_progress * clip(vx, -0.5, 1.5)`，它在 `vx=0` 处**恰好为 0**，
   梯度永不消失；再配合把 `alive` 压在 `0.15`，站桩不再划算（`experience.md` §2.2）。
 * 注意 `forward_vel_sigma` 在源码里**没有被平方**：分母就是 `rc.forward_vel_sigma` 本身
-  （`robotdog/env.py:436-438`），所以这个参数不是标准差的单位。
+  （`robotdog/env.py:405`），所以这个参数不是标准差的单位。
 * **否决方案**：只调小 `forward_vel_sigma`。σ→0 让高斯变成尖峰，远离指令处梯度全为 0；
   而且 `vx=0` 的正基座只被削小、不会消失。
 
@@ -154,7 +157,7 @@ x 的**阶梯函数**），**不是** `_height_reference()`：
 
 ### 3.8 终止：`terminate_contact_steps=10` 的躯干接触消抖 + 腿接触只罚不死
 
-`_contact_fatal()`（`robotdog/env.py:582-595`）**只**对躯干接触计数：
+`_contact_fatal()`（`robotdog/env.py:549-560`）**只**对躯干接触计数：
 
 ```python
 self._trunk_contact_streak = self._trunk_contact_streak + 1 if trunk_contact else 0
@@ -171,11 +174,11 @@ return self._trunk_contact_streak >= self._effective_contact_steps()
   机器人还没碰到台阶就被「腿刮一下」判死了，试错被彻底杀掉（`experience.md` §2.4）。
 * streak 计数器在 `_contact_fatal()` 内推进而不是在 `step()` 里，这样「一次 `_terminated()`
   == 一个控制步」对直接驱动 `_terminated` 的回归测试也成立。
-* `_contact_flags()`（`robotdog/env.py:542-576`）对空集合显式提前返回 `(False, False)`。
+* `_contact_flags()`（`robotdog/env.py:510-539`）对空集合显式提前返回 `(False, False)`。
 
 ### 3.9 `terminate_height_ref`：默认 `"support"`，不是历史上的 `"base"`
 
-`_fall_reference_height()`（`robotdog/env.py:622-635`）的三个分支：
+`_fall_reference_height()`（`robotdog/env.py:586-600`）的三个分支：
 
 | 取值 | 参照面 |
 | --- | --- |
@@ -386,7 +389,6 @@ class Go2StairsEnv(gym.Env):
 ```python
     def _build_model(self) -> None
     def set_stair(self, stair: StairSpec) -> None
-    def set_gait_prior(self, enable: bool, gait: GaitParams | None = None) -> None
     def _success_target_x(self) -> float
     def _success_reached(self) -> bool
     def reset(self, *, seed: int | None = None, options=None)
@@ -397,8 +399,8 @@ class Go2StairsEnv(gym.Env):
 
 * `set_stair(stair)`：换地形并**重新编译模型**；调用方之后**必须** `reset()`（旧的
   `MjModel`/`MjData` 已被替换，旧状态无意义）。同时刷新 `_success_x` 并把 `_reached_top` 置 `False`。
-* `set_gait_prior(enable, gait=None)`：在线开关先验；`gait` 不为 `None` 时同时替换 `cfg.gait`；
-  无论哪条分支都把 `_gait_t` / `_gait_phase` 清零。不改观测量，所以不重建 `observation_space`。
+* `set_gait_prior(enable, gait=None)`：**已在死代码清理中删除**（无调用方；最后的使用者是
+  一个早已移除的 CLI 开关）。先验现在只在构造时由 `cfg.gait_prior` / `cfg.gait` 决定。
 * `_success_target_x()`：有上行台阶时返回 `stair.up_end_x`；平地阶段返回
   `stair.start_x - spawn_back + flat_success_distance`。
 * `_success_reached()`：阶梯条件 = `base_pos[0] > stair.up_end_x` **且**
@@ -444,7 +446,6 @@ class Go2StairsEnv(gym.Env):
 
 ```python
     def _terrain_height(self, x: np.ndarray | float) -> np.ndarray
-    def _projected_gravity(self) -> np.ndarray           # R^T @ (0,0,-1)；已定义但当前无人调用
     def _obs_frame(self) -> np.ndarray                   # float64，长度 obs.frame_size
     def _observation(self) -> np.ndarray                 # float32，长度 obs.size
     def _compute_reward(self, action: np.ndarray, trunk_contact: bool,
@@ -479,8 +480,9 @@ class Go2StairsEnv(gym.Env):
   `home_angles + _gait_action() + action_scale * action`；
   `absolute` 分支 `lo + (action + 1) * 0.5 * (hi - lo)`（先验在 absolute 下**被故意忽略**）。
   两支都用 `np.clip(target, act_low, act_high)` 收尾。
-* `_projected_gravity()` 当前**是死代码**：定义了 `R^T @ (0,0,-1)` 的展开式，但 `env.py` 里
-  没有任何调用点，观测里也没有重力块。
+* `_projected_gravity()` 已**删除**（死代码清理）：它定义了 `R^T @ (0,0,-1)` 的展开式，
+  却没有任何调用点，观测里也没有重力块。**如果你需要一个「机体系下的重力方向」观测块，
+  这段实现只在 HEAD 里能找到**，当前工作区没有。
 
 `step()` 返回的 `info` 字段（**恰好 18 个键，键名逐字**）：
 `reward_terms`、`trunk_contact`、`leg_contact`、`terminate_contact_steps`、
@@ -578,7 +580,7 @@ _obs_frame()
 
 `_observation()` = `np.concatenate(self._hist).astype(np.float32)` —— 历史栈**先到先出**，
 所以第 0..9 帧的排布是「最旧 → 最新」，最新一帧在**尾部**。
-`_height_reference()` 直接返回 `terrain_height_under_base`（`robotdog/env.py:618-620`）。
+`_height_reference()` 直接返回 `terrain_height_under_base`（`robotdog/env.py:582-584`）。
 
 ### 5.5 奖励调用链
 
@@ -797,8 +799,8 @@ robotdog.env
     `.generated/failed_scene.xml` 并抛 `RuntimeError("MJCF compile failed; dumped to ...")`。
 13. **`subprocess` / `SubprocVecEnv` 在本沙箱不可用**（禁用命名管道），所以并行度只能靠单进程
     多环境；这也决定了 8 环境的天花板（`experience.md` §5.8、`robotdog/training.py` 模块说明）。
-14. **`_projected_gravity()` 是死代码**：定义了却不被调用，观测里没有重力方向块。
-    想验证「躯干倾角」是否能做特征时，注意 `base_rpy` 已经在基础 42 维里。
+14. **`_projected_gravity()` 已删除**（死代码清理，无调用点）。想验证「躯干倾角」是否能做特征时，
+    注意 `base_rpy` 已经在基础 42 维里。
 15. **`set_stair()` 之后不 `reset()` 会读到跨地形的脏状态**：新的 `MjModel`/`MjData` 已换掉，
     但 `_hist`、`_prev_foot_pos`、`_start_terrain_height` 都还指向旧地形。
 16. **`_fall_reference_height()` 的取值判定是 `.strip().lower()` 之后精确比较**：

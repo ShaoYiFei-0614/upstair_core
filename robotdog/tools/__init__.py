@@ -6,7 +6,6 @@
 
 * :mod:`robotdog.tools.paths`   —— 规范文件系统位置
 * :mod:`robotdog.tools.console` —— 控制台 UTF-8 修复
-* :mod:`robotdog.tools.png`     —— 不依赖图像库的 PNG 读写
 * :mod:`robotdog.tools.terrain` —— 参数化楼梯几何 + MJCF 地形
 
 每个模块的设计说明在 ``docs/robotdog/tools/``。
@@ -14,6 +13,6 @@
 
 from __future__ import annotations
 
-from robotdog.tools import console, paths, png, terrain
+from robotdog.tools import console, paths, terrain
 
-__all__ = ["console", "paths", "png", "terrain"]
+__all__ = ["console", "paths", "terrain"]

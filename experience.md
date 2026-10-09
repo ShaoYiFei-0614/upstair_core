@@ -210,6 +210,11 @@ group 2/3。
 **修法**：`Curriculum._on_step` 返回 `False` 只结束 `learn()`；真正切阶段由
 `scripts/train.py` 在返回之后做，并且逐级 warm-start（`model.set_parameters(上一级权重)`）。
 
+> **注意（架构已变）**：`Curriculum` 类与 `StageTrainer` 协议已在死代码清理中删除 ——
+> `scripts/train.py` 从来就是自带 `for` 循环直接调 `Trainer.train_stage`，那个驱动器是孤儿。
+> 现在的「不中途切地形」是靠 `Trainer.train_stage` 每级只 `learn()` 一次固定预算来保证的，
+> 不再是回调返回 `False` 的机制。见 `docs/robotdog/curriculum.md` §3.1。
+
 ---
 
 ## 5. 测量与工具侧（最贵的几个坑）

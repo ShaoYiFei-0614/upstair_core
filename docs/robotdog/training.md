@@ -15,7 +15,7 @@
 * `VecNormalize` 统计的保存、读回与沿包装链查找（`save_vecnormalize` /
   `restore_vecnormalize` / `_find_vecnormalize`）。
 * 运行目录（`RunDir`）：检查点、tensorboard、`model_final.zip`、`summary.json`。
-* 小工具：`format_duration`、`Stopwatch`、`mean_abs_action`。
+* 小工具：`format_duration`、`mean_abs_action`。
 
 **不做**：
 
@@ -146,14 +146,12 @@ class RunDir:
     def summary(self) -> Path: ...            # root/summary.json
     def save_model(self, model: PPO, base: str | Path,
                    venv: VecEnv | None = None) -> tuple[Path, Path | None]: ...
-    def write_summary(self, payload: dict[str, Any]) -> Path: ...
 
 def format_duration(seconds: float) -> str: ...      # 12.3s / 4.5min / 1.20h
-class Stopwatch: ...                                  # .t0，.elapsed
 def mean_abs_action(actions: np.ndarray) -> float: ...
 ```
 
-`__all__` = `["DEFAULT_NET_ARCH", "RunDir", "Stopwatch", "build_ppo", "format_duration",
+`__all__` = `["DEFAULT_NET_ARCH", "RunDir", "build_ppo", "format_duration",
 "load_policy", "load_ppo", "make_env_fn", "make_vec_env", "mean_abs_action",
 "restore_vecnormalize", "save_vecnormalize", "set_terrain"]`
 
@@ -171,15 +169,21 @@ def mean_abs_action(actions: np.ndarray) -> float: ...
   `clip_reward`、`epsilon`。**不动** `training` / `norm_reward` —— 续训时
   `training=True` 由 `make_vec_env` 保证。
 * `_find_vecnormalize(venv)` 沿 `.venv` 链下钻，**最多 10 层**（防环）。
-* `RunDir.__init__` 会 `mkdir(parents=True, exist_ok=True)` 四个目录
-  （`root` / `checkpoints` / `tensorboard` / `artifacts`）。
-* `RunDir.write_summary` 用 `json.dumps(..., indent=2, ensure_ascii=False)`，所以
-  中文标签在文件里是可读的。
+* `RunDir.__init__` **只计算路径、不建目录**；目录由 `RunDir.ensure()` 显式创建
+  （`root` / `checkpoints` / `tensorboard` / `artifacts` 四个）。
+  之所以不在 `__init__` 里 `mkdir`：那会让「输出目录已存在」的保护条件永远为真，
+  第一次运行就误报。
+* `RunDir.write_summary` 已删除：`RunDir` 只提供 `summary` 路径属性
+  （`root / "summary.json"`，`robotdog/training.py:295-297`），真正的写盘由
+  `robotdog.curriculum.write_summary` 统一负责（它用
+  `json.dumps(..., indent=2, ensure_ascii=False)`，所以中文标签在文件里可读）。
+  删除前 `scripts/train.py` 会先写一次草稿再被 `curriculum.write_summary` 覆盖，
+  属于纯冗余 I/O。
 
 ## 5. 内部结构与数据流
 
 ```
-scripts/train.py（StageTrainer 实现）
+scripts/train.py（自带阶段循环，逐级调用 Trainer.train_stage）
     make_env(stage)
         → make_vec_env(stage.spec, n_envs=8, cfg=…, norm_reward=True)
               DummyVecEnv(8) → VecMonitor → VecNormalize

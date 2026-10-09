@@ -23,7 +23,61 @@
 
 **默认总预算 1,350,000 步**。台阶越高、学习率越低（越往上越接近微调，不希望破坏已学的地形）。
 
-平地阶段的台阶高是 **3.0 cm**（实际是 5.0 cm），因为推荐值是以 cm 为单位的浮点数。
+```bat
+.venv\Scripts\python.exe scripts\train.py --run-name walk1
+```
+
+脚本只认 `--run-name` 与 `--config`（默认仓根 `config.yaml`），其余全部来自配置。
+
+启动时会先把整份课程表打出来，形如：
+
+```
+[配置] config.yaml
+[运行] ...\runs\walk1  (seed=0, n_envs=8)
+[观测] 每帧 46 维 × history 10 = 460 维
+[动作] 残差模式, action_scale=0.3 rad, 步态先验=开
+[步态] 5.48 Hz, ±0.265 thigh / ±0.986 calf (norm. units), shape=sin, scale=1.00 rad, period=183 ms
+[奖励] forward_vel=2.5 foot_lift=0.9 success=50.0 termination=-15.0
+[PPO] 网络=[512, 256] n_steps=256 batch=512 epochs=5 target_kl=0.03 log_std_init=-2.0 norm_reward=True
+
+阶段       标签             台阶    踏面   级数      顶端         预算      学习率
+flat     平地           0.0c   50c    0   0.00m    100,000  0.00015
+stair3   3cm 台阶       3.0c   50c    8   0.24m    250,000  0.00015
+stair6   6cm 台阶       6.0c   50c    8   0.48m    250,000  0.00012
+stair9   9cm 台阶       9.0c   50c    8   0.72m    250,000   0.0001
+stair12  12cm 台阶     12.0c   50c    8   0.96m    250,000    8e-05
+stair15  15cm 台阶     15.0c   50c    8   1.20m    250,000    6e-05
+合计 6 级, 总预算 1,350,000 步
+```
+
+每一级开头与结尾各有一行：
+
+```
+[课程] >>> 第 2/6 级 'stair3' (3cm 台阶) stair3   3cm 台阶     台阶=  3.0cm 踏面=  50cm 级数=8  顶端= 0.24m 预算=  250,000 lr=0.00015
+    [warm-start] 从 flat_final.zip 继承权重
+    [      2,048 步] 回合=    8 成功率= 100.0% 摔倒率=   0.0% 均回报=  332.33 均步数= 112.0     ← ProgressCallback
+    训练完成 250,000 步  412 步/秒
+[课程] <<< 'stair3' 成功率=100.0% 摔倒率=0.0% 均回报=332.3 用时=606.8s
+```
+
+全部跑完后重打一遍课程表（这次带成绩列），并列出产物路径：
+
+```
+flat     平地           0.0c   50c    0   0.00m    100,000  0.00015 100.0%   0.0%    332.87   242.7s flat_final.zip
+...
+合计 6 级, 总预算 1,350,000 步
+
+产物: runs/walk1
+  模型: runs/walk1/model_final.zip
+  汇总: runs/walk1/summary.json
+
+下一步:
+  .venv\Scripts\python.exe scripts\play.py --run walk1 --mode eval
+  .venv\Scripts\python.exe scripts\play.py --run walk1 --mode gif
+```
+
+> 上面带 `[...]` 的进度行与实际步数/耗时是**示意值**；能逐字复现的是冒烟跑（§3.1）
+> 里那份每级 2,000 步、总预算 12,000 步的输出。
 
 ### 1.2 阶段之间怎么衔接
 
@@ -67,26 +121,7 @@ scripts/train.py
 
 ## 2. 一次训练长什么样
 
-```bat
-.venv\Scripts\python.exe scripts\train.py --run-name walk1
-```
-
-输出形如：
-
-```
-[课程] flat     平地      0.0cm × 0 级  预算 100,000  学习率 1.50e-04
-[课程] stair3   3cm 台阶  3.0cm × 8 级  预算 250,000  学习率 1.50e-04
-...
-[进度] [   2,048 步] 回合=    8 成功率= 100.0% 摔倒率=   0.0% 均回报=  332.33 均步数= 112.0
-[课程] <<< 'flat' 成功率=100.0% 摔倒率=0.0% 均回报=332.3 用时=4.9s
-...
-阶段      标签        台阶   踏面  级数  顶端   预算     学习率   成功率  摔倒率  均回报    用时   模型
-flat      平地        0.0c   50c   0     0.00m  100000   1.5e-4  100.0%   0.0%  332.33    ...
-合计 6 级, 总预算 1000000 步
-产物: runs/walk1
-  模型: runs/walk1/model_final.zip
-  汇总: runs/walk1/summary.json
-```
+完整输出样例已放在 §1.1（含课程表、逐级进度行与收尾汇总）。这一节只讲**产物**。
 
 ### 产物
 
@@ -95,7 +130,8 @@ runs/<名字>/
   checkpoints/<阶段>_final.zip                  每级结束的权重
   checkpoints/<阶段>_final_vecnormalize.pkl     与它成对的观测统计
   checkpoints/<阶段>_final_env.json             该权重训练时的地形（台阶高）+ 完整配置
-  checkpoints/<阶段>/<阶段>_<步数>_steps.zip     周期检查点
+  checkpoints/<阶段>/<阶段>_<步数>_steps.zip     周期检查点（每 run.save_every 步）
+  checkpoints/<阶段>/<阶段>_<步数>_steps_vecnormalize.pkl
   model_final.zip                              最后一级的交付权重（三件套之一）
   model_final_vecnormalize.pkl                 与它成对的观测/奖励归一化统计
   model_final_env.json                         地形记录（play 默认按它选楼梯）
@@ -130,7 +166,7 @@ runs/<名字>/
 ⇒ 流水线、回调、存档、`summary.json`、`play.py` 两种模式全部验证通过。
 **这些数字只证明管道通，不证明训练有效** —— 每级只有约 1~8 次 PPO 更新。
 
-注意 `stair3` 的采样成功率 46% 是**探索**口径（每步动作加 `log_std ≈ 0.137` 的噪声），
+注意 `stair3` 的采样成功率 **50%** 是**探索**口径（每步动作加 `log_std ≈ 0.135` 的噪声），
 它会大幅低估确定性策略。
 
 ### 3.2 残差幅度是判断「有没有学起来」的关键量

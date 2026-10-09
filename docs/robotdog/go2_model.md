@@ -170,9 +170,10 @@ f'condim="3" friction="0.9 0.005 0.0001" material="groundplane" group="{TERRAIN_
 * 代价：常量与 vendored XML 之间没有自动一致性检查。当前两者一致
   （`go2.xml` 第 215 行块里 `<key name="home" qpos="0 0 0.27 1 0 0 0 0 0.9 -1.8 …"/>`），
   但改模型不会自动改常量 —— 见 §9。
-* `NOMINAL_MASS = 15.206408` 只是**注释性常量**（`extract_meta` 用的是
-  `float(model.body_mass[1:].sum())`，跳过 world body 0），用于对照
-  `6.921 + 4×(0.678 + 1.152 + 0.241352)`。
+* 总质量**不来自常量**：`extract_meta` 用 `float(model.body_mass[1:].sum())`
+  （跳过 world body 0）得到 `Go2Meta.total_mass`。原先那个只作对照用的
+  `NOMINAL_MASS = 15.206408` 常量（`6.921 + 4×(0.678 + 1.152 + 0.241352)`）
+  已在死代码清理中删除 —— 它不参与任何计算，`total_mass` 才是真值。
 
 ### 3.8 «extract_meta» 只解析一次，之后全靠它
 
@@ -193,7 +194,9 @@ f'condim="3" friction="0.9 0.005 0.0001" material="groundplane" group="{TERRAIN_
   以免再多一层 `mujoco` 调用（这两个函数在观测与奖励的每步路径上）。
 * `quat_to_rpy`：`(w,x,y,z) → (roll, pitch, yaw)`，**ZYX 顺序、绕世界 X/Y/Z 轴**；
   `pitch` 用 `arcsin(clip(..., -1, 1))` 保护，避免数值越界产生 `nan`。
-* `env.base_rpy` 与 `env._projected_gravity` 都直接依赖这两个函数的输出口径。
+* `env.base_rpy` 直接依赖这两个函数的输出口径（旧版 `env._projected_gravity`
+  做同样的事，已随死代码清理删除；投影重力现在由 `base_rpy` + 旋转矩阵在
+  `env.py` 内就地算）。
 
 ## 4. 公开 API
 
@@ -210,11 +213,8 @@ FOOT_GEOM_NAMES: tuple[str, ...] = LEGS
 BASE_HEIGHT_HOME = 0.27
 HOME_JOINT_ANGLES: tuple[float, ...] = tuple(angle for _ in LEGS for angle in (0.0, 0.9, -1.8))
 
-NOMINAL_MASS = 15.206408
 DEFAULT_TIMESTEP = 0.002
-DEFAULT_CONTROL_DECIMATION = 10          # -> 50 Hz control, 500 Hz physics
 
-VISUAL_GEOM_GROUP = 2
 COLLISION_GEOM_GROUP = 3
 
 _OUTER = re.compile(r"\s*<mujoco\b[^>]*>(?P<body>.*)</mujoco>\s*$", re.DOTALL)
@@ -222,6 +222,12 @@ _OPTION = re.compile(r"<option\b[^>]*/>")
 _COMPILER = re.compile(r"<compiler\b[^>]*/>")
 _MESHDIR = re.compile(r'meshdir\s*=\s*"[^"]*"')
 ```
+
+> 上面这段就是模块级常量的**全量**（`robotdog/go2_model.py:45-65`）。
+> 旧的 `NOMINAL_MASS` / `DEFAULT_CONTROL_DECIMATION` / `VISUAL_GEOM_GROUP`
+> 三个常量已在死代码清理中删除：前两个没有任何使用者
+> （步长走 `SceneOptions.timestep`，控制抽减由 `env.py` 自己算），
+> 第三个是只被 `extract_meta` 的历史分支用过的 geom group 号。
 
 * `ACTUATOR_NAMES` 的顺序就是 `go2.xml` 声明的执行器顺序，也**就是动作向量的顺序**：
   `FL_hip, FL_thigh, FL_calf, FR_hip, …, RR_hip, RR_thigh, RR_calf`。
@@ -331,13 +337,12 @@ class Go2Meta:
     nq: int = 0
     nv: int = 0
     nu: int = 0
-
-    @property
-    def num_joints(self) -> int: ...    # len(self.joint_names)
 ```
 
 * 24 个字段里前 18 个是**必填**（无默认值），后 6 个（`stair_geom_ids`、`trunk_geom_ids`、
   `leg_geom_ids`、`nq`、`nv`、`nu`）有默认值。
+* **已经没有 `num_joints` 属性**（死代码清理时删除）。关节数直接用
+  `len(meta.joint_names)`，或现成的 `meta.nu`（两者都是 12）。
 * `foot_radius = float(model.geom_size[foot_geom_ids[0], 0])`：脚是**球体**，
   `geom_xpos` 给的是**球心**，所以真实离地间隙必须减这个半径。
 * `home_qpos[3] == 1.0` 是四元数的 `w` 分量。
@@ -465,7 +470,7 @@ Go2StairsEnv._build_model()
 Go2StairsEnv.reset()
   → home_qpos(self.meta, x=…, y=…, z=…, yaw=…)
 
-Go2StairsEnv.base_rpy / ._projected_gravity()
+Go2StairsEnv.base_rpy()
   → quat_to_rpy(...) / quat_to_mat(...)
 ```
 
@@ -482,11 +487,11 @@ Go2StairsEnv.base_rpy / ._projected_gravity()
 | `FOOT_GEOM_NAMES` | `("FL", "FR", "RL", "RR")` |
 | `BASE_HEIGHT_HOME` | `0.27` m |
 | `HOME_JOINT_ANGLES` | `(0.0, 0.9, -1.8)` × 4 = 12 个值 |
-| `NOMINAL_MASS` | `15.206408` kg（注释：`6.921 + 4×(0.678 + 1.152 + 0.241352)`） |
 | `DEFAULT_TIMESTEP` | `0.002` s |
-| `DEFAULT_CONTROL_DECIMATION` | `10`（⇒ 50 Hz 控制 / 500 Hz 物理） |
-| `VISUAL_GEOM_GROUP` | `2` |
-| `COLLISION_GEOM_GROUP` | `3` |
+| `COLLISION_GEOM_GROUP` | `3`（机器人碰撞 geom 的 group 号；`Go2Meta` 的拆分全靠它） |
+
+> 已删除的常量（不要再引用）：`NOMINAL_MASS`、`DEFAULT_CONTROL_DECIMATION`、
+> `VISUAL_GEOM_GROUP`。
 
 **`SceneOptions` 默认值**：`timestep=0.002`、`integrator="implicitfast"`、
 `gravity=(0.0, 0.0, -9.81)`、`iterations=50`、`ls_iterations=20`、`solver="Newton"`、
@@ -605,10 +610,14 @@ robotdog.go2_model
 13. **`compile_scene` 只有 `write_to` 为 `None` 时才落盘排错 XML**：调用者传了 `write_to`
     却编译失败时，异常原样抛出（XML 已被写到 `write_to`，但**未必**是最终形态，因为
     `write_to.write_text` 在编译之前）。
-14. **`NOMINAL_MASS` 不参与任何计算**，只是注释用的对照常量；真值是
-    `meta.total_mass = float(model.body_mass[1:].sum())`。不要把它当断言基准去比较
-    —— 域随机化会改 `body_mass`（`env._apply_domain_randomization`），
-    但 `Go2Meta.total_mass` 是**编译时**快照，不会跟着变。
+14. **总质量没有「标称常量」可对照**：真值是
+    `meta.total_mass = float(model.body_mass[1:].sum())`（跳过 world body）。
+    不要用硬编码质量做断言基准 —— 编译后的 `model.body_mass` 可以被调用者改，
+    但 `Go2Meta.total_mass` 是**编译时**快照，不会跟着变。旧文档里的
+    `NOMINAL_MASS = 15.206408` 已经在死代码清理中删除，它当时也只是注释。
+    （旧文档还曾把「域随机化会改 `body_mass`」写成 `env._apply_domain_randomization`
+    的功劳 —— 全仓从来**没有**这个函数，`git grep` 在 HEAD 里只能找到
+    `TerrainRandomization` 那条已删除的 docstring。该引用已撤掉。）
 
 ## 10. 示例用法
 
@@ -640,7 +649,7 @@ model, meta, xml = compile_scene(
     write_to=Path(".generated") / "demo_scene.xml",   # 人类可读的 scratch 场景
 )
 
-print("nq/nv/nu =", meta.nq, meta.nv, meta.nu, "num_joints =", meta.num_joints)
+print("nq/nv/nu =", meta.nq, meta.nv, meta.nu, "num_joints =", len(meta.joint_names))
 print("actuators =", meta.actuator_names[:3], "...")
 print("foot_radius =", meta.foot_radius, "total_mass =", round(meta.total_mass, 6))
 print("stair geoms =", meta.stair_geom_ids, "floor =", meta.floor_geom_id)

@@ -76,21 +76,20 @@ upstair_core/
     trot_stairs.json                     trot 开环先验（唯一不可重建的 artifact）
   models/unitree_go2/                    vendored Go2 MJCF + 网格 + scene.xml
   robotdog/                              库代码（分层见 docs/README.md）
-    __init__.py      包入口，导入即修 UTF-8 控制台
+    __init__.py      包入口（只重导出工具层，导入时不修控制台）
     env.py           ★ Go2StairsEnv：观测 / 奖励 / 终止 / 成功判据
     gait.py          开环 trot 先验的参数化与 (de)serialize
     go2_model.py     Go2 MJCF 组装 + 场景编译 + 元信息提取
     policy.py        训练产物的加载：配置 / 观测维度 / 网络结构 / 归一化统计
     config.py        读 config.yaml → EnvConfig + 课程阶段表
-    training.py      PPO 组装、向量环境、运行目录
-    curriculum.py    六级课程与阶段回调
+    training.py      PPO 组装、向量环境、运行目录、权重加载
+    curriculum.py    课程数据类（StageSpec/EpisodeStats/StageResult）与汇总写出
     tools/           工具层（不 import env）
       console.py     UTF-8 控制台
       paths.py       路径常量
-      png.py         纯 zlib 的 PNG 读写（不依赖 Pillow；当前无调用者，见下）
       terrain.py     参数化楼梯几何（StairSpec / XML / 高度查询）
   scripts/
-    train.py         训练入口（调 curriculum）
+    train.py         训练入口（自带阶段循环，逐级调 Trainer.train_stage）
     play.py          评估入口（gif / eval 两种模式）
     download_go2.py  重新下载 vendored Go2 模型
   docs/              每个 .py 的设计文档
@@ -152,8 +151,8 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 | `forward_progress` | +1.5 | `clip(vx, -0.5, 1.5)` 线性项 —— vx=0 时恰为 0，堵住「站着不动」的局部最优 |
 | `orientation` | -1.2 | `roll² + pitch²` |
 | `torque` | -1.5e-4 | `Σ tau²` |
-| `foot_lift` | +0.9 | 三维足端速度门控 × `clip(离地/目标, 0, 1)`，目标 `= max(0.08, 1.4 × 台阶高)` |
-| `air_time` | +0.6 | 落地那一步结算：`clip(滞空 - 0.30, 0, ...)`，超过 0.60 s 反罚 |
+| `foot_lift` | +0.9 | 三维足端速度门控（阈值 `foot_lift_gate_speed = 0.25 m/s`）× `clip(离地/目标, 0, 1)`，目标 `= max(0.08, 1.4 × 台阶高)` |
+| `air_time` | +0.6 | 落地那一步逐足结算：`(clip(滞空 - 0.30, 0, ∞) - clip(滞空 - 0.60, 0, ∞))`，再对当步落地的足求和 |
 | `base_height` | -2.0 | 机身高度偏离其正下方地形（**只用于奖励**，与观测开关无关） |
 | `joint_vel` | -2.0e-5 | `Σ qd²` |
 | `action_rate` | -0.02 | `Σ (a - a_prev)²` |
@@ -296,14 +295,10 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 
 * **没有触觉/测距**。这是刻意的设计目标，不是缺失：高台阶上机器人在几何上「看不见」
   立面，只能靠撞上之后的机身姿态反馈调整。
-* **`EnvConfig` 没有 `stair` 字段**。地形只能通过
-  `Go2StairsEnv(stair=..., cfg=..., seed=...)` 传入；`set_stair()` 用于换地形。
+* **`EnvConfig` 没有 `stair` 字段**。地形是构造参数：
+  `Go2StairsEnv(stair=..., cfg=..., seed=...)`（`seed` 是仅关键字参数）；换地形用
+  `env.set_stair(stair)`。
 * 地形由**权重自带的 `<模型>_env.json`** 决定；老权重（在本轮配置化之前训的）没有这个
   文件，会退回 `stair_from_height` 的默认 3 cm，需要手动在 `config.yaml` 里写
   `play.stage_height_cm`。
-* 本仓的课程是**固定六级**，没有自动晋级/回退、没有域随机化、没有高度带混合。
-* **`robotdog/tools/png.py` 目前没有调用者**。它的三个历史消费者（`render.py` /
-  `render_checkpoint.py` / `eval.py`）都已删除，GIF 与拼图现在由 `scripts/play.py`
-  直接用 Pillow 完成。它仍被 `robotdog/tools/__init__.py` 导入，所以
-  `import robotdog` 会连带加载 `numpy`。保留是为了避免在没有需求时反复改动包入口；
-  它是全仓最明确的候选删除项（见 `docs/robotdog/tools/png.md` §9）。
+* **本仓的课程是固定六级**，没有自动晋级/回退、没有域随机化、没有高度带混合。

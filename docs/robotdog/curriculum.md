@@ -1,105 +1,98 @@
-# `robotdog/curriculum.py` 设计文档
+# `robotdog/curriculum.py` —— 固定六级课程与报表
 
 ## 1. 一句话定位
 
-**训练层**的「课程表 + 进度账本」：说明要练哪几级台阶、按什么顺序、每级训多少步，
-并在每级结束后把实测结果记成一张表、汇总成 `summary.json`。它**不认识 PPO、也不碰奖励**。
+**训练层**里的**纯数据 + 报表模块**：定义课程的一级长什么样（`StageSpec`）、
+训练过程中收集回合统计（`EpisodeStats`）、阶段结束后留下实测结果（`StageResult`），
+并把它们排成可打印的定宽表格与 `summary.json`。
+
+它**不是**驱动器 —— 真正逐级跑循环的是 `scripts/train.py`；本模块只回答
+「训哪几级、按什么顺序、训多少步、成绩怎么记」。
 
 ## 2. 职责边界
 
 **做**：
 
-* 定义固定的六级梯度 `STAGE_HEIGHTS_CM = (0.0, 3.0, 6.0, 9.0, 12.0, 15.0)`（平地 + 五级台阶）。
-* 把每一级包成 `StageSpec`（地形 `StairSpec` + 步数预算 + 学习率 + 中文标签）。
-* 累计训练期的回合统计 `EpisodeStats`（滑动窗口）。
-* 按 `StageTrainer` 协议**驱动**训练者跑完所有阶段，阶段之间做 warm-start。
-* 把阶段定义与结果写成 `summary.json`，并渲染一行式表格。
+* 固定台阶高度梯度 `STAGE_HEIGHTS_CM = (0.0, 3.0, 6.0, 9.0, 12.0, 15.0)`。
+* 用 `StageSpec` 描述一级：名字、台阶高、`StairSpec` 地形、预算步数、学习率、中文标签。
+* 用 `EpisodeStats` 在滑动窗口里统计成功率 / 摔倒率 / 均回报 / 均步数。
+* 用 `StageResult` 记录一级训练完的实测结果（含墙钟用时、模型路径、观测维度）。
+* 用 `format_curriculum` / `write_summary` / `format_seconds` 出报表。
 
 **不做**：
 
-* **不 import SB3**，不构造环境，不建网络。真正的 PPO 在 `robotdog/training.py`，
-  装配在 `scripts/train.py`（它实现了 `StageTrainer`）。
-* **不做地形随机化**。每一级只有**一种**几何，阶段内没有高度带、没有踏面网格。
-* **不做毕业判定**。预算到了就换下一级，没有「成功率达标提前毕业」这回事
-  （历史上那套判据会饿死 PPO，见 `experience.md` §4.1）。
-* 不做评估、不渲染、不写 GIF。
+* **不训练、不建环境、不建 PPO**。本模块不 import `stable_baselines3`，不 import
+  `robotdog.env` / `robotdog.training`。
+* **不做阶段调度**：没有自动晋级 / 回退 / 断点续训 / 高度带混合。循环在
+  `scripts/train.py` 里，是几行普通的 `for`。
+* **不读 `config.yaml`**。`config_to_stages()` 在 `robotdog/config.py` 里，
+  它构造本模块的 `StageSpec`（方向是「配置层 → 本模块」，反过来不存在）。
+* **不写 tensorboard、不存模型**（那是 `robotdog/training.py` 的 `RunDir`）。
 
 ## 3. 关键设计决策与理由
 
-### 3.1 课程是**串行**的，一级一个几何
+### 3.1 课程是**数据**，不是类
 
-早期版本把一整条高度带同时铺到 8 个子环境上（8.0/8.4/…/11.0 cm）。那样做的动机是
-防止灾难性遗忘，但代价是**每个子环境各有一份编译好的 MJCF**，而换地形要重编译
-（`set_stair` 约 250 ms × `n_envs`），并且策略永远不知道自己站在哪一级台阶上。
+`StageSpec` 是 `@dataclass`，一门课就是一个 `list[StageSpec]`。
+`scripts/train.py` 直接 `for stage in stages:` 逐级调用 `Trainer.train_stage`。
 
-现在是「一级 → 训练 → 存权重 → 下一级从上一级 `PPO.set_parameters` 续训」。好处：
+**被否决的方案**：保留一个 `Curriculum` 类，带 `run()` / `table()` / `total_timesteps()`
+与一个 `StageTrainer` Protocol。**否决理由**：那个类从 `scripts/train.py` 拿走控制权后，
+要做 warm-start、每级学习率、每级产物命名，都必须在「类 → 协议 → 训练器」之间来回传参；
+实际使用中 `train.py` 从来**没有构造过 `Curriculum`**，它自带 for 循环直接调
+`train_stage` —— 于是整个驱动器成了孤儿（只有 `default_curriculum()` 在造它）。
+删掉后本模块从 558 行降到 308 行，且没有任何行为变化。
 
-* 每级只有一种几何，`set_stair` 只在**两个 `train_stage` 调用之间**发生，不打断 rollout
-  （换地形会同时改变观测参照面与已累积的 rollout buffer 语义）。
-* 权重迁移承担了「不遗忘」的责任，而不是让观测去承担。
-* `obs.step_height` 这个 1 维标量就能告诉策略「现在在哪一级」，不需要高度带。
+教训：**当调用方绕过你的抽象层自己写循环时，那不是调用方的错，是抽象层的错**。
 
-### 3.2 步数预算：平地给得少，台阶给得多
+### 3.2 阶段表由「高度梯度 + 预算表」两张平行表决定，且要求高度升序
 
-```python
-_FLAT_BASE_STEPS  = 100_000     # 平地
-_STAIR_BASE_STEPS = 250_000     # 每一级台阶
-```
+`STAGE_HEIGHTS_CM` 是固定六档；步数与学习率来自 `config.yaml` 的
+`curriculum.timesteps` / `curriculum.learning_rate`（长度不足时由
+`robotdog/config.py` 的 `_spread()` 线性重采样补齐）。
 
-开环 trot 先验（`artifacts/trot_stairs.json`，5.48 Hz）本身就能在平地上走完全程，
-所以平地段几乎不产生学习信号——实测成功率很快顶住，继续训只是空转。真正发生学习的
-是台阶阶段。默认总预算 **1,350,000 步**（100k + 5 × 250k）。
+`config_to_stages()` 显式要求高度升序，否则报错。理由：课程的核心假设是
+「下一级从上一级 warm-start」；高度乱序会让后一级比前一级更容易，
+warm-start 的方向就反了，而这种错误从训练曲线上看不出来（成绩照样在涨）。
 
-`default_curriculum(total_timesteps=...)` 给出时按同样的 `100k : 250k` 权重比例缩放，
-保证每级至少 1 步，**余数补给最后一级（最难的）**：
+### 3.3 `EpisodeStats` 用滑动窗口，不累计
 
-```python
-budgets = [max(1, int(total * w / wsum)) for w in weights]
-budgets[-1] += total - sum(budgets)
-```
+窗口（`window=50`）内的成功率才是「当前水平」；累计成功率会被早期的失败拖住，
+在阶段切换后给出严重滞后的读数。**被否决的方案**：只留累计值 —— 否决，因为
+训练日志里真正要看的是「最近 50 个回合」而不是「历史全部」。
 
-### 3.3 学习率随台阶升高而**下降**
+`add_info` 只认 `info["episode"]`（`VecMonitor` 打的键）；没有这个键的 `info`
+直接忽略并返回 `False`，所以调用方可以无脑遍历一批 `infos`。
 
-```python
-lrs = [1.5e-4, 1.5e-4, 1.2e-4, 1.0e-4, 8e-5, 6e-5]
-```
+### 3.4 `_spec_as_dict` 把地形摊平成 JSON 可序列化的字典
 
-高立面要求更细的更新。用同一个学习率往下走，一次过大的更新就可能把已经学会的
-踏步节律踢掉，而策略再也回不到那个解（这一级没有更简单的起点）。
+`vars(spec)` 拿到 dataclass 字段后，额外补 `friction`（tuple → list）、
+`crest_height`、`up_end_x` 两个**派生属性**（它们不是字段）。理由：读
+`summary.json` 的人想知道「这条楼梯多高、到哪结束」，而这两个量在
+`StairSpec` 上是 property，`vars()` 看不到。
 
-### 3.4 平地必须用 `flat_spec`，不能用 0 高度的楼梯
+### 3.5 `write_summary` 只有一个参数顺序
 
-`demo_stairs_spec(step_height=0.0, n_up=8)` 会生成 `size="0.250000 1.000000 0.000000"`
-的 box，MuJoCo 直接抛 `ValueError: Error: size 2 must be positive in geom`。所以
-平地走 `flat_spec(n_up=0, n_down=0, step_height=0.0, ...)`，并且 `is_flat` 的判据是
-`spec.n_up == 0 and spec.n_down == 0` 而不是 `step_height == 0.0`。
+签名是 `write_summary(path, stages, results=None, meta=None)`。
 
-### 3.5 训练者用**结构化子类型**（`Protocol`）而不是基类
-
-`StageTrainer` 只声明四个方法（`make_env` / `train_stage` / `save_model` / `close`），
-`scripts/train.py` 里的一个普通类就能满足，不需要 import 本模块再继承。这样
-`curriculum.py` 可以保持**零 SB3 依赖**——它是纯账本，测试时不需要装 torch。
-
-### 3.6 `save_model` 允许抛 `NotImplementedError`
-
-`Curriculum.run()` 用 `try/except NotImplementedError` 包住它，拿不到路径就退回去读
-模型对象自己的 `model_path` / `path` 属性（`_model_path_of`）。这让一个只做内存内
-训练的最小训练者也能跑课程。
+历史上它带过一个 `if isinstance(path, dict): path, meta = stages, path` 的重载，
+用来兼容「先攒 payload、再给路径」的老调用习惯（`write_summary(payload, path)`）。
+那个调用方是已被删除的 `Curriculum.run()`，**重载分支已随死代码清理删除** ——
+现在传 dict 会被当成路径并在 `Path(dict)` 处抛 `TypeError`。
+完整签名见 §4。
 
 ## 4. 公开 API
 
 ```python
 STAGE_HEIGHTS_CM: tuple[float, ...] = (0.0, 3.0, 6.0, 9.0, 12.0, 15.0)
-DEFAULT_TREAD = 0.50
-DEFAULT_N_UP  = 8
-DEFAULT_TOP_LANDING = 1.20
-DEFAULT_WIDTH = 2.0
-DEFAULT_START_X = 1.50
+DEFAULT_TREAD: float = 0.50
+DEFAULT_N_UP: int = 8
+
 
 @dataclass
 class StageSpec:
     name: str
-    step_height: float          # [m]，平地 = 0.0
+    step_height: float          # 台阶高 [m]，平地 = 0.0
     spec: StairSpec
     timesteps: int
     learning_rate: float
@@ -110,17 +103,17 @@ class StageSpec:
     def is_flat(self) -> bool: ...        # spec.n_up == 0 and spec.n_down == 0
     def summary(self) -> str: ...
 
-def default_curriculum(*, tread: float = 0.50, n_up: int = 8,
-                       total_timesteps: int | None = None) -> list[StageSpec]: ...
 
 @dataclass
 class EpisodeStats:
     window: int = 50
     n_total: int = 0
 
+    def __post_init__(self) -> None: ...
     def add(self, *, success: bool, fallen: bool, ret: float, length: float) -> None: ...
-    def add_info(self, info: dict[str, Any]) -> bool: ...      # 只有带 "episode" 的才算
+    def add_info(self, info: dict[str, Any]) -> bool: ...
     def add_infos(self, infos: Iterable[dict[str, Any]]) -> int: ...
+
     @property
     def n_window(self) -> int: ...
     @property
@@ -131,8 +124,13 @@ class EpisodeStats:
     def mean_return(self) -> float: ...
     @property
     def mean_length(self) -> float: ...
+
     def as_dict(self) -> dict[str, float]: ...
     def format_line(self) -> str: ...
+
+
+def _nanmean(values: Iterable[float]) -> float: ...      # 内部
+
 
 @dataclass
 class StageResult:
@@ -152,191 +150,161 @@ class StageResult:
 
     def as_dict(self) -> dict[str, Any]: ...
 
-class StageTrainer(Protocol):
-    def make_env(self, stage: StageSpec, *, warm_start: str | None = None) -> Any: ...
-    def train_stage(self, stage: StageSpec, venv: Any, *,
-                    warm_start: str | None = None,
-                    tensorboard_log: str | Path | None = None,
-                    **kwargs: Any) -> tuple[Any, EpisodeStats]: ...
-    def save_model(self, model: Any, stage: StageSpec, venv: Any) -> Path: ...
-    def close(self) -> None: ...
 
-@dataclass
-class Curriculum:
-    stages: list[StageSpec]
-    results: list[StageResult] = field(default_factory=list)
-    model_path: str | None = None
-    summary_path: Path | None = None
+def format_curriculum(
+    stages: Sequence[StageSpec],
+    results: Sequence[StageResult] | None = None,
+) -> str: ...
 
-    @classmethod
-    def default(cls, *, total_timesteps: int | None = None) -> Curriculum: ...
-    def names(self) -> list[str]: ...
-    def __iter__(self): ...
-    def __len__(self) -> int: ...
-    def run(self, trainer: StageTrainer, *,
-            resume_from: str | None = None,
-            tensorboard_log: str | Path | None = None,
-            summary_path: str | Path | None = None,
-            meta: dict[str, Any] | None = None,
-            verbose: int = 1,
-            **train_kwargs: Any) -> list[StageResult]: ...
-    def table(self) -> str: ...
-    def total_timesteps(self) -> int: ...
 
-def format_curriculum(stages: Sequence[StageSpec],
-                      results: Sequence[StageResult] | None = None) -> str: ...
-def write_summary(path, stages, results, meta) -> Path: ...
-def format_seconds(seconds: float) -> str: ...
+def write_summary(
+    path: str | Path,
+    stages: Sequence[StageSpec],
+    results: Sequence[StageResult] | None = None,
+    meta: dict[str, Any] | None = None,
+) -> Path: ...
+
+
+def _spec_as_dict(spec: StairSpec) -> dict[str, Any]: ...   # 内部
+
+
+def format_seconds(seconds: float) -> str: ...   # 12.3s / 4.5min / 1.20h
 ```
 
-`__all__ = ["STAGE_HEIGHTS_CM", "Curriculum", "EpisodeStats", "StageResult",
-"StageSpec", "StageTrainer", "default_curriculum", "format_curriculum",
-"format_seconds", "write_summary"]`
+`__all__` = `["STAGE_HEIGHTS_CM", "EpisodeStats", "StageResult", "StageSpec",
+"format_curriculum", "format_seconds", "write_summary"]`
+（`robotdog/curriculum.py:300-308`）
 
 语义要点：
 
-* `EpisodeStats.add_info()` **只在 `info` 含 `dict` 类型的 `"episode"` 键时才记一笔**，
-  其余 info 被静默忽略 —— 所以调用方可以无脑遍历整个 `infos` 列表。返回 `True`
-  表示真的记了一笔。
-* `success_rate` / `fall_rate` 是**窗口内**的；`n_total` 是**全程**的。前者用于进度显示，
-  后者用于判断样本量够不够。
-* `mean_return` / `mean_length` 走 `_nanmean`，会丢弃 `nan`（例如某些子环境没有回报时）。
-* `Curriculum.run()` 每级结束后**务必**调用 `venv.close()`（在 `finally` 里），因为
-  下一级会新建一个向量环境；不关会泄漏 8 个 MuJoCo 模型。
-* `meta` 会被合进 `summary.json`，并且 `run()` 会补三个默认键
-  （`stage_heights_cm`、`n_stages`、`total_timesteps`）与两个总是覆盖的键
-  （`resume_from`、`final_model`）。
+* `EpisodeStats.window` 不是构造后的只读量：`__post_init__` 用它给四个
+  `deque(maxlen=window)` 定容量。构造时传入的 `_success` 等既有关卡会被保留。
+* `_nanmean` 先 `np.isfinite` 过滤再平均，空数组返回 `0.0` 而不是 `nan`
+  —— 报表里出现 `nan` 比出现 `0.0` 更难解释。
+* `StageSpec.is_flat` 判的是 `spec` 的两级数，**不是** `step_height`
+  （虽然两者在本仓总是一致的）。
+* `format_curriculum` 的表格宽度按最长表头算，`results=None` 时只输出定义部分。
+* `write_summary` 里 `out.parent.mkdir(parents=True, exist_ok=True)` 已包含建目录；
+  不需要先调 `RunDir.ensure()`。
+* `as_dict()` 的浮点都做了 `round`：`success_rate`/`fall_rate` 四位、`mean_return` 三位。
 
 ## 5. 内部结构与数据流
 
-```
-scripts/train.py
-  config_to_stages(raw)                      # config.yaml 的 curriculum 段
-      └─ flat_spec / demo_stairs_spec → [StageSpec × 6]
-         （Curriculum.default() / default_curriculum() 是库内等价的旧入口，
-            当前 CLI 不再调用它，见 §9）
-  Curriculum.run(Trainer(), resume_from=…, summary_path=…, meta={env_config, obs_config, reward_config})
-      for stage in stages:
-          venv   = trainer.make_env(stage, warm_start=…)      # 重编译 MJCF
-          model, stats = trainer.train_stage(stage, venv, warm_start=…)
-          path   = trainer.save_model(model, stage, venv)      # checkpoints/<stage>_final.zip
-          venv.close()
-          warm   = path                                         # 下一级的 warm start
-          results.append(StageResult(…stats…))
-      write_summary(summary_path, stages, results, payload)
-```
-
-`EpisodeStats` 的填充路径：
+阶段定义 → 训练 → 报表的完整链路（跨模块）：
 
 ```
-VecMonitor 把 info["episode"] = {"r": …, "l": …} 挂在回合结束那一步的 info 上
-    → scripts/train.py 的 ProgressCallback._on_step 收集 infos
-    → EpisodeStats.add_infos(infos)      → 返回新增回合数
-    → EpisodeStats.format_line()         → 一行进度
+config.yaml (curriculum: heights_cm / tread / n_up / timesteps / learning_rate)
+  → robotdog/config.py  config_to_stages()
+      → flat_spec(tread=...)                    # 第 1 级
+      → demo_stairs_spec(step_height=h/100, tread=..., n_up=...)   # 其余 5 级
+      → [StageSpec, StageSpec, ...]
+  → scripts/train.py    for stage in stages:
+      → Trainer.train_stage(stage, venv, warm_start=...)
+          → EpisodeStats.add_infos(infos)        # 每个 rollout 迭代
+          → StageResult(...)                     # 阶段结束
+      → write_summary(run.summary, stages, results, payload)
+          — meta 里的 env_config / obs_config / reward_config / final_model /
+            wall_seconds 被平铺到顶层，再补 stages / results / total_timesteps
+```
+
+本模块内部：
+
+```
+format_curriculum(stages, results)
+  → by_name = {r.name: r for r in results}
+  → 每个 stage 一行；results 非空时追加 成功率/摔倒率/均回报/用时/模型名
+  → 末行 "合计 N 级, 总预算 M 步"
+
+write_summary(path, stages, results, meta)
+  → _spec_as_dict(s.spec) 逐级摊平地形
+  → payload["results"] = [r.as_dict() ...]
+  → payload["total_timesteps"] = sum(s.timesteps)
+  → json.dumps(indent=2, ensure_ascii=False)
 ```
 
 ## 6. 关键常量与默认值
 
-| 名称 | 值 | 说明 |
-| --- | --- | --- |
-| `STAGE_HEIGHTS_CM` | `(0.0, 3.0, 6.0, 9.0, 12.0, 15.0)` | 六级，平地 + 五级台阶 |
-| `DEFAULT_TREAD` | `0.50` m | 踏面。**不要改**：实测 0.40 / 0.60 会让 34% 的成功率掉到 10%，0.65 直接 0% |
-| `DEFAULT_N_UP` | `8` | 上行级数 |
-| `DEFAULT_TOP_LANDING` | `1.20` m | 顶层平台长度 |
-| `DEFAULT_WIDTH` | `2.0` m | 楼梯宽度 |
-| `DEFAULT_START_X` | `1.50` m | 第一级立面的 x |
-| `_FLAT_BASE_STEPS` | `100_000` | 平地预算 |
-| `_STAIR_BASE_STEPS` | `250_000` | 每级台阶预算 |
-| 默认总预算 | `1,350,000` 步 | `100k + 5 × 250k` |
-| 学习率表 | `[1.5e-4, 1.5e-4, 1.2e-4, 1.0e-4, 8e-5, 6e-5]` | 索引与 `STAGE_HEIGHTS_CM` 对齐 |
-| `EpisodeStats.window` | `50` | 滑动窗口长度 |
-| 阶段名 | `flat`、`stair3`、`stair6`、`stair9`、`stair12`、`stair15` | 也是 `checkpoints/<名字>_final.zip` 的文件名；由 `config_to_stages()` 按高度推导 |
-
-实测 `default_curriculum()` 展开：
-
-```
-flat     h=0.00cm  100,000 步  lr=1.5e-4
-stair3   h=3.00cm  250,000 步  lr=1.5e-4
-stair6   h=6.00cm  250,000 步  lr=1.2e-4
-stair9   h=9.00cm  250,000 步  lr=1.0e-4
-stair12  h=12.00cm 250,000 步  lr=8e-5
-stair15  h=15.00cm 250,000 步  lr=6e-5
-（全部 n_up=8, tread=0.50）
-```
+| 项 | 真实值 |
+| --- | --- |
+| `STAGE_HEIGHTS_CM` | `(0.0, 3.0, 6.0, 9.0, 12.0, 15.0)` —— 固定六档，平地 + 3/6/9/12/15 cm |
+| `DEFAULT_TREAD` | `0.50` m |
+| `DEFAULT_N_UP` | `8` |
+| `EpisodeStats.window` 默认 | `50` |
+| `format_seconds` 分界 | `< 60` → `12.3s`；`< 3600` → `4.5min`；否则 `1.20h` |
+| `as_dict()` 舍入 | `success_rate`/`fall_rate` 4 位，`mean_return` 3 位，`mean_length` 1 位 |
+| 文件行数 | 308 行 |
 
 ## 7. 与其它模块的关系
 
-```
-robotdog/tools/terrain.py   (StairSpec / flat_spec / demo_stairs_spec)
-            ▲
-robotdog/curriculum.py  ────►  scripts/train.py  (实现 StageTrainer，持有 PPO)
-                                        │
-                                robotdog/training.py  (make_vec_env / build_ppo / RunDir)
-```
+**上游**：stdlib（`json` / `time` / `collections.deque` / `dataclasses` / `pathlib` /
+`typing`）+ `numpy` + `robotdog.tools.terrain.StairSpec`（`robotdog/curriculum.py:23`）。
+**不 import `robotdog.env` / `robotdog.training` / `stable_baselines3`**。
 
-* **唯一的下游依赖是 `tools.terrain`**。没有 `env`、没有 `training`、没有 SB3 ——
-  这是刻意的，它保证「课程表」可以在没有 torch 的环境里被读出来（文档、报表、
-  `--help` 打印都不需要装深度学习栈）。
-* **向上**只有 `scripts/train.py` 消费它。仓库里没有其它调用方。
-* **与 `training.py` 的分工**：`training.py` 知道「怎么建环境、怎么建 PPO、存哪里」；
-  `curriculum.py` 只知道「跑几级、每级多少步」。两者通过 `StageTrainer` 协议接触，
-  由 `scripts/train.py` 这一个具体类把两边接起来。
+**下游**：
+
+| 位置 | 用到的符号 |
+| --- | --- |
+| `robotdog/config.py` | `StageSpec`、`STAGE_HEIGHTS_CM`、`DEFAULT_TREAD`、`DEFAULT_N_UP`（构造阶段表） |
+| `scripts/train.py` | `EpisodeStats`、`StageResult`、`format_curriculum`、`write_summary`、`format_seconds` |
+
+依赖方向是 `scripts/train.py → robotdog/curriculum.py → robotdog/tools/terrain.py`，
+永远向下，不成环。
 
 ## 8. 实测与经验教训
 
-* `experience.md` §4.1 —— 旧的「成功率达标即毕业」判据会把 PPO 的梯度更新饿死
-  （每级只跑 0~1 次更新，`mean|a| = 0.011`，策略退化成纯先验）。现在的课程**没有**
-  这个门，只有步数预算，就是这条教训的直接结果。
-* `experience.md` §4.2 —— 奖励归一化是温和的稳定器而非解药（3 cm 成功率
-  0.474 → 0.539），所以 `norm_reward` 默认开但不要指望它单独解决问题。
-* `train.md` §1.1 —— 六级课程表与学习率。
-* `train.md` §3.1 —— 12,000 步冒烟六级全部跑完的实测输出。
-* `README.md` §3.5 —— 踏面不可改、`geomgroup=1`、`CREST_SEAM_OVERLAP`。
+* 六级课程的实测数字、每级产物清单，见 `train.md` §1、§2。
+* 「抽象层被调用方绕过」这条教训的完整背景（旧的 `Curriculum` + `StageTrainer`
+  被删除），见 `experience.md` 的死代码清理小节。
+* 配置层如何把 `config.yaml` 的六档高度变成 `StageSpec` 列表，见
+  `docs/robotdog/config.md` §4。
 
 ## 9. 已知限制与坑
 
-* **`Curriculum.run()` 没有断点续训**。进程在第三级中途被杀，就只能从**该级之前的
-  checkpoint 手工重建**（当前 CLI 没有 `--resume` / `--from-stage` 一类入口，
-  课程表与预算是 `config.yaml` 的 `curriculum` 段一次性给死的）。
-  要把「从某个权重接着练」加回来，得在 `scripts/train.py` 里新接一条路径。
-* **`default_curriculum()` / `Curriculum.default()` 现在没有调用方**。课程的构造权已经
-  交给 `robotdog/config.py:config_to_stages()`（读 `config.yaml` 的 `curriculum` 段，
-  见 `docs/robotdog/config.md` §3.4）。这两个入口保留在库里，是因为它们自带
-  「1:2.5 权重分配 + 学习率表」这套**参考实现**，配置侧可以选择调用它们或自建
-  `StageSpec`。改课程默认值时，两处都要看。
-* **阶段切换期间没有验证**。每级结束后只报训练期的滑动窗口统计（采样动作口径），
-  不是确定性评估；要确定性成功率请用 `scripts/play.py --mode eval`。
-* `default_curriculum` 的 `tread` / `n_up` 会**同时**作用于平地与所有台阶阶段，
-  没有「只改某一级」的入口。要非均匀课程就直接构造 `StageSpec` 列表。
-* `_spec_as_dict()` 写进 `summary.json` 的字段是 `vars(spec)` 加 `crest_height` /
-  `up_end_x`，`friction` 被转成 list（JSON 没有元组）。读回时不要假设它是 tuple。
-* `StageResult.episodes` 是**窗口之外**的总回合数（`stats.n_total`），
-  而 `success_rate` 是窗口内的——两者口径不同，别相除。
-* `format_curriculum()` 与 `StageSpec.summary()` 的行宽是对齐好的，改标签长度会错位。
+* **没有断点续训**。`scripts/train.py` 的循环被杀了就只能从该级之前重来
+  （`runs/<名字>/` 已存在时训练入口直接拒绝启动，避免覆盖）。
+* **没有自动晋级**。每一级都训满 `timesteps`，哪怕上一级还没学会。
+* **`EpisodeStats` 只在窗口内统计**：`n_total` 是累计回合数，但
+  `success_rate` 只看最近 `window` 个。读日志时不要把两者混起来算。
+* **`StageResult` 默认 `step_height=0.0`**，直接构造而不传该字段会得到
+  「看起来像平地」的报表行。
+* **`write_summary` 只有一个参数顺序**：`(path, stages, results, meta)`。老文档描述的
+  `isinstance(path, dict)` 重载已随死代码清理删除，传 `dict` 给 `path` 会在
+  `Path(dict)` 处抛 `TypeError`，不会静默走错分支。
+* **本模块不再有 `Curriculum` / `StageTrainer` / `default_curriculum`**。
+  在旧文档或旧脚本里看到这些名字，一律是过期引用。
 
 ## 10. 示例用法
 
 ```python
-from robotdog.curriculum import Curriculum, default_curriculum, format_curriculum
+from robotdog.curriculum import (
+    EpisodeStats,
+    StageResult,
+    StageSpec,
+    format_curriculum,
+    format_seconds,
+    write_summary,
+)
+from robotdog.tools.terrain import demo_stairs_spec, flat_spec
 
-# 看课程表（不需要 SB3、不需要环境）
-stages = default_curriculum()
-print(format_curriculum(stages))
+stages = [
+    StageSpec(name="flat", step_height=0.0, spec=flat_spec(n_up=0, n_down=0),
+              timesteps=100_000, learning_rate=1.5e-4, label="平地"),
+    StageSpec(name="stair3", step_height=0.03,
+              spec=demo_stairs_spec(step_height=0.03, tread=0.50, n_up=8),
+              timesteps=250_000, learning_rate=1.5e-4, label="3cm"),
+]
 
-# 缩到 30 万步跑一遍（只在测试里这么干）
-cur = Curriculum.default(total_timesteps=300_000)
-for s in cur:
-    print(s.name, s.timesteps, f"{s.step_height*100:.1f}cm", s.is_flat)
+print(format_curriculum(stages))          # 只有定义部分
 
-# 真正驱动训练（Trainer 由 scripts/train.py 提供）
-# cur.run(trainer,
-#         resume_from=None,
-#         summary_path="runs/walk1/summary.json",
-#         meta={"env_config": ..., "obs_config": ..., "reward_config": ...})
-
-# 单独用统计累加器
-from robotdog.curriculum import EpisodeStats
 stats = EpisodeStats(window=50)
-stats.add(success=True, fallen=False, ret=123.4, length=210.0)
+stats.add(success=True, fallen=False, ret=412.5, length=168.0)
+stats.add_info({"episode": {"r": -30.0, "l": 90.0}, "is_success": False, "fallen": True})
 print(stats.format_line())
+print(format_seconds(272.4))              # 4.5min
+
+results = [StageResult(name="flat", label="平地", success_rate=1.0,
+                       mean_return=330.87, wall_seconds=272.4,
+                       model_path="runs/course1/checkpoints/flat_final.zip")]
+print(format_curriculum(stages, results))
+write_summary("runs/course1/summary.json", stages, results, meta={"seed": 0})
 ```

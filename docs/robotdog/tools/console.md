@@ -52,18 +52,32 @@ if reconfigure is None:
 
 `getattr(sys, stream_name, None)` 一起兜掉了「解释器没有 `sys.stdout`」（pythonw、`-c` 下 `sys.stdout` 为 `None`）的情况 —— 此时 `stream` 是 `None`，`getattr(None, "reconfigure", None)` 返回 `None`，走 `continue`。
 
-`reconfigure` 已知会在两种情形抛异常并写入源码注释 `# e.g. detached or already-closed stream; nothing we can do`：
+`reconfigure` 已知会在两种情形抛异常并写入源码注释 `# 例如流已分离或已关闭；这里无能为力`（`robotdog/tools/console.py:27`）：
 
 * `ValueError`：流已关闭。
 * `OSError`：流已分离（detached）。
 
 二者都是「环境已经坏了，但程序还能继续跑」，所以吞掉。**被否决的方案**：兜 `Exception` —— 否决，因为这会掩盖真正的 bug（例如某天有人给流对象传了错误的参数类型），而编码修复失败的后果只是乱码，不是崩溃。
 
-### 3.5 自动调用点放在 `robotdog/__init__.py`，不放本模块
+### 3.5 调用点是脚本，不是 `robotdog/__init__.py`
 
-`robotdog/__init__.py:7` 导入它、`:11` 调用它。理由：编码必须在**任何输出发生之前**生效，而 `robotdog/__init__.py` 是「整个进程里第一段 robotdog 代码」的确定位置。放在 `robotdog/tools/__init__.py`（会在父包初始化期间先执行）会变成「谁先 import 谁决定」，而且让「导入一个路径常量」这种纯数据操作产生进程级副作用。
+`robotdog/__init__.py:15` 只**导入**它、**从不调用**它。真实调用点是
+`scripts/train.py:235` 与 `scripts/play.py:429`，两处都在 `main()` 的第一行。
 
-**被否决的方案**：在 `console.py` 模块层直接调用自己 —— 否决，因为那样连 `from robotdog.tools.console import setup_utf8_console` 都会改进程 I/O，而这个函数**需要**能被显式调用（`scripts/train.py:235` / `scripts/play.py:433` 正是这么用的），显式与隐式两条路径会叠加。
+理由：编码必须在**任何输出发生之前**生效，而脚本的 `main()` 第一行正是这个确定位置；
+放成包导入的副作用会让「导入一个纯数据模块」改进程 I/O，范围超出合理预期（见
+`docs/robotdog/__init__.md` §3 D1）。放在 `robotdog/tools/__init__.py` 更糟：它会变成
+「谁先 import 谁决定」，而且让「导入一个路径常量」这种纯数据操作产生全局副作用。
+
+**被否决的方案**：在 `console.py` 模块层直接调用自己 —— 否决，因为那样连
+`from robotdog.tools.console import setup_utf8_console` 都会改进程 I/O，而这个函数
+**需要**能被显式调用（`scripts/train.py:235` / `scripts/play.py:429` 正是这么用的），
+显式与隐式两条路径会叠加。
+
+**历史腐坏**：本文档与 `robotdog/__init__.py`、`robotdog/tools/console.py` 三处曾一致声称
+「导入 `robotdog` 即自动修控制台编码」，`git show HEAD:robotdog/__init__.py` 证明该调用
+从来不存在。三处文案已改成事实；源码里**故意没有补上这次调用**（补调用会改变
+`import robotdog` 的进程级 I/O 行为，超出「删无用代码 + 中文化注释」的范围）。
 
 ## 4. 公开 API
 
@@ -76,7 +90,7 @@ __all__ = ["setup_utf8_console"]
 
 
 def setup_utf8_console() -> None:
-    """Make stdout/stderr emit UTF-8; safe to call repeatedly and on any stream."""
+    """让 stdout/stderr 输出 UTF-8；可重复调用，对任何流都安全。"""
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         reconfigure = getattr(stream, "reconfigure", None)
@@ -85,9 +99,11 @@ def setup_utf8_console() -> None:
         try:
             reconfigure(encoding="utf-8", errors="replace")
         except (ValueError, OSError):
-            # e.g. detached or already-closed stream; nothing we can do
+            # 例如流已分离或已关闭；这里无能为力
             pass
 ```
+
+（`robotdog/tools/console.py:18-29`。模块 docstring 在 `:1-9`，`__all__` 在 `:15`。）
 
 | 项 | 值 |
 | --- | --- |
@@ -104,12 +120,12 @@ def setup_utf8_console() -> None:
 
 ## 5. 内部结构与数据流
 
-一次典型调用（进程里第一段 robotdog 代码）：
+一次真实调用（脚本在 `main()` 第一行主动调用）：
 
 ```
-import robotdog
-  → robotdog/__init__.py:9  from robotdog.tools.console import setup_utf8_console
-  → robotdog/__init__.py:10 setup_utf8_console()
+scripts/train.py:54   from robotdog.tools import console  # noqa: E402
+scripts/train.py:235  console.setup_utf8_console()        # main() 的第一条语句
+  → setup_utf8_console()
       → for stream_name in ("stdout", "stderr")
           → getattr(sys, stream_name, None)          # 得到 TextIOWrapper 或 None
           → getattr(stream, "reconfigure", None)     # 得到绑定方法或 None
@@ -118,19 +134,17 @@ import robotdog
           → except (ValueError, OSError): pass
 ```
 
-从脚本侧显式调用（`scripts/train.py:54` 精确导入模块、`scripts/train.py:235` 在 `main()` 的第一行调用；`scripts/play.py:48` / `scripts/play.py:433` 同构）：
+`scripts/play.py:48` 精确导入同一个模块，`scripts/play.py:429` 在 `main()` 的第一行
+以同样方式调用：
 
 ```
-scripts/train.py:54   from robotdog.tools import console  # noqa: E402
-scripts/train.py:235  console.setup_utf8_console()        # main() 的第一条语句
+scripts/play.py:48    from robotdog.tools import console, paths  # noqa: E402
+scripts/play.py:429   console.setup_utf8_console()               # main() 的第一条语句
 ```
 
-从脚本侧依赖父包副作用（任何 `import robotdog.*` 都会先执行 `robotdog/__init__.py`）：
-
-```
-import robotdog   # noqa: F401  (installs the UTF-8 console wrapper)
-  → robotdog/__init__.py:10 setup_utf8_console()
-```
+**没有任何「靠导入触发」的路径**：`import robotdog` 只执行
+`robotdog/__init__.py:14`（三个工具模块）与 `:15`（导入本函数），不调用它。
+`robotdog/__init__.py` 的模块 docstring（`:6-9`）把这一点写成了显式警告。
 
 本模块内部无进一步调用链（只调 stdlib 的 `getattr` 与流的 `reconfigure`）。
 
@@ -152,10 +166,9 @@ import robotdog   # noqa: F401  (installs the UTF-8 console wrapper)
 
 | 位置 | 用法 | 方向理由 |
 | --- | --- | --- |
-| `robotdog/__init__.py:9, 10` | 导入 + 立即调用 | 包装层是最早的 robotdog 代码，天然是「输出前修好编码」的唯一位置 |
+| `robotdog/__init__.py:15` | **只导入，不调用** | 供 `from robotdog import setup_utf8_console` 使用；导入本身不产生副作用，所以 `import robotdog` 不会改进程 I/O |
 | `scripts/train.py:54, 235` | 显式导入模块并在 `main()` 首行调用 | 独立脚本可能不经 `import robotdog` 启动，所以自己兜一次（幂等） |
-| `scripts/play.py:48, 433` | 同上 | 同上 |
-| 任何 `import robotdog.*` | 靠父包副作用，不再重复调用 | 父包在第 10 行已经修好了编码 |
+| `scripts/play.py:48, 429` | 同上 | 同上 |
 
 **为什么方向是「工具层被所有人依赖」**：编码修复是最底层的横切关注点，它不需要任何项目知识，因此可以放在依赖图的最底端被所有层调用；反过来它绝不 import 任何项目模块，否则就从最底端变成环的一环。
 
@@ -172,7 +185,7 @@ import robotdog   # noqa: F401  (installs the UTF-8 console wrapper)
 * **只对当前流对象生效**。已被别人缓存的旧 `TextIOWrapper` 引用不受影响；被替换掉的新流对象也不受约束。若某处做了 `sys.stdout = MyStream()`，需要再调一次 `setup_utf8_console()`。
 * **不会让终端本身的代码页变 UTF-8**。如果 Windows 控制台活动代码页是 936，UTF-8 字节仍可能显示为乱码 —— 本函数解决的是「重定向到文件/管道后被读成乱码」，不是「控制台字体/代码页」。控制台侧要看 `chcp 65001`。
 * **`errors="replace"` 会静默丢字**：无法编码的字符变成替代字符，日志里不会出现任何警告。想严格报错必须绕过本函数。
-* **覆盖了调用方的显式设置**。若某脚本刻意设置 `PYTHONIOENCODING` 为别的编码，只要 `import robotdog` 就会被改成 UTF-8。
+* **覆盖了调用方的显式设置**。若某脚本刻意把 `PYTHONIOENCODING` 设为别的编码，只要它（或它导入的 `robotdog` 脚本）调用了本函数，就会被改成 UTF-8。注意**光 `import robotdog` 不会**触发——本函数只被脚本显式调用。
 * **不监控 `sys.stdout` 的后续替换**，也没有 `atexit` 钩子做还原。
 * **`reconfigure` 内部抛出的 `AttributeError` / `TypeError` 不会被捕获**（只兜 `ValueError, OSError`），会直接冒泡。
 * **模块名与文件路径一致**：本模块的规范导入路径是 `robotdog.tools.console`，仓里**没有**同名的顶层 `robotdog/console.py`，所以 traceback 里出现的模块名就是真实文件位置。
@@ -186,16 +199,15 @@ from robotdog.tools.console import setup_utf8_console
 setup_utf8_console()
 print("中文日志写入管道/文件后不再是乱码")
 
-# 2) 靠父包副作用（任务脚本的常见写法）
-import robotdog  # noqa: F401  (installs the UTF-8 console wrapper)
-from robotdog.tools.paths import LOGS_DIR
+# 2) 经包入口拿到同一个函数（等价写法）
+from robotdog import setup_utf8_console
+from robotdog.tools.paths import RUNS_DIR
 
 setup_utf8_console()          # 再次调用是安全的（幂等）
-print(LOGS_DIR)
+print(RUNS_DIR)
 
 # 3) 输出被重定向到文件，用 UTF-8 读回来
 import sys
-import io
 
 setup_utf8_console()
 sys.stdout.write("校验\n")

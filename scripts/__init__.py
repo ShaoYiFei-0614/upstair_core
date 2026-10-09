@@ -1,5 +1,5 @@
-"""Project scripts (importable as a package so verification scripts can reuse them).
+"""工程脚本（做成可导入的包，便于验证脚本复用）。
 
-The CLI entry points live here as well: ``python scripts/train.py`` still works
-because each module has a ``__main__`` guard.
+命令行入口也放在这里：``python scripts/train.py`` 依然可用，
+因为每个模块都带 ``__main__`` 守卫。
 """

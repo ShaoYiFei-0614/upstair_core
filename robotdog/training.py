@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import json
-import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable
@@ -310,13 +309,6 @@ class RunDir:
             return Path(str(base) + ".zip"), p
         return Path(str(base) + ".zip"), save_vecnormalize(model, base)
 
-    def write_summary(self, payload: dict[str, Any]) -> Path:
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.summary.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        return self.summary
-
 
 # --------------------------------------------------------------------------- #
 # 报表辅助
@@ -324,25 +316,12 @@ class RunDir:
 
 
 def format_duration(seconds: float) -> str:
-    """``12.3s`` / ``4.5min`` / ``1.20h``。"""
+    """把秒数写成 ``12.3s`` / ``4.5min`` / ``1.20h``。"""
     if seconds < 60:
         return f"{seconds:.1f}s"
     if seconds < 3600:
         return f"{seconds / 60:.1f}min"
     return f"{seconds / 3600:.2f}h"
-
-
-class Stopwatch:
-    """最小计时器。"""
-
-    def __init__(self) -> None:
-        self.t0 = time.time()
-
-    @property
-    def elapsed(self) -> float:
-        return time.time() - self.t0
-
-
 def mean_abs_action(actions: np.ndarray) -> float:
     """``mean(|a|)``：判断策略是否退化成「纯先验」的关键量（健康值约 0.3~0.45）。"""
     return float(np.mean(np.abs(np.asarray(actions, dtype=np.float64))))
@@ -351,7 +330,6 @@ def mean_abs_action(actions: np.ndarray) -> float:
 __all__ = [
     "DEFAULT_NET_ARCH",
     "RunDir",
-    "Stopwatch",
     "build_ppo",
     "format_duration",
     "load_policy",

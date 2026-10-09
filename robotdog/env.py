@@ -1,29 +1,26 @@
-"""Gymnasium environment: Unitree Go2 walking blind up box stairs.
+"""Gymnasium 环境：Unitree Go2 盲走上箱式楼梯。
 
-**Blind locomotion.**  There is no touch sensor, no ray casting and no contact
-force reading anywhere in this module.  The policy sees only proprioception
-joint angles/velocities, base attitude and rate, the previous action) plus a
-single scalar telling it how tall the staircase it was placed on is.  It has to
-discover the stepping rhythm from that alone.
+**盲走（blind locomotion）**：本模块中没有任何触觉传感器、没有射线投射，
+也没有任何接触力读取。策略只能看到本体感知——关节角/角速度、机身姿态与角速度、
+上一步动作——外加一个标量，告诉它被放上去的那条楼梯有多高。它必须仅凭这些
+发现迈步的节奏。
 
-* **Action** -- 12 joint target angles (``FL_hip .. RR_calf``).
-* **Observation** -- ``ObsConfig``: 42 proprioceptive values per frame (joint
-  positions/velocities, base roll/pitch/yaw, angular velocity, previous action)
-  plus the blocks that are switched on; the last ``history_len`` frames are
-  stacked.  No contact or range-sensor data exists anywhere.
-* **Reward** -- ``RewardConfig``: forward speed, posture, joint torque, foot
-  lift, torso/leg collision, staircase progress (plus standard shaping).
+* **Action** -- 12 个关节目标角（``FL_hip .. RR_calf``）。
+* **Observation** -- ``ObsConfig``：每帧 42 个本体感知量（关节位置/速度、机身
+  roll/pitch/yaw、角速度、上一步动作），再加上被打开的那些观测块；最近
+  ``history_len`` 帧会被堆叠。任何地方都没有接触或测距传感器数据。
+* **Reward** -- ``RewardConfig``：前进速度、姿态、关节力矩、足端抬升、
+  机身/腿部碰撞、爬梯进展（外加常规的成形项）。
 
-Frame conventions:
+帧约定：
 
-* ``qpos[0:3]``  base position, **world** frame.
-* ``qpos[3:7]``  base orientation quaternion ``(w, x, y, z)``, world->body.
-* ``qvel[0:3]``  base linear velocity, **world** frame.
-* ``qvel[3:6]``  base angular velocity, **LOCAL (body)** frame -- this is the
-  value a real IMU gyro reports, so it is used directly for the observation.
+* ``qpos[0:3]``  机身位置，**世界**系。
+* ``qpos[3:7]``  机身姿态四元数 ``(w, x, y, z)``，世界->机身。
+* ``qvel[0:3]``  机身线速度，**世界**系。
+* ``qvel[3:6]``  机身角速度，**局部（机身）**系 —— 这正是真实 IMU 陀螺报告的
+  值，所以直接用于观测。
 
-Control runs at ``1 / (timestep * decimation)`` Hz (default 50 Hz) while physics
-runs at 500 Hz.
+控制以 ``1 / (timestep * decimation)`` Hz 运行（默认 50 Hz），而物理以 500 Hz 运行。
 """
 
 from __future__ import annotations
@@ -48,26 +45,25 @@ from robotdog.go2_model import (
 from robotdog.tools.terrain import StairSpec, build_terrain_xml
 
 # --------------------------------------------------------------------------- #
-# Configuration
+# 配置
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
 class ObsConfig:
-    """Observation layout.
+    """观测布局。
 
-    ``base_frame_size`` is always present (42 proprioceptive values).  The four
-    boolean blocks below are appended in declaration order; ``step_height`` is the
-    one the blind policy cannot infer cheaply, so it is a plain number rather
-    than something the robot has to estimate.  ``README.md`` §3.2 lists the
-    resulting dimensions.
+    ``base_frame_size`` 始终存在（42 个本体感知量）。下面四个布尔块按声明顺序
+    追加；``step_height`` 是盲走策略无法低成本推断的那一项，所以它是一个普通
+    数字，而不是要机器人自己去估计的量。``README.md`` §3.2 列出了由此得到的
+    维度。
     """
 
     history_len: int = 10
-    base_lin_vel_body: bool = True      # 3: body-frame velocity
-    base_height: bool = False           # 1: height above the terrain under the base
-    gait_phase: bool = False            # 2: sin/cos gait clock
-    step_height: bool = True            # 1: the staircase height of this episode
+    base_lin_vel_body: bool = True      # 3：机身系线速度
+    base_height: bool = False           # 1：机身相对其正下方地形的高度
+    gait_phase: bool = False            # 2：步态时钟的 sin/cos
+    step_height: bool = True            # 1：本回合的楼梯高度
     base_frame_size: int = 42
 
     @property
@@ -86,37 +82,36 @@ class ObsConfig:
 
 @dataclass
 class RewardConfig:
-    """Reward weights.
+    """奖励权重。
 
-    Roughly balancing positive and negative terms.  Historical tuning that these
-    values come from -- which failure each weight closes -- is in
-    ``experience.md`` §2, formulas in ``README.md`` §3.3.
+    大致平衡正项与负项。这些数值所来自的历史调参——每个权重堵住哪种失败——见
+    ``experience.md`` §2，公式见 ``README.md`` §3.3。
     """
 
-    # --- the five requested terms ----------------------------------------- #
-    forward_vel: float = 2.5            # [SPEC] Gaussian tracking of command_vx
+    # --- 五个要求的项 ----------------------------------------------------- #
+    forward_vel: float = 2.5            # [SPEC] 对 command_vx 的高斯跟踪
     forward_vel_sigma: float = 0.25
-    orientation: float = -1.2           # [SPEC] roll^2 + pitch^2
-    torque: float = -1.5e-4             # [SPEC] sum(tau^2)
-    foot_lift: float = 0.9              # [SPEC] swing-clearance shaping
-    body_collision: float = -4.0        # [SPEC] torso touching the terrain
+    orientation: float = -1.2           # [SPEC] roll^2 + pitch^2（平方和）
+    torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
+    foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
+    body_collision: float = -4.0        # [SPEC] 躯干接触地形
 
-    # --- forward motion ---------------------------------------------------- #
-    forward_progress: float = 1.5       # linear in vx, so vx=0 earns nothing
+    # --- 前进运动 ---------------------------------------------------------- #
+    forward_progress: float = 1.5       # 对 vx 线性，所以 vx=0 时一分也拿不到
     forward_progress_max: float = 1.5
     forward_progress_min: float = -0.5
 
-    # --- swing-foot lift --------------------------------------------------- #
-    foot_lift_target: float = 0.08      # floor of the target, not the whole target
-    foot_lift_step_ratio: float = 1.4   # target = max(target, ratio * step_height)
-    foot_lift_gate_speed: float = 0.25  # m/s 3-D foot speed gate
+    # --- 摆动足抬升 -------------------------------------------------------- #
+    foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
+    foot_lift_step_ratio: float = 1.4   # 取较大者：target = max(target, ratio * step_height)
+    foot_lift_gate_speed: float = 0.25  # m/s，三维足端速度门限
 
-    # --- gait discovery ---------------------------------------------------- #
+    # --- 步态发现 ---------------------------------------------------------- #
     air_time: float = 0.6
     air_time_target: float = 0.30
     air_time_max: float = 0.60
 
-    # --- supporting shaping ------------------------------------------------ #
+    # --- 辅助成形 ---------------------------------------------------------- #
     base_height: float = -2.0
     joint_vel: float = -2.0e-5
     action_rate: float = -0.02
@@ -125,55 +120,55 @@ class RewardConfig:
     termination: float = -15.0
     success: float = 50.0
 
-    # --- staircase progress ------------------------------------------------ #
+    # --- 爬升进展 ---------------------------------------------------------- #
     stair_progress: float = 3.0
     leg_collision: float = -0.25
 
 
 @dataclass
 class EnvConfig:
-    """Everything tunable about one environment instance."""
+    """一个环境实例的全部可调项。"""
 
     timestep: float = 0.002
-    decimation: int = 10                    # -> 50 Hz control
+    decimation: int = 10                    # -> 50 Hz 控制
     episode_length_s: float = 20.0
-    action_mode: str = "residual"           # "residual" | "absolute"
-    action_scale: float = 0.30              # rad, policy authority (residual only)
-    command_vx: float = 0.55                # m/s forward command
+    action_mode: str = "residual"           # 动作模式："residual" | "absolute"
+    action_scale: float = 0.30              # rad，策略权限（仅残差模式）
+    command_vx: float = 0.55                # m/s，前向指令
     command_vy: float = 0.0
     command_yaw_rate: float = 0.0
 
-    # --- residual RL over an open-loop gait -------------------------------- #
-    # PD target becomes home + gait_gain * gait.radians(t) + action_scale * action
+    # --- 开环步态之上的残差 RL --------------------------------------------- #
+    # PD 目标变为 home + gait_gain * gait.radians(t) + action_scale * action
     gait_prior: bool = False
     gait: GaitParams = field(default_factory=GaitParams.default_trot)
     gait_gain: float = 1.0
     kp: tuple[float, float, float] = (30.0, 30.0, 45.0)
     kd: tuple[float, float, float] = (0.6, 0.6, 0.9)
 
-    # --- termination ------------------------------------------------------- #
-    # Number of consecutive control steps the trunk must be in contact with the
-    # terrain before the episode ends.  >1 debounces single-frame impacts.
+    # --- 终止 -------------------------------------------------------------- #
+    # 回合结束前躯干必须持续接触地形的连续控制步数。>1 可以对单帧的
+    # 撞击消抖。
     terminate_contact_steps: int = 10
-    # Which surface the "trunk has fallen" height test measures against:
-    #   "base" -> terrain under the base (step function, gives ghost falls)
-    #   "support" -> terrain under the four feet (what actually supports it)
+    # 「躯干是否摔倒」的高度判据以哪个面为基准：
+    #   "base" -> 机身下方的地形（阶梯函数，会产生幽灵摔倒）
+    #   "support" -> 四足下方的地形（真正支撑它的那个面）
     terminate_height_ref: str = "support"
     terminate_min_height: float = 0.13
-    terminate_max_tilt: float = 1.0         # rad, roll or pitch
+    terminate_max_tilt: float = 1.0         # rad，roll 或 pitch
     terminate_on_success: bool = True
 
-    # --- reset noise ------------------------------------------------------- #
+    # --- 重置噪声 ---------------------------------------------------------- #
     reset_z: float = 0.32
     reset_joint_noise: float = 0.06
     reset_xy_noise: float = 0.12
     reset_yaw_noise: float = 0.10
 
-    # --- success ----------------------------------------------------------- #
-    flat_success_distance: float = 3.0      # flat stage only
-    spawn_back: float = 0.55                # m in front of the first riser
+    # --- 成功 -------------------------------------------------------------- #
+    flat_success_distance: float = 3.0      # 仅平地阶段
+    spawn_back: float = 0.55                # 第一个立面前方的米数
 
-    # --- observation / reward ---------------------------------------------- #
+    # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
 
@@ -183,12 +178,12 @@ class EnvConfig:
 
 
 # --------------------------------------------------------------------------- #
-# Environment
+# 环境
 # --------------------------------------------------------------------------- #
 
 
 class Go2StairsEnv(gym.Env):
-    """A Go2 walking on a parametric box staircase."""
+    """一只走在参数化箱式楼梯上的 Go2。"""
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
 
@@ -224,16 +219,16 @@ class Go2StairsEnv(gym.Env):
         self._step_count = 0
         self._start_terrain_height = 0.0
         self._reached_top = False
-        # Consecutive trunk / leg terrain-contact streaks (see
-        # ``EnvConfig.terminate_contact_steps``).
+        # 躯干 / 腿部持续接触地形（见 ``EnvConfig.terminate_contact_steps``）
+        # 的连续步数。
         self._trunk_contact_streak = 0
         self._leg_contact_streak = 0
         self._success_x = self._success_target_x()
-        self.nominal_pose = float(self.meta.home_qpos[2])  # 0.27 m stance height
+        self.nominal_pose = float(self.meta.home_qpos[2])  # 0.27 m 站立高度
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
-        # Gait-prior clock (seconds since episode start).
+        # 步态先验时钟（自回合开始起的秒数）。
         self._gait_t = 0.0
         self._gait_phase = 0.0
         self._rng = np.random.default_rng(seed)
@@ -242,7 +237,7 @@ class Go2StairsEnv(gym.Env):
         self._scene_option = None
         self._render_size = None
 
-    # ------------------------------------------------------------------ build
+    # ------------------------------------------------------------------- 构建
 
     def _build_model(self) -> None:
         opts = SceneOptions(timestep=self.cfg.timestep)
@@ -252,9 +247,9 @@ class Go2StairsEnv(gym.Env):
             floor_geom=default_floor_geom(),
         )
         self.data = mujoco.MjData(self.model)
-        # ``mujoco.Renderer`` binds to one ``MjModel`` instance, so it must never
-        # outlive the model it was built from -- otherwise ``set_stair()`` would
-        # keep drawing the *previous* terrain.
+        # ``mujoco.Renderer`` 绑定到某一个 ``MjModel`` 实例，所以它绝不能比
+        # 构建它的那个模型活得更久 —— 否则 ``set_stair()`` 会一直画*上一块*
+        # 地形。
         if getattr(self, "_renderer", None) is not None:
             self._renderer.close()
             self._renderer = None
@@ -262,37 +257,24 @@ class Go2StairsEnv(gym.Env):
             self._scene_option = None
 
     def set_stair(self, stair: StairSpec) -> None:
-        """Swap the terrain (used by the curriculum). Recompiles the model.
+        """替换地形（课程学习会用到）。会重新编译模型。
 
-        The caller must call ``reset()`` afterwards: recompiling replaces the
-        underlying ``MjModel``/``MjData``, so the old state is meaningless.
+        调用方之后必须调用 ``reset()``：重新编译会替换底层的
+        ``MjModel``/``MjData``，所以旧状态没有意义。
         """
         self.stair = stair
         self._build_model()
         self._success_x = self._success_target_x()
         self._reached_top = False
 
-    def set_gait_prior(self, enable: bool, gait: GaitParams | None = None) -> None:
-        """Turn the residual-gait prior on/off at runtime (used by the CLI).
-
-        Changing the prior mid-run is safe because it only affects how the PD
-        target is built; it does not change the observation size, so it can be
-        toggled without resetting ``observation_space``.
-        """
-        self.cfg.gait_prior = bool(enable)
-        if gait is not None:
-            self.cfg.gait = gait
-        self._gait_t = 0.0
-        self._gait_phase = 0.0
-
-    # ---------------------------------------------------------------- success
+    # ------------------------------------------------------------------- 成功
 
     def _success_target_x(self) -> float:
-        """x the base must pass for this episode to count as a success.
+        """本次回合要被算作成功，机身必须越过的 x。
 
-        Stairs: the far edge of the last riser (crest height must also be
-        reached, see ``_success_reached``). Flat: a fixed forward distance,
-        because a flat stage has no riser to clear.
+        楼梯：最后一级立面的远边缘（还必须达到顶部高度，见
+        ``_success_reached``）。平地：一段固定的前进距离，因为平地阶段没有
+        立面要跨过去。
         """
         if self.stair.n_up > 0:
             return float(self.stair.up_end_x)
@@ -307,7 +289,7 @@ class Go2StairsEnv(gym.Env):
             )
         return bool(self.base_pos[0] > self._success_x)
 
-    # ------------------------------------------------------------- properties
+    # ------------------------------------------------------------------- 属性
 
     @property
     def base_pos(self) -> np.ndarray:
@@ -327,17 +309,17 @@ class Go2StairsEnv(gym.Env):
 
     @property
     def base_lin_vel_body(self) -> np.ndarray:
-        """Linear velocity in the body frame, i.e. ``R(q)^T @ qvel[0:3]``.
+        """机体系下的线速度，即 ``R(q)^T @ qvel[0:3]``。
 
-        Unlike :attr:`base_lin_vel_world` this does not change meaning as the
-        robot yaws, so "forward" is always ``[0]``.
+        与 :attr:`base_lin_vel_world` 不同，它不会随机器人偏航而改变含义，
+        所以「前进」永远是分量 ``[0]``。
         """
         rot = quat_to_mat(self.base_quat)
         return rot.T @ self.data.qvel[0:3]
 
     @property
     def base_ang_vel_body(self) -> np.ndarray:
-        """Gyro reading. qvel[3:6] is already in the body frame."""
+        """陀螺读数。qvel[3:6] 已经在机体系下。"""
         return self.data.qvel[3:6]
 
     @property
@@ -350,7 +332,7 @@ class Go2StairsEnv(gym.Env):
 
     @property
     def foot_pos(self) -> np.ndarray:
-        """(4, 3) world positions of the foot sphere centres."""
+        """(4, 3) 世界系下四个足端球心的位置。"""
         return self.data.geom_xpos[self.meta.foot_geom_ids]
 
     @property
@@ -361,36 +343,23 @@ class Go2StairsEnv(gym.Env):
     def yaw(self) -> float:
         return float(self.base_rpy[2])
 
-    # ---------------------------------------------------------------- helper
+    # ------------------------------------------------------------------ 辅助
 
     @property
     def foot_clearance(self) -> np.ndarray:
-        """Gap between each foot *surface* and the terrain below it (m).
+        """每只足端*表面*与其下方地形之间的间隙（m）。
 
-        ``geom_xpos`` is the centre of the foot sphere, so the radius must be
-        subtracted before comparing against the terrain height.
+        ``geom_xpos`` 是足端球的球心，所以在与地形高度比较之前必须减去半径。
         """
         feet = self.foot_pos
         return feet[:, 2] - self.meta.foot_radius - self._terrain_height(feet[:, 0])
 
     def _terrain_height(self, x: np.ndarray | float) -> np.ndarray:
-        """Terrain height under one or more world x coordinates."""
+        """一个或多个世界系 x 坐标处的地形高度。"""
         arr = np.atleast_1d(np.asarray(x, dtype=float))
         if self.stair.n_up == 0 and self.stair.n_down == 0:
             return np.zeros_like(arr)
         return np.array([self.stair.height_at(float(xi)) for xi in arr])
-
-    def _projected_gravity(self) -> np.ndarray:
-        """Gravity direction in the body frame (classic locomotion feature)."""
-        w, x, y, z = self.base_quat
-        # R^T @ (0,0,-1)
-        return np.array(
-            [
-                2 * (x * z - w * y),
-                2 * (y * z + w * x),
-                1 - 2 * (x * x + y * y),
-            ]
-        )
 
     def _obs_frame(self) -> np.ndarray:
         obs_cfg = self.cfg.obs
@@ -409,16 +378,15 @@ class Go2StairsEnv(gym.Env):
             theta = 2.0 * np.pi * self.cfg.gait.freq * self._gait_phase
             parts.append(np.array([np.sin(theta), np.cos(theta)]))
         if obs_cfg.step_height:
-            # The one piece of the staircase the policy is told outright.  Blind
-            # locomotion still needs to know *which* staircase it is on; it does
-            # not get to know where the next riser is.
+            # 楼梯信息里唯一直接告诉策略的一项。盲走仍然需要知道自己在*哪一段*
+            # 楼梯上；但它不会知道下一级立面在哪里。
             parts.append(np.array([float(self.stair.step_height)]))
         return np.concatenate(parts).astype(np.float64)
 
     def _observation(self) -> np.ndarray:
         return np.concatenate(list(self._hist)).astype(np.float32)
 
-    # ----------------------------------------------------------------- reward
+    # ------------------------------------------------------------------- 奖励
 
     def _compute_reward(self, action: np.ndarray, trunk_contact: bool,
                         foot_contact: np.ndarray | None = None,
@@ -431,57 +399,57 @@ class Go2StairsEnv(gym.Env):
 
         terms: dict[str, float] = {}
 
-        # 1) 前进速度奖励 -- forward velocity tracking -----------------------
+        # 1) 前进速度奖励 -- 前向速度跟踪 ------------------------------------
         err = lin[0] - self.cfg.command_vx
         terms["forward_vel"] = (
             rc.forward_vel * float(np.exp(-(err * err) / rc.forward_vel_sigma))
         )
-        # Linear companion term: exactly 0 when the robot is not moving, so the
-        # "stand perfectly still" policy cannot collect it at all.
+        # 线性伴随项：机器人不动时恰好为 0，所以「原地站死」的策略一分也
+        # 拿不到。
         terms["forward_progress"] = rc.forward_progress * float(
             np.clip(lin[0], rc.forward_progress_min, rc.forward_progress_max)
         )
 
-        # 2) 姿态稳定奖励 -- penalise roll and pitch ------------------------
+        # 2) 姿态稳定奖励 -- 惩罚 roll 与 pitch -----------------------------
         terms["orientation"] = rc.orientation * float(rpy[0] ** 2 + rpy[1] ** 2)
 
-        # 3) 关节力矩惩罚 -- joint torque -----------------------------------
+        # 3) 关节力矩惩罚 -- 关节力矩平方和 ---------------------------------
         tau = self.data.actuator_force
         terms["torque"] = rc.torque * float(np.sum(np.square(tau)))
 
-        # 4) 足端抬升奖励 -- swing feet must clear the terrain --------------
+        # 4) 足端抬升奖励 -- 摆动足必须越过地形 -----------------------------
         feet = self.foot_pos
         foot_dt = self.cfg.control_dt
-        # 3-D foot speed: the horizontal component alone would reward a fast
-        # flat sweep and cut off the slow lift a tall step needs.
+        # 三维足端速度：只看水平分量会奖励快速的贴地平扫，同时砍掉高台阶
+        # 需要的慢速抬腿。
         foot_speed = np.linalg.norm(
             (feet - self._prev_foot_pos) / foot_dt, axis=1
         )
         gate = np.clip(foot_speed / max(float(rc.foot_lift_gate_speed), 1e-6),
                        0.0, 1.0)
-        # geom_xpos is the SPHERE CENTRE, so subtract the radius to get the
-        # real gap between the foot surface and the terrain.
+        # geom_xpos 是球心，所以要减去半径，才能得到足端表面与地形之间的
+        # 真实间隙。
         clearance = self.foot_clearance
-        # The target grows with the terrain, but at 5 cm it equals the old
-        # constant, so an already-learned easy stage does not regress.
+        # 目标随地形一起变高，但在 5 cm 处它与原来的常量相等，所以已经学会
+        # 的简单阶段不会回退。
         lift_target = max(
             rc.foot_lift_target, rc.foot_lift_step_ratio * float(self.stair.step_height)
         )
         lift = np.clip(clearance / lift_target, 0.0, 1.0)
         terms["foot_lift"] = rc.foot_lift * float(np.mean(gate * lift))
 
-        # 5) 机身碰撞惩罚 -- torso touching the terrain ---------------------
-        # Per-step and bounded: it scales with how long the torso scrapes
-        # rather than being a single boolean at the terminal step.
+        # 5) 机身碰撞惩罚 -- 躯干接触地形 -----------------------------------
+        # 逐步行且有界：它随躯干擦地的时长成比例，而不是在终止步给一个
+        # 布尔量。
         terms["body_collision"] = rc.body_collision * float(trunk_contact)
-        # Shin / knee scraping a riser.  Bounded per step, and crucially it does
-        # NOT end the episode, so the robot can keep trying on tall stairs.
+        # 胫部 / 膝部蹭到立面。逐步有界，而且关键是它*不*结束回合，所以
+        # 机器人可以在高楼梯上继续尝试。
         terms["leg_collision"] = rc.leg_collision * float(leg_contact)
 
-        # 6) 足端腾空时间 -- gait shaping (landing after a good swing) ------
-        # ``_foot_air_time`` holds the flight time accumulated BEFORE the current
-        # step, and ``_prev_foot_contact`` the contact state before it, so this
-        # pays out exactly on the step where a foot touches down.
+        # 6) 足端腾空时间 -- 步态成形（一次良好摆动后的落地） ---------------
+        # ``_foot_air_time`` 保存的是当前步*之前*累积的腾空时间，
+        # ``_prev_foot_contact`` 保存的是它之前的接触状态，所以这一项恰好在
+        # 足端落地的那一步结算。
         if rc.air_time != 0.0:
             if foot_contact is None:
                 foot_contact = self._foot_contact_mask()
@@ -495,7 +463,7 @@ class Go2StairsEnv(gym.Env):
         else:
             terms["air_time"] = 0.0
 
-        # --- supporting shaping -------------------------------------------
+        # --- 辅助成形 -----------------------------------------------------
         terms["base_height"] = rc.base_height * float(
             (self.base_pos[2] - self.terrain_height_under_base - target_height) ** 2
         )
@@ -510,15 +478,15 @@ class Go2StairsEnv(gym.Env):
         terms["alive"] = rc.alive
 
         # --- 爬升进展 -------------------------------------------------------
-        # Terrain height under the base relative to where the episode started, so
-        # standing still on a step already reached earns nothing new.
+        # 机身下方的地形高度相对回合起点的高度，所以在已经到达的台阶上原地
+        # 不动拿不到任何新奖励。
         terms["stair_progress"] = rc.stair_progress * float(
             max(0.0, self.terrain_height_under_base - self._start_terrain_height)
         )
         return float(sum(terms.values())), terms
 
     def _foot_contact_mask(self) -> np.ndarray:
-        """Per-foot boolean: is this foot geom touching the terrain right now?"""
+        """逐足布尔量：这个足端 geom 此刻是否接触地形？"""
         foot_ids = [int(g) for g in self.meta.foot_geom_ids]
         terrain = {int(self.meta.floor_geom_id)} | {
             int(g) for g in self.meta.stair_geom_ids
@@ -533,23 +501,22 @@ class Go2StairsEnv(gym.Env):
         return mask
 
     def _advance_foot_air_time(self, foot_contact: np.ndarray) -> None:
-        """Accumulate flight time; called once per control step, after reward."""
+        """累加腾空时间；每个控制步调用一次，在奖励计算之后。"""
         self._foot_air_time = np.where(
             foot_contact, 0.0, self._foot_air_time + self.cfg.control_dt
         )
         self._prev_foot_contact = foot_contact
 
     def _contact_flags(self) -> tuple[bool, bool]:
-        """(trunk_contact, leg_contact) for robot-geom-vs-terrain contacts.
+        """机器人 geom 与地形接触时的 (trunk_contact, leg_contact)。
 
-        ``trunk_contact`` -- one of the torso collision primitives (the box /
-        cylinder / sphere welded to the ``base`` body) is touching the terrain.
-        That is a genuine fall, and the only contact that is fatal by default.
+        ``trunk_contact`` —— 躯干碰撞体之一（焊在 ``base`` body 上的 box /
+        cylinder / sphere）正在接触地形。这是真正的摔倒，也是默认唯一致命的
+        接触。
 
-        ``leg_contact`` -- a hip / thigh / calf collision shape is touching the
-        terrain while the torso is not.  On a staircase this is almost always a
-        shin brushing a riser mid-climb: it earns ``leg_collision`` per step but
-        the episode keeps running, which is what preserves trial and error.
+        ``leg_contact`` —— 髋 / 大腿 / 小腿的碰撞形状在躯干没接触时接触了
+        地形。在楼梯上，这几乎总是爬升途中胫部蹭到立面：它每步扣
+        ``leg_collision``，但回合继续运行，这正是保留试错的原因。
         """
         trunk = {int(g) for g in self.meta.trunk_geom_ids}
         legs = {int(g) for g in self.meta.leg_geom_ids}
@@ -576,17 +543,16 @@ class Go2StairsEnv(gym.Env):
         return trunk_hit, leg_hit
 
     def _effective_contact_steps(self) -> int:
-        """Consecutive control steps of trunk contact that end the episode."""
+        """会让回合结束的躯干接触连续控制步数。"""
         return max(1, int(self.cfg.terminate_contact_steps))
 
     def _contact_fatal(self, trunk_contact: bool, leg_contact: bool) -> bool:
-        """Has the torso been in contact with the terrain long enough to be fatal?
+        """躯干接触地形的时间是否已长到致命？
 
-        The streak counter is advanced here rather than in ``step`` so that "one
-        call to this method == one control step" also holds when a test drives it
-        directly.  A shin scrape is priced by ``reward.leg_collision``, never
-        fatal -- killing the episode on it removes the very signal a tall step
-        needs.
+        连续计数在这里推进而不是在 ``step`` 里，这样当测试直接驱动它时，
+        「调用本方法一次 == 一个控制步」也成立。胫部蹭立面由
+        ``reward.leg_collision`` 定价，永不致命 —— 因它而终止回合会抹掉高
+        台阶恰恰需要的那个信号。
         """
         self._trunk_contact_streak = self._trunk_contact_streak + 1 if trunk_contact else 0
         self._leg_contact_streak = self._leg_contact_streak + 1 if leg_contact else 0
@@ -595,37 +561,34 @@ class Go2StairsEnv(gym.Env):
         return self._trunk_contact_streak >= self._effective_contact_steps()
 
     def _support_height(self) -> float:
-        """Lowest terrain height under the four feet -- the supporting surface.
+        """四足下方最低的地形高度 —— 支撑面。
 
-        Contrast with :meth:`terrain_height_under_base`, which is a step
-        function of the trunk's x position.
+        与 :meth:`terrain_height_under_base` 相对照，后者是躯干 x 位置的
+        阶梯函数。
         """
         heights = [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
         return float(min(heights)) if heights else self.terrain_height_under_base
 
     def _support_height_mean(self) -> float:
-        """Mean terrain height under the four feet.
+        """四足下方地形高度的均值。
 
-        ``support`` (the minimum) jumps by a full riser in one frame when the
-        last foot lands; the mean spreads that over four ``h/4`` increments.
-        It is *not* simply more permissive -- during a crossing the mean is
-        higher than the minimum, so it fires earlier; what it removes is the
-        single-frame discontinuity.
+        ``support``（最小值）在最后一只脚落地时一帧就跳一整个立面；均值把这个
+        跳变摊到四次 ``h/4`` 增量上。它*并不*只是更宽松 —— 跨越过程中均值高于
+        最小值，所以会更早触发；它消除的是单帧的不连续。
         """
         heights = [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
         return float(np.mean(heights)) if heights else self.terrain_height_under_base
 
     def _height_reference(self) -> float:
-        """Height reference for ``obs.base_height``: the terrain under the base."""
+        """``obs.base_height`` 的高度参照面：机身正下方的地形。"""
         return self.terrain_height_under_base
 
     def _fall_reference_height(self) -> float:
-        """Terrain height the fall test measures the trunk against.
+        """摔倒判据用来衡量躯干的地形高度。
 
-        ``"support"`` uses the lowest terrain under the four feet, which is what
-        is actually holding the robot up; the terrain under the *base* is a step
-        function of the trunk's x position and flips by a whole riser between two
-        adjacent frames, producing ghost falls.
+        ``"support"`` 用四足下方最低的地形，那才是真正撑住机器人的那个面；
+        *机身*下方的地形是躯干 x 位置的阶梯函数，相邻两帧之间会跳一整个立面，
+        从而产生幽灵摔倒。
         """
         mode = str(self.cfg.terminate_height_ref).strip().lower()
         if mode == "support_mean":
@@ -646,7 +609,7 @@ class Go2StairsEnv(gym.Env):
         truncated = self._step_count >= self._max_steps
         return bool(fell or contact_fatal), truncated
 
-    # ------------------------------------------------------------ gymnasium
+    # ------------------------------------------------------------ Gymnasium
 
     def reset(self, *, seed: int | None = None, options=None):
         super().reset(seed=seed)
@@ -683,8 +646,8 @@ class Go2StairsEnv(gym.Env):
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = self._foot_contact_mask()
-        # Gait-prior clock, in seconds since the start of the episode.  The phase
-        # reported in the observation is the one the step actually used.
+        # 步态先验时钟，单位为自回合开始起的秒数。观测里报告的相位就是本步
+        # 实际使用的那一个。
         self._gait_t = 0.0
         self._gait_phase = 0.0
         self._hist.clear()
@@ -695,34 +658,33 @@ class Go2StairsEnv(gym.Env):
         return self._observation(), {}
 
     def _gait_action(self) -> np.ndarray:
-        """The gait prior's joint-angle offset (rad) at the current phase.
+        """步态先验在当前相位下的关节角偏移（rad）。
 
-        Zeros whenever the prior is disabled, so ``_target_from_action`` is a
-        single code path for both modes (and for ``GaitParams.static()``).
+        先验被禁用时恒为零，所以 ``_target_from_action`` 对两种模式（以及对
+        ``GaitParams.static()``）都是同一条代码路径。
         """
         if not self.cfg.gait_prior or self.cfg.gait_gain == 0.0:
             return np.zeros(self.num_act, dtype=np.float64)
         return self.cfg.gait_gain * self.cfg.gait.radians(self._gait_phase)
 
     def _target_from_action(self, action: np.ndarray) -> np.ndarray:
-        """Map a policy action to PD joint targets (the whole action pipeline).
+        """把策略动作映射为 PD 关节目标（整条动作流水线）。
 
-        Residual RL keeps the two amplitudes separate on purpose:
+        残差 RL 有意把两个幅值分开：
 
             target = home + gain * gait.radians(t) + action_scale * action
 
-        ``gait.action_scale`` says how large the prior's motion is (it is part
-        of the searched gait); ``cfg.action_scale`` says how much the policy may
-        deviate from it.  Sharing one scale made the policy's exploration noise
-        scale with the prior, which destabilised the robot instantly.
+        ``gait.action_scale`` 表示先验动作有多大（它是被搜索的步态的一部分）；
+        ``cfg.action_scale`` 表示策略可以偏离它多少。共用一个尺度会让策略的
+        探索噪声随先验一起缩放，瞬间就把机器人搞失稳。
         """
         if self.cfg.action_mode == "residual":
             target = (self.home_angles
                       + self._gait_action()
                       + self.cfg.action_scale * action)
         else:
-            # "absolute" maps the action straight onto the joint range, so a
-            # residual prior has no meaning there; it is deliberately ignored.
+            # "absolute" 把动作直接映射到关节范围上，所以残差先验在那里没有
+            # 意义；它被有意忽略。
             lo, hi = self.act_low, self.act_high
             target = lo + (action + 1.0) * 0.5 * (hi - lo)
         return np.clip(target, self.act_low, self.act_high)
@@ -730,9 +692,8 @@ class Go2StairsEnv(gym.Env):
     def step(self, action: np.ndarray):
         action = np.asarray(action, dtype=np.float64).clip(-1.0, 1.0)
 
-        # Residual RL: the prior supplies a working periodic gait, the policy
-        # supplies the correction.  The phase reported in the observation is
-        # the one this step actually used, so the transition stays Markov.
+        # 残差 RL：先验提供一个能用的周期步态，策略提供修正量。观测里报告的
+        # 相位就是本步实际使用的那一个，所以转移保持马尔可夫性。
         self._gait_phase = self._gait_t
         target = self._target_from_action(action)
         self._gait_t += self.cfg.control_dt
@@ -751,10 +712,9 @@ class Go2StairsEnv(gym.Env):
         foot_contact = self._foot_contact_mask()
         terminated, truncated = self._terminated(trunk_contact, leg_contact)
 
-        # Goal termination.  Reaching the crest / the flat target ends the
-        # episode *successfully* instead of letting the robot walk off the far
-        # edge of the staircase and fall.  ``_reached_top`` is sticky inside the
-        # episode, so a fall on an earlier step still means failure.
+        # 目标终止。到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出
+        # 楼梯远端摔下去。``_reached_top`` 在回合内是粘性的，所以更早某一步
+        # 的摔倒仍然算失败。
         if self._success_reached():
             self._reached_top = True
             if self.cfg.terminate_on_success and not terminated:
@@ -774,8 +734,8 @@ class Go2StairsEnv(gym.Env):
 
         self._prev_action = self._last_action.copy()
         self._last_action = action.copy()
-        # Foot xy displacement must be measured over exactly one control step,
-        # so this snapshot has to advance every step.
+        # 足端 xy 位移必须恰好在一个控制步上测量，所以这个快照每一步都要
+        # 推进。
         self._prev_foot_pos = self.foot_pos.copy()
         self._hist.append(self._obs_frame())
 
@@ -801,17 +761,17 @@ class Go2StairsEnv(gym.Env):
         }
         return self._observation(), float(reward), terminated, truncated, info
 
-    # -------------------------------------------------------------- render
+    # ---------------------------------------------------------------- 渲染
 
-    #: Camera presets understood by :meth:`render`.
+    #: :meth:`render` 能识别的相机预设。
     CAMERAS = ("side", "track", "chase", "front", "top")
 
     def render(self, camera: str = "side", *, width: int = 640, height: int = 480):
-        """Offscreen render of the current state; ``camera`` is in :attr:`CAMERAS`.
+        """离屏渲染当前状态；``camera`` 取值见 :attr:`CAMERAS`。
 
-        ``side`` (default) is the fixed whole-staircase profile view, ``track``
-        the same view with the look-at point following the robot in x, ``chase``
-        from behind/above along +x, and ``front`` / ``top`` for stills.
+        ``side``（默认）是固定的整段楼梯侧视图，``track`` 是同一视角但注视点
+        沿 x 跟随机器人，``chase`` 是沿 +x 的后上方视角，``front`` / ``top``
+        用于出静帧。
         """
         if camera not in self.CAMERAS:
             raise ValueError(f"未知相机 {camera!r}, 可选 {self.CAMERAS}")
@@ -822,12 +782,11 @@ class Go2StairsEnv(gym.Env):
             self._renderer = mujoco.Renderer(self.model, height=size[1], width=size[0])
             self._render_size = size
             self._render_cam = mujoco.MjvCamera()
-            # ``mjv_defaultOption`` ships ``geomgroup = [1, 1, 1, 0, 0, 0]``, so
-            # any geom in group 3, 4 or 5 is invisible by default.  The terrain
-            # lives in a dedicated group (see ``terrain.TERRAIN_GEOM_GROUP``) and
-            # used to be stamped into the hidden range, which made the staircase
-            # vanish from every GIF while the physics kept climbing it.  Turn all
-            # six groups on so the renderer can never silently drop the world.
+            # ``mjv_defaultOption`` 默认 ``geomgroup = [1, 1, 1, 0, 0, 0]``，
+            # 所以 group 3、4、5 里的任何 geom 默认都不可见。地形放在专用
+            # group 里（见 ``terrain.TERRAIN_GEOM_GROUP``），而它曾经被塞进隐藏
+            # 区间，导致楼梯在每张 GIF 里都消失、物理却还在往上爬。把六个
+            # group 全打开，这样渲染器就永远不会悄悄丢掉整个世界。
             self._scene_option = mujoco.MjvOption()
             mujoco.mjv_defaultOption(self._scene_option)
             for g in range(6):
@@ -857,7 +816,7 @@ class Go2StairsEnv(gym.Env):
             self._render_cam.distance = 3.0
             self._render_cam.lookat[:] = (
                 float(base[0]) + 1.2, float(base[1]), float(base[2]) + 0.10)
-        else:  # top
+        else:  # 顶视
             self._render_cam.azimuth = 90.0
             self._render_cam.elevation = -85.0
             self._render_cam.distance = 4.5

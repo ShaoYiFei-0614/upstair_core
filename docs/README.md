@@ -1,8 +1,8 @@
 # `docs/` —— 模块设计文档
 
 本目录为 `robotdog/` 下的**每一个 `.py`** 提供一份设计文档，**目录结构与
-`robotdog/` 一一对应**：`robotdog/` 下共 12 个 `.py`（8 个在顶层，4 个在
-`tools/`），因此本目录共 12 份模块文档 + 本索引。
+`robotdog/` 一一对应**：`robotdog/` 下共 11 个 `.py`（8 个在顶层，3 个在
+`tools/`），因此本目录共 11 份模块文档 + 本索引。
 
 ```
 docs/
@@ -20,7 +20,6 @@ docs/
       __init__.md           工具子包入口
       console.md            UTF-8 控制台
       paths.md              路径常量
-      png.md                无依赖 PNG 读写
       terrain.md            参数化楼梯几何
 ```
 
@@ -35,7 +34,7 @@ docs/
 
 | 层 | 位置 | 允许依赖 | 说明 |
 | --- | --- | --- | --- |
-| 工具层 | `robotdog/tools/` | 只依赖标准库、numpy、mujoco，以及**同层**模块 | **不 import `robotdog.env`**，不知道 PPO / 课程 / 训练循环 |
+| 工具层 | `robotdog/tools/` | 只依赖标准库（`sys` / `pathlib` / `dataclasses`），以及**同层**模块 | **不 import `robotdog.env`**，不知道 PPO / 课程 / 训练循环 |
 | 环境层 | `robotdog/env.py`、`go2_model.py`、`gait.py` | 工具层 | 一个 Gymnasium 环境及其模型装配 |
 | 训练层 | `robotdog/training.py`、`curriculum.py`、`policy.py` | 环境层 + 工具层 | PPO 组装、课程调度、权重与归一化统计的加载 |
 
@@ -86,3 +85,8 @@ from robotdog.tools import paths
 `render.md`、`evaluate.md`、`tools/touch.md` 随源码一起删除：`robotdog/render.py`
 与 `robotdog/evaluate.py` 不再存在（GIF 能力内联进 `scripts/play.py`，评估就是
 `play.py --mode eval`），触觉/测距整套逻辑已删除（本仓的目标是**盲走楼梯**）。
+
+`tools/png.md` 随 `robotdog/tools/png.py` 一起删除：那个 130 行的纯 zlib PNG
+容器**连自己内部的 `write_png`/`read_png`/`downscale`/`hstack` 都没有调用者**，
+三个历史消费者（`render.py`、`render_checkpoint.py`、`eval.py`）早已删除，
+GIF 与拼图改由 `scripts/play.py` 直接用 Pillow 完成。

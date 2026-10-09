@@ -253,11 +253,6 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
     return stages
 
 
-def _default_heights() -> tuple[float, ...]:
-    """保底课程梯度（来自 :mod:`robotdog.curriculum`）。"""
-    return STAGE_HEIGHTS_CM
-
-
 # --------------------------------------------------------------------------- #
 # PPO 与播放
 # --------------------------------------------------------------------------- #

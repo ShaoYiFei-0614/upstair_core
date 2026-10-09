@@ -193,7 +193,7 @@ class Trainer:
 
 
 # --------------------------------------------------------------------------- #
-# CLI
+# 命令行
 # --------------------------------------------------------------------------- #
 
 
@@ -317,8 +317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "final_model": final_model,
         "wall_seconds": round(time.time() - t_start, 1),
     }
-    summary = rundir.write_summary(payload)
-    write_summary(summary, stages, results, payload)
+    summary = write_summary(rundir.summary, stages, results, payload)
 
     print()
     print(format_curriculum(stages, results))

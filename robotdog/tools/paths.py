@@ -15,10 +15,7 @@ GO2_XML: Path = GO2_DIR / "go2.xml"
 GO2_SCENE_XML: Path = GO2_DIR / "scene.xml"
 GO2_ASSETS_DIR: Path = GO2_DIR / "assets"
 
-SCRIPTS_DIR: Path = WORKSPACE / "scripts"
-ARTIFACTS_DIR: Path = WORKSPACE / "artifacts"
 RUNS_DIR: Path = WORKSPACE / "runs"
-LOGS_DIR: Path = WORKSPACE / "logs"
 
 #: 人要**看**的东西放这里。只有 ``gifs/`` 是交付件（``output/gifs/<名字>.gif``），
 #: 其余是工作目录，谁写谁按需创建。
@@ -42,18 +39,15 @@ def ensure_output_dirs() -> None:
 
 
 __all__ = [
-    "ARTIFACTS_DIR",
     "GENERATED_DIR",
     "GO2_ASSETS_DIR",
     "GO2_DIR",
     "GO2_SCENE_XML",
     "GO2_XML",
-    "LOGS_DIR",
     "MODELS_DIR",
     "OUTPUT_DIR",
     "OUTPUT_GIFS_DIR",
     "RUNS_DIR",
-    "SCRIPTS_DIR",
     "WORKSPACE",
     "ensure_dir",
     "ensure_output_dirs",

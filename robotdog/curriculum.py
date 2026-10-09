@@ -16,11 +16,11 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Protocol, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
-from robotdog.tools.terrain import StairSpec, demo_stairs_spec, flat_spec
+from robotdog.tools.terrain import StairSpec
 
 # --------------------------------------------------------------------------- #
 # 固定课程梯度
@@ -32,13 +32,7 @@ STAGE_HEIGHTS_CM: tuple[float, ...] = (0.0, 3.0, 6.0, 9.0, 12.0, 15.0)
 #: 所有台阶阶段共用的地形尺寸。
 DEFAULT_TREAD: float = 0.50
 DEFAULT_N_UP: int = 8
-DEFAULT_TOP_LANDING: float = 1.20
-DEFAULT_WIDTH: float = 2.0
-DEFAULT_START_X: float = 1.50
 
-#: 平地阶段与台阶阶段的保底步数预算 (用作 ``total_timesteps`` 的权重基准)。
-_FLAT_BASE_STEPS: int = 100_000
-_STAIR_BASE_STEPS: int = 250_000
 
 
 @dataclass
@@ -70,69 +64,6 @@ class StageSpec:
             f"顶端={s.crest_height:5.2f}m 预算={self.timesteps:>9,} "
             f"lr={self.learning_rate:g}"
         )
-
-
-def default_curriculum(
-    *,
-    tread: float = DEFAULT_TREAD,
-    n_up: int = DEFAULT_N_UP,
-    total_timesteps: int | None = None,
-) -> list[StageSpec]:
-    """返回固定的六级课程 (平地 -> 3 -> 6 -> 9 -> 12 -> 15 cm)。
-
-    **步数预算的取法**: 平地段给得最少。开环 trot 先验本身就能在平地上走,
-    平地阶段几乎不产生学习信号 —— 实测里它的成功率很快就顶住, 继续训只是
-    空转; 台阶阶段才是学习真正发生的地方, 所以台阶步数明显大于平地。
-
-    ``total_timesteps`` 给出时按 1:2.5 的权重 (平地 : 每级台阶) 分配,
-    并保证每级至少 1 步; 余数补给最后的 (最难的) 一级。
-    """
-    tread_m = float(tread)
-    n_up_i = int(n_up)
-    stair_kw = dict(tread=tread_m, n_up=n_up_i, top_landing=DEFAULT_TOP_LANDING,
-                    width=DEFAULT_WIDTH, start_x=DEFAULT_START_X)
-    flat = flat_spec(n_up=0, n_down=0, step_height=0.0, tread=tread_m,
-                     width=DEFAULT_WIDTH, start_x=DEFAULT_START_X)
-
-    n_stair = len(STAGE_HEIGHTS_CM) - 1
-    if total_timesteps is None:
-        budgets = [_FLAT_BASE_STEPS] + [_STAIR_BASE_STEPS] * n_stair
-    else:
-        total = max(len(STAGE_HEIGHTS_CM), int(total_timesteps))
-        weights = [_FLAT_BASE_STEPS] + [_STAIR_BASE_STEPS] * n_stair
-        wsum = float(sum(weights))
-        budgets = [max(1, int(total * w / wsum)) for w in weights]
-        budgets[-1] += total - sum(budgets)       # 余数给最难的一级
-    # 台阶越高, 学习率越小: 高立面需要更细的更新, 免得把已学会的步态踢掉。
-    lrs = [1.5e-4, 1.5e-4, 1.2e-4, 1.0e-4, 8e-5, 6e-5]
-
-    stages: list[StageSpec] = [
-        StageSpec(
-            name="flat",
-            step_height=0.0,
-            spec=flat,
-            timesteps=budgets[0],
-            learning_rate=lrs[0],
-            label="平地",
-            description="平地行走, 站稳并跟上前进速度指令",
-        )
-    ]
-    for i, h_cm in enumerate(STAGE_HEIGHTS_CM[1:]):
-        h = float(h_cm) / 100.0
-        stages.append(
-            StageSpec(
-                name=f"stair{int(h_cm)}",
-                step_height=h,
-                spec=demo_stairs_spec(step_height=h, **stair_kw),
-                timesteps=budgets[i + 1],
-                learning_rate=lrs[i + 1],
-                label=f"{h_cm:g}cm 台阶",
-                description=f"{h_cm:g} cm 立面 x {n_up_i} 级, 学习抬腿跨越",
-            )
-        )
-    return stages
-
-
 # --------------------------------------------------------------------------- #
 # 回合统计
 # --------------------------------------------------------------------------- #
@@ -280,183 +211,6 @@ class StageResult:
 
 
 # --------------------------------------------------------------------------- #
-# 训练接口
-# --------------------------------------------------------------------------- #
-
-
-class StageTrainer(Protocol):
-    """一个阶段的实际训练者。
-
-    只要提供同名方法即可, 无需继承 (结构化子类型)。真正的 PPO 代码在
-    ``scripts/train.py`` 里实现这个接口, 本模块不 import SB3。
-    """
-
-    def make_env(self, stage: StageSpec, *, warm_start: str | None = None) -> Any:
-        """为该阶段构建 (或复用) 一个向量化环境。返回任何 ``train_stage`` 能用的对象。"""
-        ...
-
-    def train_stage(
-        self,
-        stage: StageSpec,
-        venv: Any,
-        *,
-        warm_start: str | None = None,
-        tensorboard_log: str | Path | None = None,
-        **kwargs: Any,
-    ) -> tuple[Any, EpisodeStats]:
-        """用 ``stage.timesteps`` 训练 ``stage``, 返回 ``(模型, 回合统计)``。"""
-        ...
-
-    def save_model(self, model: Any, stage: StageSpec, venv: Any) -> Path:
-        """保存该阶段的权重, 返回 ``.zip`` 路径; 不支持则抛 ``NotImplementedError``。"""
-        ...
-
-    def close(self) -> None:
-        """释放训练者持有的资源; 可选。"""
-        ...
-
-
-# --------------------------------------------------------------------------- #
-# 课程驱动器
-# --------------------------------------------------------------------------- #
-
-
-@dataclass
-class Curriculum:
-    """按顺序跑完 ``stages``, 记录每级的 :class:`StageResult`。"""
-
-    stages: list[StageSpec]
-    results: list[StageResult] = field(default_factory=list)
-    model_path: str | None = None      # 最近一次训练产出的模型路径
-    summary_path: Path | None = None   # :meth:`run` 用 ``write_summary`` 写的文件
-
-    # ---------------------------------------------------------------- 输入
-    @classmethod
-    def default(cls, *, total_timesteps: int | None = None) -> Curriculum:
-        """用 :func:`default_curriculum` 建一个课程。"""
-        return cls(default_curriculum(total_timesteps=total_timesteps))
-
-    def names(self) -> list[str]:
-        return [s.name for s in self.stages]
-
-    def __iter__(self):
-        return iter(self.stages)
-
-    def __len__(self) -> int:
-        return len(self.stages)
-
-    # ---------------------------------------------------------------- 执行
-    def run(
-        self,
-        trainer: StageTrainer,
-        *,
-        resume_from: str | None = None,
-        tensorboard_log: str | Path | None = None,
-        summary_path: str | Path | None = None,
-        meta: dict[str, Any] | None = None,
-        verbose: int = 1,
-        **train_kwargs: Any,
-    ) -> list[StageResult]:
-        """顺序训练每一级; 下一级从上一级的权重 warm-start。
-
-        ``train_stage`` 返回的模型可以选择**同一个实例** (在线续训) 或新实例;
-        后者更安全, 因为 ``PPO.set_parameters`` 会把上一级冻结的对数标准差一起
-        搬过来, 换实例能保证没有残留状态。预算由 ``stage.timesteps`` 决定,
-        没有任何中途毕业条件。
-        """
-        self.results = []
-        warm = resume_from
-        for i, stage in enumerate(self.stages, start=1):
-            if verbose:
-                print(f"\n[课程] >>> 第 {i}/{len(self.stages)} 级 "
-                      f"'{stage.name}' ({stage.label})", flush=True)
-                print(f"[课程]     {stage.summary()} -- {stage.description}",
-                      flush=True)
-            t0 = time.time()
-            venv = trainer.make_env(stage, warm_start=warm)
-            try:
-                model, stats = trainer.train_stage(
-                    stage, venv, warm_start=warm,
-                    tensorboard_log=tensorboard_log, **train_kwargs,
-                )
-                obs_size = _obs_size_of(venv)
-                try:
-                    saved = trainer.save_model(model, stage, venv)
-                except NotImplementedError:
-                    saved = None
-                path = str(saved) if saved else _model_path_of(model)
-            finally:
-                close = getattr(venv, "close", None)
-                if callable(close):
-                    close()
-            wall = time.time() - t0
-            path = path or warm or ""
-            result = StageResult(
-                name=stage.name,
-                label=stage.label,
-                step_height=stage.step_height,
-                timesteps=int(stage.timesteps),
-                mean_return=float(stats.mean_return),
-                success_rate=float(stats.success_rate),
-                fall_rate=float(stats.fall_rate),
-                wall_seconds=wall,
-                model_path=str(path),
-                mean_length=float(stats.mean_length),
-                episodes=int(stats.n_total),
-                obs_size=obs_size,
-            )
-            self.results.append(result)
-            if path:
-                self.model_path = str(path)
-            warm = self.model_path
-            if verbose:
-                print(f"[课程] <<< '{stage.name}' 完成: 成功率={result.success_rate:.1%} "
-                      f"摔倒率={result.fall_rate:.1%} 均回报={result.mean_return:.2f} "
-                      f"用时={format_seconds(wall)}", flush=True)
-
-        if summary_path is not None:
-            payload = dict(meta or {})
-            payload.setdefault("stage_heights_cm", list(STAGE_HEIGHTS_CM))
-            payload.setdefault("n_stages", len(self.stages))
-            payload.setdefault("total_timesteps", sum(s.timesteps for s in self.stages))
-            payload["resume_from"] = resume_from
-            payload["final_model"] = self.model_path
-            self.summary_path = write_summary(
-                summary_path, self.stages, self.results, payload
-            )
-        return self.results
-
-    # ---------------------------------------------------------------- 输出
-    def table(self) -> str:
-        """:meth:`run` 已产生的阶段结果表格 (没跑过则只有阶段定义)。"""
-        if not self.results:
-            return format_curriculum(self.stages)
-        return format_curriculum(self.stages, self.results)
-
-    def total_timesteps(self) -> int:
-        return int(sum(s.timesteps for s in self.stages))
-
-
-def _model_path_of(model: Any) -> str:
-    """模型对象的落盘路径; 拿不到就返回空串。"""
-    for attr in ("model_path", "path"):
-        val = getattr(model, attr, None)
-        if val:
-            return str(val)
-    return ""
-
-
-def _obs_size_of(venv: Any) -> int:
-    """向量环境的观测维度; 拿不到就返回 0。"""
-    space = getattr(venv, "observation_space", None)
-    shape = getattr(space, "shape", None)
-    try:
-        return int(shape[0]) if shape else 0
-    except (TypeError, IndexError, ValueError):
-        return 0
-
-
-# --------------------------------------------------------------------------- #
 # 报表
 # --------------------------------------------------------------------------- #
 
@@ -494,17 +248,16 @@ def format_curriculum(
 
 
 def write_summary(
-    path: str | Path | dict[str, Any],
-    stages: Sequence[StageSpec] | str | Path,
+    path: str | Path,
+    stages: Sequence[StageSpec],
     results: Sequence[StageResult] | None = None,
     meta: dict[str, Any] | None = None,
 ) -> Path:
     """写 ``summary.json``: 课程定义 + 每级结果 + 元信息 (中文不转义)。
 
-    前两个参数也接受 ``(payload, path)`` 的顺序 (老脚本习惯先攒 payload)。
+    ``meta`` 里的键会**平铺到顶层**，再补上 ``stages`` / ``results`` /
+    ``total_timesteps`` 三个由本函数计算的键。
     """
-    if isinstance(path, dict):
-        path, meta = stages, path
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = dict(meta or {})
@@ -546,12 +299,9 @@ def format_seconds(seconds: float) -> str:
 
 __all__ = [
     "STAGE_HEIGHTS_CM",
-    "Curriculum",
     "EpisodeStats",
     "StageResult",
     "StageSpec",
-    "StageTrainer",
-    "default_curriculum",
     "format_curriculum",
     "format_seconds",
     "write_summary",

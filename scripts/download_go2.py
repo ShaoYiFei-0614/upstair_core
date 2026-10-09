@@ -1,6 +1,6 @@
-"""Download the Unitree Go2 MJCF + meshes from google-deepmind/mujoco_menagerie.
+"""从 google-deepmind/mujoco_menagerie 下载 Unitree Go2 的 MJCF + 网格。
 
-Writes into  models/unitree_go2/ , producing a self-contained model directory:
+写入  models/unitree_go2/ ，产出一个自包含的模型目录：
 
     models/unitree_go2/
         go2.xml
@@ -9,12 +9,11 @@ Writes into  models/unitree_go2/ , producing a self-contained model directory:
         LICENSE
         assets/*.obj
 
-Each file is fetched over HTTPS with retries and mirror fallback, then verified
-against the size reported by the GitHub API.
+每个文件都走 HTTPS 拉取，带重试与镜像回退，再对着 GitHub API 报出的 size 校验。
 
-Run:
+运行:
     python scripts/download_go2.py
-    python scripts/download_go2.py --force     # re-download everything
+    python scripts/download_go2.py --force     # 重新下载全部
 """
 from __future__ import annotations
 
@@ -33,15 +32,15 @@ REPO = "google-deepmind/mujoco_menagerie"
 REF = "main"
 SRC_DIR = "unitree_go2"
 
-# Mirrors tried in order. {path} is the repo-relative path on the branch.
+# 镜像按顺序尝试。{path} 是文件在分支上的仓内相对路径。
 MIRRORS = [
     "https://raw.githubusercontent.com/{repo}/{ref}/{path}",
     "https://gh-proxy.com/https://raw.githubusercontent.com/{repo}/{ref}/{path}",
     "https://cdn.jsdelivr.net/gh/{repo}@{ref}/{path}",
 ]
 
-# Directories (repo-relative) whose files we want; go2.png is referenced by
-# scene.xml for the head texture, the *_mjx.png previews are not needed.
+# 需要的（仓内相对）目录；go2.png 被 scene.xml 引用作为头部纹理，
+# *_mjx.png 那几张预览图不需要。
 WANT_FILES = [f"{SRC_DIR}/go2.xml", f"{SRC_DIR}/scene.xml", f"{SRC_DIR}/LICENSE", f"{SRC_DIR}/go2.png"]
 WANT_DIRS = [f"{SRC_DIR}/assets"]
 
@@ -70,14 +69,14 @@ def download(path: str, size: int, use_mirror_from: int = 0) -> bytes:
                 if size and len(blob) != size:
                     raise IOError(f"size mismatch: got {len(blob)} want {size}")
                 return blob
-            except Exception as exc:  # noqa: BLE001 - retry across mirrors
+            except Exception as exc:  # noqa: BLE001 - 跨镜像重试
                 last = exc
                 time.sleep(0.7 * (attempt + 1))
     raise RuntimeError(f"all mirrors failed for {path}: {last}")
 
 
 def collect_manifest() -> list[tuple[str, str, int]]:
-    """Return [(repo_path, local_relpath, size)]."""
+    """返回 [(repo_path, local_relpath, size)]。"""
     manifest: list[tuple[str, str, int]] = []
     for path in WANT_FILES:
         name = path.split("/")[-1]
@@ -139,7 +138,7 @@ def main() -> int:
         print("\nRESULT: INCOMPLETE")
         return 1
 
-    # Sanity: the MJCF and its mesh directory must both be present.
+    # 健全性检查：MJCF 与它的网格目录必须都存在。
     xml = DEST / "go2.xml"
     assets = DEST / "assets"
     if not xml.exists() or not any(assets.glob("*.obj")):

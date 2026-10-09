@@ -1,31 +1,28 @@
-"""Compose MuJoCo scenes from the Unitree Go2 MJCF plus custom terrain.
+"""由 Unitree Go2 的 MJCF 加上自定义地形组装出 MuJoCo 场景。
 
-The vendored `models/unitree_go2/go2.xml` is never modified. Instead this module
-reads it, injects terrain geometry into the worldbody, and compiles the result
-as a single self-contained MJCF string.
+vendored 的 `models/unitree_go2/go2.xml` 永不被修改。本模块改为读取它，
+把地形几何注入 worldbody，再把结果编译成一个自包含的 MJCF 字符串。
 
-Element injection points (all inside the Go2 document):
-    <asset>      -> extra textures/materials for the ground       (append)
-    <worldbody>  -> terrain geoms, lights                          (append)
-    <option>     -> timestep / integrator / gravity overrides      (edit)
+元素注入点（都在 Go2 文档内部）：
+    <asset>      -> 地面额外需要的 texture/material          （追加）
+    <worldbody>  -> 地形 geom、灯光                          （追加）
+    <option>     -> timestep / integrator / gravity 覆盖     （修改）
 
-`<include>` is deliberately not used: MuJoCo resolves relative asset
-directories against the *main* file, and compiling from a string has no main
-file directory to resolve against.
+`<include>` 被刻意弃用：MuJoCo 把相对资源目录解析到*主*文件上，而从字符串
+编译时根本没有主文件目录可解析。
 
-Mesh assets and non-ASCII paths
--------------------------------
-This workspace lives at ``D:\\项目\\RobortDog\\upstair_core``. MuJoCo's asset reader
-resolves narrow (``const char*``) filenames through the Windows ANSI codepage,
-so pointing ``meshdir`` at a Chinese path fails with::
+网格资源与非 ASCII 路径
+-----------------------
+本工作区位于 ``D:\\项目\\RobortDog\\upstair_core``。MuJoCo 的资源读取器通过
+Windows ANSI 代码页解析窄字符（``const char*``）文件名，所以把 ``meshdir``
+指向中文路径会失败并报出::
 
     Error opening file 'D:/<mojibake>/models/unitree_go2/assets/base_0.obj'
 
-``mujoco.MjVfs`` exposes only ``close()`` to Python, so custom VFS callbacks are
-not available. The supported fix is the ``assets`` mapping accepted by
-``MjModel.from_xml_string``, which serves file contents from memory and never
-touches the filesystem. We therefore keep the original relative
-``meshdir="assets"`` and always pass :func:`go2_assets`.
+``mujoco.MjVfs`` 只向 Python 暴露 ``close()``，所以自定义 VFS 回调不可用。
+受支持的修法是 ``MjModel.from_xml_string`` 接受的 ``assets`` 映射：它直接从
+内存提供文件内容，完全不碰文件系统。所以我们保留原本的相对路径
+``meshdir="assets"``，并始终传入 :func:`go2_assets`。
 """
 
 from __future__ import annotations
@@ -42,40 +39,34 @@ from robotdog.tools.paths import GO2_ASSETS_DIR, GO2_XML
 from robotdog.tools.terrain import TERRAIN_GEOM_GROUP
 
 # --------------------------------------------------------------------------- #
-# Go2 constants (mirrored from models/unitree_go2/go2.xml, verified at load)
+# Go2 常量（镜像自 models/unitree_go2/go2.xml，加载时校验）
 # --------------------------------------------------------------------------- #
 
 LEGS: tuple[str, str, str, str] = ("FL", "FR", "RL", "RR")
 JOINT_SUFFIXES: tuple[str, str, str] = ("hip", "thigh", "calf")
 
-# Actuator order as declared in go2.xml:
+# go2.xml 里声明的执行器顺序：
 #   FL_hip, FL_thigh, FL_calf, FR_hip, ..., RR_hip, RR_thigh, RR_calf
 ACTUATOR_NAMES: tuple[str, ...] = tuple(f"{leg}_{s}" for leg in LEGS for s in JOINT_SUFFIXES)
 JOINT_NAMES: tuple[str, ...] = tuple(f"{name}_joint" for name in ACTUATOR_NAMES)
 FOOT_GEOM_NAMES: tuple[str, ...] = LEGS
 
-# Home / nominal standing pose, from go2.xml <keyframe name="home">.
+# home / 标称站姿，取自 go2.xml 的 <keyframe name="home">。
 BASE_HEIGHT_HOME = 0.27
 HOME_JOINT_ANGLES: tuple[float, ...] = tuple(
     angle for _ in LEGS for angle in (0.0, 0.9, -1.8)
 )
-
-# Total robot mass [kg]: 6.921 base + 4*(0.678 hip + 1.152 thigh + 0.241352 calf)
-NOMINAL_MASS = 15.206408
-
 DEFAULT_TIMESTEP = 0.002
-DEFAULT_CONTROL_DECIMATION = 10  # -> 50 Hz control, 500 Hz physics
 
-# Geom groups used by the Go2 MJCF.  ``2`` holds visual-only meshes that never
-# collide; ``3`` holds every colliding primitive (torso box/cylinder/sphere,
-# hip/thigh/calf shapes and the four foot spheres), so ``group == 3`` is exactly
-# "this geom can touch the terrain".  Terrain lives in ``TERRAIN_GEOM_GROUP``.
-VISUAL_GEOM_GROUP = 2
+# MuJoCo 几何分组。Go2 的 MJCF 里 ``3`` 组装着**所有会碰撞的图元** —— 躯干盒/柱/球、
+# 髋/大腿/小腿的碰撞体, 以及四个脚的球体; 所以 ``geom_group == 3`` 恰好等价于
+# 「这个几何体可能接触地形」。地形本身在 :data:`TERRAIN_GEOM_GROUP` 组里,
+# 于是 :func:`extract_meta` 用这个常量把「脚」从其它碰撞体里筛出来。
 COLLISION_GEOM_GROUP = 3
 
 
 # --------------------------------------------------------------------------- #
-# MJCF text assembly
+# MJCF 文本装配
 # --------------------------------------------------------------------------- #
 
 _OUTER = re.compile(r"\s*<mujoco\b[^>]*>(?P<body>.*)</mujoco>\s*$", re.DOTALL)
@@ -86,16 +77,16 @@ _MESHDIR = re.compile(r'meshdir\s*=\s*"[^"]*"')
 
 @dataclass
 class SceneOptions:
-    """Overrides layered onto the Go2 model when a scene is compiled."""
+    """编译场景时叠加到 Go2 模型上的覆盖项。"""
 
     timestep: float = DEFAULT_TIMESTEP
     integrator: str = "implicitfast"
     gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
-    # Solver/contact stability for a ~15 kg quadruped on thin stair edges.
+    # 为在薄楼梯边缘上的约 15 kg 四足提供求解器 / 接触稳定性。
     iterations: int = 50
     ls_iterations: int = 20
     solver: str = "Newton"
-    # Restitution-like softness for stiff foot-box contacts.
+    # 为僵硬的脚-盒接触提供类似恢复系数的柔软度。
     add_ground_texture: bool = True
     extra_visual: str = ""
     nconmax: int | None = None
@@ -103,11 +94,10 @@ class SceneOptions:
 
 
 def _go2_inner_xml() -> str:
-    """Return go2.xml contents with the outer <mujoco> wrapper removed.
+    """返回去掉外层 <mujoco> 包装后的 go2.xml 内容。
 
-    ``meshdir`` is deliberately left as the original relative ``"assets"``:
-    the mesh bodies are supplied in memory by :func:`go2_assets`, so no
-    directory lookup happens at all (see the module docstring).
+    ``meshdir`` 被刻意保留为原本的相对路径 ``"assets"``：网格内容由
+    :func:`go2_assets` 从内存提供，所以完全不会发生目录查找（见模块 docstring）。
     """
     text = GO2_XML.read_text(encoding="utf-8")
     match = _OUTER.match(text)
@@ -116,7 +106,7 @@ def _go2_inner_xml() -> str:
     inner = match.group("body")
 
     if not _MESHDIR.search(inner):
-        # Defensive: without meshdir MuJoCo would look in the CWD.
+        # 防御性处理：没有 meshdir 时 MuJoCo 会去 CWD 里找。
         inner, n = _COMPILER.subn(
             lambda m: m.group(0)[:-2] + ' meshdir="assets"/>', inner, count=1
         )
@@ -127,14 +117,14 @@ def _go2_inner_xml() -> str:
 
 @functools.lru_cache(maxsize=1)
 def go2_assets() -> dict[str, bytes]:
-    """Mesh file contents keyed by basename, for MuJoCo's in-memory VFS.
+    """按 basename 索引的网格文件内容，供 MuJoCo 的内存 VFS 使用。
 
-    Read once and cached: the 16 OBJ files total ~27 MB and every worker
-    process pays this cost a single time.
+    只读一次并缓存：16 个 OBJ 文件合计约 27 MB，每个 worker 进程只付一次
+    这份开销。
 
-    Keys must be *bare basenames*: MuJoCo rejects a mapping that contains the
-    same file name twice ("Repeated file name in assets dict"), so do not also
-    register ``assets/<name>`` aliases.
+    键必须是*裸 basename*：MuJoCo 会拒绝含重复文件名的映射
+    （"Repeated file name in assets dict"），所以不要另外注册
+    ``assets/<name>`` 别名。
     """
     meshes = sorted(GO2_ASSETS_DIR.glob("*.obj"))
     if not meshes:
@@ -190,16 +180,16 @@ def build_scene_xml(
     floor_geom: str | None = None,
     include_lights: bool = True,
 ) -> str:
-    """Assemble a compilable MJCF string: Go2 + floor/terrain + lighting.
+    """组装出可编译的 MJCF 字符串：Go2 + 地面 / 地形 + 灯光。
 
     Parameters
     ----------
     terrain_xml:
-        Raw XML inserted as the last children of ``<worldbody>``. Use it for
-        stairs, heightfields, obstacles, and any per-episode geometry.
+        作为 ``<worldbody>`` 最后一批子元素插入的原始 XML。用于楼梯、
+        heightfield、障碍物以及任何逐回合变化的几何。
     floor_geom:
-        Optional ``<geom .../>`` string for a ground plane. Pass ``None`` for no
-        floor (terrain supplies its own).
+        可选的地面平面 ``<geom .../>`` 字符串。传 ``None`` 表示不要地板
+        （地形自带）。
     """
     opts = opts or SceneOptions()
     inner = _go2_inner_xml()
@@ -237,12 +227,11 @@ def build_scene_xml(
 
 
 def default_floor_geom(z: float = 0.0, size: float = 60.0) -> str:
-    """A textured infinite plane at height ``z``.
+    """位于高度 ``z`` 的一块带贴图的无限平面。
 
-    The plane carries ``group=TERRAIN_GEOM_GROUP`` so that the forward
-    rangefinder in :mod:`robotdog.tools.touch` sees the ground but never the robot.
-    Pick that group with care -- MuJoCo hides groups 3-5 by default, so a bad
-    choice makes the whole world vanish from the renders.
+    这块平面带 ``group=TERRAIN_GEOM_GROUP``，这样 :mod:`robotdog.tools.touch`
+    里的前向测距能看到地面，却永远看不到机器人。选这个 group 要小心 ——
+    MuJoCo 默认隐藏 group 3-5，选错会让整个世界从渲染里消失。
     """
     return (
         f'<geom name="floor" type="plane" pos="0 0 {z:g}" size="{size:g} {size:g} 0.05" '
@@ -252,13 +241,13 @@ def default_floor_geom(z: float = 0.0, size: float = 60.0) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Compiled-model metadata
+# 编译后模型元数据
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
 class Go2Meta:
-    """Resolved ids/indices for the compiled Go2 scene."""
+    """编译后的 Go2 场景中解析出来的 id / 索引。"""
 
     joint_names: tuple[str, ...]
     actuator_names: tuple[str, ...]
@@ -284,27 +273,21 @@ class Go2Meta:
     floor_geom_id: int
     stair_geom_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
 
-    # Collision-geom split of the robot (all ``geom_group == 3``).
+    # 机器人碰撞 geom 的拆分（全部 ``geom_group == 3``）。
     #
-    # ``trunk_geom_ids`` is the three collision primitives welded to ``base``
-    # (box + cylinder + sphere): a contact here means the torso itself hit the
-    # terrain, i.e. a genuine fall.
+    # ``trunk_geom_ids`` 是焊在 ``base`` 上的三个碰撞图元
+    # （box + cylinder + sphere）：这里出现接触意味着躯干本身撞上了地形，
+    # 也就是真摔。
     #
-    # ``leg_geom_ids`` is every other robot collision primitive (hips, thighs,
-    # calves) minus the four foot spheres.  A contact here is a shin/knee
-    # *grazing* a riser while the robot is still upright and exploring -- it must
-    # be penalised, not turned into an instant death sentence.
+    # ``leg_geom_ids`` 是其余所有机器人碰撞图元（髋 / 大腿 / 小腿）减去四个
+    # 脚球。这里出现接触是小腿 / 膝盖在机器人仍然站得住、还在探索时*蹭*到
+    # 立面 —— 必须扣分，而不是立刻判死。
     trunk_geom_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
     leg_geom_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
 
     nq: int = 0
     nv: int = 0
     nu: int = 0
-
-    @property
-    def num_joints(self) -> int:
-        return len(self.joint_names)
-
 
 def _resolve_id(model: mujoco.MjModel, objtype: mujoco.mjtObj, name: str) -> int:
     idx = mujoco.mj_name2id(model, objtype, name)
@@ -314,7 +297,7 @@ def _resolve_id(model: mujoco.MjModel, objtype: mujoco.mjtObj, name: str) -> int
 
 
 def extract_meta(model: mujoco.MjModel) -> Go2Meta:
-    """Read back every id/index the environment needs from a compiled model."""
+    """从编译后的模型里读回环境需要的每一个 id / 索引。"""
     joint_ids = np.array(
         [_resolve_id(model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in JOINT_NAMES], dtype=int
     )
@@ -324,13 +307,13 @@ def extract_meta(model: mujoco.MjModel) -> Go2Meta:
     foot_geom_ids = np.array(
         [_resolve_id(model, mujoco.mjtObj.mjOBJ_GEOM, n) for n in FOOT_GEOM_NAMES], dtype=int
     )
-    # The foot is a sphere; geom_xpos is its centre, so true clearance needs it.
+    # 脚是球体；geom_xpos 给的是球心，所以算真实离地间隙需要它。
     foot_radius = float(model.geom_size[foot_geom_ids[0], 0])
 
     base_body_id = _resolve_id(model, mujoco.mjtObj.mjOBJ_BODY, "base")
     imu_site_id = _resolve_id(model, mujoco.mjtObj.mjOBJ_SITE, "imu")
 
-    # A free joint always occupies the first 7 qpos / 6 qvel entries.
+    # 自由关节始终占用最前面的 7 个 qpos / 6 个 qvel。
     qpos_joint_adr = np.array([model.jnt_qposadr[j] for j in joint_ids], dtype=int)
     qvel_joint_adr = np.array([model.jnt_dofadr[j] for j in joint_ids], dtype=int)
     dof_joint_adr = qvel_joint_adr
@@ -341,7 +324,7 @@ def extract_meta(model: mujoco.MjModel) -> Go2Meta:
     home_joint_angles = np.asarray(HOME_JOINT_ANGLES, dtype=float)
     home_qpos = np.zeros(model.nq, dtype=float)
     home_qpos[2] = BASE_HEIGHT_HOME
-    home_qpos[3] = 1.0  # quaternion w
+    home_qpos[3] = 1.0  # 四元数的 w 分量
     home_qpos[qpos_joint_adr] = home_joint_angles
 
     floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
@@ -351,13 +334,12 @@ def extract_meta(model: mujoco.MjModel) -> Go2Meta:
         if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith("stair_")
     ]
 
-    # Exclude the robot's own 12 bodies from the mass sum where relevant.
+    # 在相关处把机器人自己的 12 个 body 从质量求和中排除。
     total_mass = float(model.body_mass[1:].sum())
 
-    # --- split the robot's collision geoms into trunk / legs -----------------
-    # The Go2 MJCF puts visual-only meshes in group 2 and every colliding
-    # primitive in group 3, so ``group == 3`` is exactly "can generate a
-    # contact with the terrain".
+    # --- 把机器人的碰撞 geom 拆成躯干 / 腿 -----------------------------------------------
+    # Go2 的 MJCF 把纯视觉网格放在 group 2，把每一个碰撞图元放在 group 3，
+    # 所以 ``group == 3`` 恰好等价于「能和地形产生接触」。
     terrain_ids = {int(floor_id)} | {int(g) for g in stair_ids}
     trunk_ids: list[int] = []
     leg_ids: list[int] = []
@@ -407,7 +389,7 @@ def compile_scene(
     floor_geom: str | None = None,
     write_to: Path | None = None,
 ) -> tuple[mujoco.MjModel, Go2Meta, str]:
-    """Build + compile a scene, returning (model, meta, xml_text)."""
+    """构建并编译一个场景，返回 (model, meta, xml_text)。"""
     if floor_geom is None:
         floor_geom = default_floor_geom()
     xml = build_scene_xml(terrain_xml, opts=opts, floor_geom=floor_geom)
@@ -418,7 +400,7 @@ def compile_scene(
 
     try:
         model = mujoco.MjModel.from_xml_string(xml, assets=go2_assets())
-    except Exception as exc:  # surface the generated XML for debugging
+    except Exception as exc:  # 把生成的 XML 暴露出来便于调试
         if write_to is None:
             from robotdog.tools.paths import GENERATED_DIR
 
@@ -434,7 +416,7 @@ def compile_scene(
 
 def home_qpos(meta: Go2Meta, *, x: float = 0.0, y: float = 0.0, z: float | None = None,
               yaw: float = 0.0) -> np.ndarray:
-    """Home keyframe qpos, optionally relocated/oriented (yaw about world Z)."""
+    """home keyframe 的 qpos，可选地平移 / 定向（绕世界 Z 轴的 yaw）。"""
     qpos = meta.home_qpos.copy()
     qpos[0] = x
     qpos[1] = y
@@ -446,11 +428,11 @@ def home_qpos(meta: Go2Meta, *, x: float = 0.0, y: float = 0.0, z: float | None 
 
 
 # --------------------------------------------------------------------------- #
-# Frame conventions
+# 帧约定
 # --------------------------------------------------------------------------- #
 
 def quat_to_mat(quat_wxyz: np.ndarray) -> np.ndarray:
-    """(w,x,y,z) -> 3x3 rotation matrix."""
+    """(w,x,y,z) -> 3x3 旋转矩阵。"""
     w, x, y, z = quat_wxyz
     return np.array(
         [
@@ -463,7 +445,7 @@ def quat_to_mat(quat_wxyz: np.ndarray) -> np.ndarray:
 
 
 def quat_to_rpy(quat_wxyz: np.ndarray) -> np.ndarray:
-    """(w,x,y,z) -> (roll, pitch, yaw) about the world X/Y/Z axes (ZYX order)."""
+    """(w,x,y,z) -> 绕世界 X/Y/Z 轴的 (roll, pitch, yaw)（ZYX 顺序）。"""
     w, x, y, z = quat_wxyz
     sinr_cosp = 2.0 * (w * x + y * z)
     cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
