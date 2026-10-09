@@ -1,8 +1,8 @@
 # `docs/` —— 模块设计文档
 
 本目录为 `robotdog/` 下的**每一个 `.py`** 提供一份设计文档，**目录结构与
-`robotdog/` 一一对应**：`robotdog/` 下共 11 个 `.py`（8 个在顶层，3 个在
-`tools/`），因此本目录共 11 份模块文档 + 本索引。
+`robotdog/` 一一对应**：`robotdog/` 下共 12 个 `.py`（9 个在顶层，3 个在
+`tools/`），因此本目录共 12 份模块文档 + 本索引。
 
 ```
 docs/
@@ -14,6 +14,7 @@ docs/
     gait.md                 trot 步态先验
     go2_model.md            Go2 MJCF 组装与场景编译
     policy.md               训练产物的加载与观测归一化
+    reward.md               ★ 全部奖励数学（RewardConfig + compute_reward）
     training.md             PPO 组装 / 向量环境 / 运行目录
     curriculum.md           六级课程（平地 + 3/6/9/12/15 cm）
     tools/

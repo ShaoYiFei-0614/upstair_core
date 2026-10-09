@@ -35,7 +35,7 @@
 `_apply()` 先取 `target.__dataclass_fields__`，把不认识的键收集起来一次性抛出：
 
 ```
-config.yaml 的 env: 无法识别的键 ['command_vx_']; 可用键 = ['action_mode', ...]
+config.yaml 的 env: 无法识别的键 ['command_vx_']; 可用键 = ['action_scale', 'decimation', ...]
 ```
 
 **理由**：配置文件是手写的，`forward_vel_sigma` 写成 `forward_vel_sigme`、`n_envs`
@@ -131,7 +131,7 @@ raw: dict
    │     ├── env.*      → EnvConfig 字段（_apply）
    │     ├── env.obs.*  → ObsConfig 字段（_apply）
    │     └── gait_file  → load_gait（仅 gait_prior=true 时）
-   ├── reward:      ├── → RewardConfig 字段（_apply）
+   ├── reward:      cfg.reward ← _apply（在 config_to_env 内，robotdog/config.py:163；字段定义在 robotdog/reward.py）
    ├── ppo:         config_to_ppo    → dict（原样透传）
    └── play:        config_to_play   → dict（补渲染默认值）
 ```
@@ -159,6 +159,9 @@ raw: dict
 * **依赖** `robotdog.env`（`EnvConfig`）、`robotdog.curriculum`（`StageSpec` 与默认
   常量）、`robotdog.gait`（`load_gait`）、`robotdog.tools.terrain`（造地形）、
   `robotdog.tools.paths`（定位仓根与先验文件）、第三方 `yaml`。
+  奖励字段（`reward:` 段）定义在 `robotdog/reward.py`，但本模块**不直接 import 它**：
+  靠 `robotdog/env.py:37` 的重导出，`_apply(cfg.reward, ...)`（`robotdog/config.py:163`）
+  就能工作 —— 依赖方向仍是 `config.py → env.py → reward.py`，没有新增边。
 * **被依赖** `scripts/train.py`（`config_to_run` / `config_to_env` / `config_to_stages` /
   `config_to_ppo` / `n_envs`）与 `scripts/play.py`（`config_to_play`）。
 * **为什么放在 `robotdog/` 而不是 `scripts/`**：它要对 `EnvConfig` 的字段做白名单
@@ -169,7 +172,7 @@ raw: dict
 
 ## 8. 实测与经验教训
 
-* 首次跑通：`load_config()` → `frame 46 / obs 460`、`gait_prior=True`、
+* 首次跑通：`load_config()` → `frame 46 / obs 46`（`history_len=1`）、`gait_prior=True`、
   六级打印正确、总预算 1,350,000 步。见 `experience.md` §7 的开头。
 * `policy_arch()` 的必要性（不读配置的结构就会 `size mismatch`）见
   `experience.md` §7.1。
@@ -199,7 +202,7 @@ raw = load_config()                       # 默认 <仓根>/config.yaml
 cfg = config_to_env(raw)
 stages = config_to_stages(raw)
 
-print(cfg.obs.size)                       # 460
+print(cfg.obs.size)                       # 46（history_len=1）
 print([(s.name, s.timesteps) for s in stages])
 print(sum(s.timesteps for s in stages))   # 1350000
 ```

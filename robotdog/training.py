@@ -188,9 +188,15 @@ def load_policy(
 
     归一化统计来自同目录同名的 ``*_vecnormalize.pkl``。**不还原它，策略就会拿到按
     ``mean=0 / var=1`` 归一化的输入，而训练时看到的是真统计**——等于换了一套输入
-    坐标系，确定性评估会从 100% 掉到 0%。所以这里读裸 pickle，把
-    ``obs_rms.mean/var`` 拷成 :class:`~robotdog.policy.ObsNorm`（``VecNormalize``
-    对象本身不能随便访问属性，多读一个不存在的名字就 ``RecursionError``）。
+    坐标系，确定性评估会从 100% 掉到 0%。所以这里做两件事：
+
+    1. 读裸 pickle，把 ``obs_rms.mean/var`` 拷成 :class:`~robotdog.policy.ObsNorm`
+       返回给调用方（``VecNormalize`` 对象本身不能随便访问属性，多读一个不存在的
+       名字就 ``RecursionError``）；
+    2. 用 :func:`restore_vecnormalize` 把同一份统计量**装回模型自带的 VecEnv**。
+       少了这一步，``model.get_env()`` 拿到的包装器还是 ``mean=0 / var=1``，经它
+       评估等于喂未归一化的观测 —— 同一个权重走 ``model.get_env()`` 和走裸
+       ``Go2StairsEnv`` 会给出相反结论（3 cm 上前者 0% 摔倒、后者 100% 成功）。
     """
     model_path = Path(model_path)
     if not model_path.is_file() and model_path.with_suffix(".zip").is_file():
@@ -204,6 +210,8 @@ def load_policy(
     model.set_parameters(str(model_path))
 
     cand = model_path.with_name(model_path.stem + "_vecnormalize.pkl")
+    if cand.is_file():
+        restore_vecnormalize(venv, cand)
     norm = ObsNorm.from_path(cand) if cand.is_file() else None
     return model, norm
 

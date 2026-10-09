@@ -302,6 +302,49 @@ group 2/3。
 * 编辑代码块时 `edit` 的 `old_string` 只覆盖一部分 ⇒ 收尾的 `"""` 会残留成语法错误或
   脏文本。**改完必须 `py_compile` 并读回确认。**
 
+### 5.9 ⭐ 同一个权重，两套结论：`VecNormalize` 统计量没装回模型
+
+**症状**：对同一个 `runs/ab_hist1/model_final.zip`，两条评测路径在 3 cm 上给出相反
+答案 ——
+
+| 路径 | 3 cm 结果 |
+|---|---|
+| `scripts/play.py --mode eval`（自己驱动裸 `Go2StairsEnv` + `ObsNorm`） | 成功率 100%、摔倒 0%、前进 4.54 m |
+| 自写脚本走 `model.get_env()` → `VecEnv.step()` | `succ=0.00 fall=1.00 adv=3.17m steps=347.8` |
+
+一度怀疑是地形构造、seed、`info` 键名或探针本身有 bug（历史上已发生过一次探针报错
+回合）。**真因在 `robotdog/training.py: load_policy()`**：它读 `*_vecnormalize.pkl`
+只为了**返回**一个 `ObsNorm` 给调用方，却**没有把统计量装回模型自带的那个
+`VecNormalize`**。`model.set_parameters()` 只还原网络权重，`build_ppo` 建出来的
+`VecNormalize` 仍是初始的 `mean=0 / var=1`。于是：
+
+* 裸 env 路径：`ObsNorm` 手动归一化 ⇒ 策略看到真统计；
+* `model.get_env()` 路径：包装器还是 `mean=0 / var=1` ⇒ **策略看到未归一化的观测**。
+
+**定位手法（可复用）**：并排打印两条路径**重置后的前 6 维原始观测与归一化观测**。
+分叉一眼可见 ——
+
+```
+raw obs0 A  [-0.0006  0.0068 -0.0087 ...]   ← 空
+raw obs0 B  [-0.058   0.9376 -1.7505 ...]   ← 真实关节角
+norm obs0 A [-0.0006  0.0068 -0.0087 ...]   ← 归一化等于没做（mean=0 / var=1）
+norm obs0 B [ 0.2344 -3.8073  0.4135 ...]   ← 真统计
+```
+
+**修法**：`load_policy` 在 `set_parameters` 之后调一次
+`restore_vecnormalize(venv, cand)`（`robotdog/training.py` 里这个函数早就写好、也
+在 `__all__` 里，**但此前零调用者**）。修完两条路径一致。
+
+**顺带踩到的第二个坑**：`.tmp/path_cmp.py` 里 `make_env_fn(stair, None, seed=seed)`
+传了 `cfg=None` ⇒ 建出默认 `history_len=10`（460 维）的环境，而权重是
+`history_len=1`（46 维），报 `ValueError: operands could not be broadcast together
+with shapes (1,460) (46,)`。**跑权重必须用它自带的 `EnvConfig`**
+（`env_config_for_model(model_path)`）；另外 `make_env_fn` 返回的是**零参工厂**，
+必须再调一次：`make_env_fn(...)()`。
+
+**教训**：评测器与训练器必须共用同一个「建环境 + 归一化」实现。任何**手搓**的
+评测路径都要先和仓库自带脚本对一次数，否则 `|a|`、成功率、摔倒率全都不可信。
+
 ---
 
 ## 6. 重构（2026-10）：为什么现在是「盲走六级」

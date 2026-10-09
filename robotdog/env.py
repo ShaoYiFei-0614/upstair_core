@@ -34,6 +34,7 @@ import numpy as np
 from gymnasium import spaces
 
 from robotdog.gait import GaitParams
+from robotdog.reward import RewardConfig, compute_reward
 from robotdog.go2_model import (
     SceneOptions,
     compile_scene,
@@ -81,62 +82,14 @@ class ObsConfig:
 
 
 @dataclass
-class RewardConfig:
-    """奖励权重。
-
-    大致平衡正项与负项。这些数值所来自的历史调参——每个权重堵住哪种失败——见
-    ``experience.md`` §2，公式见 ``README.md`` §3.3。
-    """
-
-    # --- 五个要求的项 ----------------------------------------------------- #
-    forward_vel: float = 2.5            # [SPEC] 对 command_vx 的高斯跟踪
-    forward_vel_sigma: float = 0.25
-    orientation: float = -1.2           # [SPEC] roll^2 + pitch^2（平方和）
-    torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
-    foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
-    body_collision: float = -4.0        # [SPEC] 躯干接触地形
-
-    # --- 前进运动 ---------------------------------------------------------- #
-    forward_progress: float = 1.5       # 对 vx 线性，所以 vx=0 时一分也拿不到
-    forward_progress_max: float = 1.5
-    forward_progress_min: float = -0.5
-
-    # --- 摆动足抬升 -------------------------------------------------------- #
-    foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
-    foot_lift_step_ratio: float = 1.4   # 取较大者：target = max(target, ratio * step_height)
-    foot_lift_gate_speed: float = 0.25  # m/s，三维足端速度门限
-
-    # --- 步态发现 ---------------------------------------------------------- #
-    air_time: float = 0.6
-    air_time_target: float = 0.30
-    air_time_max: float = 0.60
-
-    # --- 辅助成形 ---------------------------------------------------------- #
-    base_height: float = -2.0
-    joint_vel: float = -2.0e-5
-    action_rate: float = -0.02
-    joint_limit: float = -0.5
-    alive: float = 0.15
-    termination: float = -15.0
-    success: float = 50.0
-
-    # --- 爬升进展 ---------------------------------------------------------- #
-    stair_progress: float = 3.0
-    leg_collision: float = -0.25
-
-
-@dataclass
 class EnvConfig:
     """一个环境实例的全部可调项。"""
 
     timestep: float = 0.002
     decimation: int = 10                    # -> 50 Hz 控制
     episode_length_s: float = 20.0
-    action_mode: str = "residual"           # 动作模式："residual" | "absolute"
-    action_scale: float = 0.30              # rad，策略权限（仅残差模式）
+    action_scale: float = 0.30              # rad，策略权限
     command_vx: float = 0.55                # m/s，前向指令
-    command_vy: float = 0.0
-    command_yaw_rate: float = 0.0
 
     # --- 开环步态之上的残差 RL --------------------------------------------- #
     # PD 目标变为 home + gait_gain * gait.radians(t) + action_scale * action
@@ -390,100 +343,16 @@ class Go2StairsEnv(gym.Env):
 
     def _compute_reward(self, action: np.ndarray, trunk_contact: bool,
                         foot_contact: np.ndarray | None = None,
-                        leg_contact: bool = False
+                        leg_contact: bool = False,
+                        terminated: bool = False
                         ) -> tuple[float, dict[str, float]]:
-        rc = self.cfg.reward
-        rpy = self.base_rpy
-        lin = self.base_lin_vel_world
-        target_height = self.nominal_pose
-
-        terms: dict[str, float] = {}
-
-        # 1) 前进速度奖励 -- 前向速度跟踪 ------------------------------------
-        err = lin[0] - self.cfg.command_vx
-        terms["forward_vel"] = (
-            rc.forward_vel * float(np.exp(-(err * err) / rc.forward_vel_sigma))
+        """本步奖励与逐项明细；数学全在 :func:`robotdog.reward.compute_reward`。"""
+        base, terms, terminal = compute_reward(
+            self, action, trunk_contact, foot_contact,
+            leg_contact=leg_contact, terminated=terminated,
         )
-        # 线性伴随项：机器人不动时恰好为 0，所以「原地站死」的策略一分也
-        # 拿不到。
-        terms["forward_progress"] = rc.forward_progress * float(
-            np.clip(lin[0], rc.forward_progress_min, rc.forward_progress_max)
-        )
-
-        # 2) 姿态稳定奖励 -- 惩罚 roll 与 pitch -----------------------------
-        terms["orientation"] = rc.orientation * float(rpy[0] ** 2 + rpy[1] ** 2)
-
-        # 3) 关节力矩惩罚 -- 关节力矩平方和 ---------------------------------
-        tau = self.data.actuator_force
-        terms["torque"] = rc.torque * float(np.sum(np.square(tau)))
-
-        # 4) 足端抬升奖励 -- 摆动足必须越过地形 -----------------------------
-        feet = self.foot_pos
-        foot_dt = self.cfg.control_dt
-        # 三维足端速度：只看水平分量会奖励快速的贴地平扫，同时砍掉高台阶
-        # 需要的慢速抬腿。
-        foot_speed = np.linalg.norm(
-            (feet - self._prev_foot_pos) / foot_dt, axis=1
-        )
-        gate = np.clip(foot_speed / max(float(rc.foot_lift_gate_speed), 1e-6),
-                       0.0, 1.0)
-        # geom_xpos 是球心，所以要减去半径，才能得到足端表面与地形之间的
-        # 真实间隙。
-        clearance = self.foot_clearance
-        # 目标随地形一起变高，但在 5 cm 处它与原来的常量相等，所以已经学会
-        # 的简单阶段不会回退。
-        lift_target = max(
-            rc.foot_lift_target, rc.foot_lift_step_ratio * float(self.stair.step_height)
-        )
-        lift = np.clip(clearance / lift_target, 0.0, 1.0)
-        terms["foot_lift"] = rc.foot_lift * float(np.mean(gate * lift))
-
-        # 5) 机身碰撞惩罚 -- 躯干接触地形 -----------------------------------
-        # 逐步行且有界：它随躯干擦地的时长成比例，而不是在终止步给一个
-        # 布尔量。
-        terms["body_collision"] = rc.body_collision * float(trunk_contact)
-        # 胫部 / 膝部蹭到立面。逐步有界，而且关键是它*不*结束回合，所以
-        # 机器人可以在高楼梯上继续尝试。
-        terms["leg_collision"] = rc.leg_collision * float(leg_contact)
-
-        # 6) 足端腾空时间 -- 步态成形（一次良好摆动后的落地） ---------------
-        # ``_foot_air_time`` 保存的是当前步*之前*累积的腾空时间，
-        # ``_prev_foot_contact`` 保存的是它之前的接触状态，所以这一项恰好在
-        # 足端落地的那一步结算。
-        if rc.air_time != 0.0:
-            if foot_contact is None:
-                foot_contact = self._foot_contact_mask()
-            landed = foot_contact & ~self._prev_foot_contact
-            air = self._foot_air_time
-            credit = np.clip(air - rc.air_time_target, 0.0, None)
-            overrun = np.clip(air - rc.air_time_max, 0.0, None)
-            terms["air_time"] = rc.air_time * float(
-                np.sum((credit - overrun) * landed)
-            )
-        else:
-            terms["air_time"] = 0.0
-
-        # --- 辅助成形 -----------------------------------------------------
-        terms["base_height"] = rc.base_height * float(
-            (self.base_pos[2] - self.terrain_height_under_base - target_height) ** 2
-        )
-        terms["joint_vel"] = rc.joint_vel * float(np.sum(np.square(self.joint_vel)))
-        terms["action_rate"] = rc.action_rate * float(
-            np.sum(np.square(action - self._prev_action))
-        )
-        lo, hi = self.act_low, self.act_high
-        q = self.joint_pos
-        over = np.clip(lo - q, 0, None) + np.clip(q - hi, 0, None)
-        terms["joint_limit"] = rc.joint_limit * float(np.sum(over))
-        terms["alive"] = rc.alive
-
-        # --- 爬升进展 -------------------------------------------------------
-        # 机身下方的地形高度相对回合起点的高度，所以在已经到达的台阶上原地
-        # 不动拿不到任何新奖励。
-        terms["stair_progress"] = rc.stair_progress * float(
-            max(0.0, self.terrain_height_under_base - self._start_terrain_height)
-        )
-        return float(sum(terms.values())), terms
+        terms["terminal"] = terminal
+        return base + terminal, terms
 
     def _foot_contact_mask(self) -> np.ndarray:
         """逐足布尔量：这个足端 geom 此刻是否接触地形？"""
@@ -660,8 +529,8 @@ class Go2StairsEnv(gym.Env):
     def _gait_action(self) -> np.ndarray:
         """步态先验在当前相位下的关节角偏移（rad）。
 
-        先验被禁用时恒为零，所以 ``_target_from_action`` 对两种模式（以及对
-        ``GaitParams.static()``）都是同一条代码路径。
+        先验被禁用时恒为零，于是动作流水线对 ``gait_prior=False``
+        和对 ``GaitParams.static()`` 是同一条代码路径。
         """
         if not self.cfg.gait_prior or self.cfg.gait_gain == 0.0:
             return np.zeros(self.num_act, dtype=np.float64)
@@ -670,23 +539,21 @@ class Go2StairsEnv(gym.Env):
     def _target_from_action(self, action: np.ndarray) -> np.ndarray:
         """把策略动作映射为 PD 关节目标（整条动作流水线）。
 
-        残差 RL 有意把两个幅值分开：
+        只有一种映射：**残差 RL**。它有意把两个幅值分开：
 
-            target = home + gain * gait.radians(t) + action_scale * action
+            target = home + gait_gain * gait.radians(t) + action_scale * action
 
         ``gait.action_scale`` 表示先验动作有多大（它是被搜索的步态的一部分）；
         ``cfg.action_scale`` 表示策略可以偏离它多少。共用一个尺度会让策略的
         探索噪声随先验一起缩放，瞬间就把机器人搞失稳。
+
+        （历史上有过 "absolute" 模式：``target = lo + (a+1)/2 * (hi-lo)``。
+        它从未被训练或被搜索使用过，只是 ``EnvConfig`` 里一个无人设置的
+        分支，已随本次清理删除。）
         """
-        if self.cfg.action_mode == "residual":
-            target = (self.home_angles
-                      + self._gait_action()
-                      + self.cfg.action_scale * action)
-        else:
-            # "absolute" 把动作直接映射到关节范围上，所以残差先验在那里没有
-            # 意义；它被有意忽略。
-            lo, hi = self.act_low, self.act_high
-            target = lo + (action + 1.0) * 0.5 * (hi - lo)
+        target = (self.home_angles
+                  + self._gait_action()
+                  + self.cfg.action_scale * action)
         return np.clip(target, self.act_low, self.act_high)
 
     def step(self, action: np.ndarray):
@@ -722,15 +589,10 @@ class Go2StairsEnv(gym.Env):
                 truncated = False
 
         reward, terms = self._compute_reward(
-            action, trunk_contact, foot_contact, leg_contact=leg_contact
+            action, trunk_contact, foot_contact,
+            leg_contact=leg_contact, terminated=terminated,
         )
         self._advance_foot_air_time(foot_contact)
-        terminal = 0.0
-        if terminated:
-            terminal = (self.cfg.reward.success if self._reached_top
-                        else self.cfg.reward.termination)
-            reward += terminal
-        terms["terminal"] = float(terminal)
 
         self._prev_action = self._last_action.copy()
         self._last_action = action.copy()

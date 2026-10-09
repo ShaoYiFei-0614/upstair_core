@@ -90,11 +90,22 @@ DummyVecEnv → VecMonitor → VecNormalize
 拼接会得到 `model.zip_vecnormalize.pkl` 而读取方找的是 `model_vecnormalize.pkl`。
 **给 base 传不带后缀的名字。**
 
-### 3.7 `load_policy()` 为什么要自己读裸 pickle
+### 3.7 `load_policy()` 要把统计量装上两处
 
 它返回 `(PPO, ObsNorm | None)`。`ObsNorm` 来自同目录同名的 `*_vecnormalize.pkl`。
 **不还原归一化统计，确定性评估会从 100% 掉到 0%** —— 策略会拿到按
 `mean=0 / var=1` 归一化的输入，而训练时看到的是真统计，等于换了一套输入坐标系。
+
+统计量要装到**两个**地方，少装一个就会出现「同一权重、两套结论」：
+
+1. 返回值 `ObsNorm`，给 `scripts/play.py` 那种**自己驱动裸 `Go2StairsEnv`**的调用方；
+2. 模型自带的那个 `VecEnv`（用 `restore_vecnormalize`），给走
+   `model.get_env()` 的调用方。
+
+第 2 条是后补的：`model.set_parameters()` 只还原网络权重，
+`build_ppo` 建出来的 `VecNormalize` 统计量仍是初始的 `mean=0 / var=1`。曾经因此
+在 3 cm 上得到「A 路（`model.get_env()`）0% 成功 / 100% 摔倒、B 路（裸 env）
+100% 成功 / 0% 摔倒」这种自相矛盾的结论，见 `experience.md` §5.9。
 
 为什么不直接用 `VecNormalize.load()`：那会新建一个包装器（这里只需要统计量），
 而且 `VecNormalize` 对象本身**不能随便访问属性**——多读一个不存在的名字就
@@ -165,6 +176,11 @@ def mean_abs_action(actions: np.ndarray) -> float: ...
   env_config_for_model(model_path)`），因为 PPO 必须挂在一个环境上；随后
   `model.set_parameters()` 而不是 `PPO.load()` —— 后者会用新模型覆盖策略，
   这里只需要把权重灌进去。
+* `load_policy` 在 `set_parameters` 之后**还会调一次 `restore_vecnormalize(venv, cand)`**，
+  把统计量装回模型自带的 `VecEnv`；`cand` 不存在时跳过。返回值里的 `ObsNorm`
+  与模型自带包装器因此始终是同一份统计量。**注意 `cfg` 要传对**：
+  `make_env_fn(stair, None)` 会用默认 `EnvConfig`（`history_len=10` → 460 维），
+  载入 `history_len=1`（46 维）的权重时观测维度就对不上了。
 * `restore_vecnormalize` 只拷 5 个字段：`obs_rms`、`ret_rms`、`clip_obs`、
   `clip_reward`、`epsilon`。**不动** `training` / `norm_reward` —— 续训时
   `training=True` 由 `make_vec_env` 保证。

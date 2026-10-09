@@ -235,7 +235,7 @@ play.Runner.predict(obs)
 ```
                  robotdog/tools/terrain.py  (StairSpec / flat_spec / demo_stairs_spec)
                               ▲
-robotdog/env.py (EnvConfig/ObsConfig/RewardConfig) ──►  robotdog/policy.py
+robotdog/env.py (EnvConfig/ObsConfig) + robotdog/reward.py (RewardConfig) ──►  robotdog/policy.py
                               ▲                              ▲
                      robotdog/training.py ──────────────────┘   (load_policy / load_ppo)
                               ▲

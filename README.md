@@ -42,6 +42,7 @@ python -m venv .venv
 
 `torch` 的 `+cpu` 后缀来自 PyTorch 官方 CPU 源，所以命令里**必须**带
 `--extra-index-url https://download.pytorch.org/whl/cpu`（清华镜像是主源）。
+`requirements.txt` 的版本与下表一致。
 
 | 包 | 版本 | 必需 |
 | --- | --- | --- |
@@ -110,22 +111,49 @@ upstair_core/
 | 控制频率 | **50 Hz** | `control_dt = timestep * decimation = 0.02 s` |
 | `episode_length_s` | 20.0 s | 1000 个控制步 |
 | 动作维度 | 12 | 每条腿 `hip / thigh / calf`，顺序 `FL, FR, RL, RR` |
-| `action_mode` | `"residual"` | 先验 + 残差 |
 | `action_scale` | 0.30 rad | 残差的权限；先验走 `GaitParams.action_scale`，**两者独立** |
-| 增益 `kp` / 阻尼 `kd` | `[30, 30, 45]` / `[0.6, 0.6, 0.9]` | 关节 PD，力矩 `tau = kp*(target-q) - kd*qd` 后按 `ctrlrange` 截断 |
+| 增益 `kp` / 阻尼 `kd` | `[30, 30, 45]` / `[0.6, 0.6, 0.9]` | 关节 PD，力矩 `tau = kp*(target-q) - kd*qd` 后按 `ctrlrange` 截断；选型依据见下 |
 
-`residual` 模式的目标角：
+目标角（`robotdog/env.py:539` 的 `_target_from_action()`）：
 
 ```python
 target = home + gait_gain * gait.radians(phase) + action_scale * action
 target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 ```
 
-`absolute` 模式忽略先验：`target = lo + (a + 1) * 0.5 * (hi - lo)`。
+历史上还有一个 `action_mode: "absolute"` 分支（`target = lo + (a+1)*0.5*(hi-lo)`，
+故意忽略先验）。它从未被任何一次训练或被参数搜索用过，已随清理删除 —— 现在只有
+上面这一条路径。
+
+#### `kp` / `kd` 是怎么定的
+
+`kp` / `kd` 是**关节 PD** 的增益（`tau = kp*(target-q) - kd*qd`），每条腿三个（hip / thigh / calf）
+再 `tile(..., 4)` 成 12 维（`robotdog/env.py:155` 附近）。它们不是拍脑袋的，而是按**实测关节惯量**
+配到目标带宽与阻尼比上的。用 `mujoco.mj_fullM(model, data, M)`（mujoco 3.12 的签名是
+`mj_fullM(model, data, dst)`）在 `home_qpos` 姿态下取关节空间惯量的对角元 `J`：
+
+| 关节 | `J` (kg·m²) | `kp` | `kd` | `w0 = sqrt(kp/J)` | `f0` | 阻尼比 `zeta = kd/(2*sqrt(kp*J))` | `1/(zeta*w0)` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| hip (×4) | 0.03357 | 30.0 | 0.60 | 29.89 rad/s | 4.76 Hz | 0.299 | 112 ms |
+| thigh (×4) | 0.03039 | 30.0 | 0.60 | 31.42 rad/s | 5.00 Hz | 0.314 | 101 ms |
+| calf (×4) | 0.01633 | 45.0 | 0.90 | 52.50 rad/s | 8.36 Hz | 0.525 | 36 ms |
+
+读法：
+
+* **带宽**：三条腿 4.8 / 5.0 / 8.4 Hz，都远高于本仓 50 Hz 控制环与 2–5.5 Hz 的步态频率，
+  所以 PD 不会成为步态的限制；同时低于 500 Hz 物理步长下显式积分的失稳边界。
+* **阻尼比**：0.30 / 0.31 / 0.53。calf 惯量最小、带宽最高，所以**刻意给了更高的阻尼比**
+  （`kd` 从 0.6 提到 0.9），否则踝关节在触地冲击下会振铃。比值 1.5 比严格等比缩放
+  `sqrt(45/30) = 1.225` 更保守一点，留了裕量。
+* **力矩上限**：实测 `ctrl_ranges` 是 hip / thigh `±23.70 N·m`、calf `±45.43 N·m`；
+  `step()` 每步 `clip(tau, ctrl_ranges[:,0], ctrl_ranges[:,1])`，所以增益再大也只会饱和，
+  不会输出超规格力矩。
+* **历史**：这套值来自 vendored `go2` MJCF 的作动器风格（位置伺服 + 阻尼），
+  本仓没有做自动整定 —— 上面这张表就是事后核算，用来确认它落在合理区间，而不是选型过程。
 
 ### 3.2 观测 `ObsConfig`
 
-**每帧 42 维固定块 + 按开关追加的块**，再沿时间堆叠 `history_len = 10` 帧：
+**每帧 42 维固定块 + 按开关追加的块**，再沿时间堆叠 `history_len` 帧：
 
 | 块 | 维度 | 默认 | 内容 |
 | --- | --- | --- | --- |
@@ -135,7 +163,10 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 | `gait_phase` | 2 | 关 | 步态时钟的 `sin/cos`（残差策略需要知道自己处在周期哪一点） |
 | `step_height` | 1 | **开** | 本回合的台阶高度（m）—— 唯一直接告诉策略「在哪条楼梯上」的量 |
 
-默认 `frame_size = 42 + 3 + 1 = 46` ⇒ **观测 460 维**。开 `gait_phase` 得 480 维。
+默认 `frame_size = 42 + 3 + 1 = 46`。**`config.yaml` 现在把 `history_len` 设为 `1`**
+⇒ 观测就是单帧 **46 维**；`PPO` 与 `policy.py` 的维数全部跟着它走。
+（`history_len = 10` 得 460 维，开 `gait_phase` 得 480 维；实测单帧在课程内不差、
+在 3 cm / 6 cm 上还明显更好，见 `train.md` §3.6。）
 
 帧约定（与 MuJoCo 一致）：`qpos[0:3]` 世界位置、`qpos[3:7]` 四元数 `(w,x,y,z)`、
 `qvel[0:3]` 世界线速度、**`qvel[3:6]` 是机身本地角速度**（IMU 陀螺直接就是这个）。
@@ -143,7 +174,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 **刻意不给**的量：足端离地高度、机身高度（默认）、任何测距/接触读数。
 `step_height` 是标量，它告诉策略「这条楼梯多高」，**但不告诉它下一个立面在哪**。
 
-### 3.3 奖励 `RewardConfig`
+### 3.3 奖励 `RewardConfig`（公式在 `robotdog/reward.py`）
 
 | 项 | 默认 | 口径 |
 | --- | --- | --- |
@@ -166,6 +197,8 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 
 两个关键点：
 
+* **所有奖励数学都在 `robotdog/reward.py`**（纯函数 `compute_reward(env, ...)`），
+  `robotdog/env.py:344` 只留一个三行转发方法。为了便于研究与改动，单看那一个文件就够。
 * 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
   （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
   拆解可以安全地相加。

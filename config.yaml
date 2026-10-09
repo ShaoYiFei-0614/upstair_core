@@ -35,14 +35,19 @@ env:
   action_scale: 0.30         # 残差动作上限 [rad]，策略的权限
   command_vx: 0.55           # 前进速度指令 [m/s]
   terminate_contact_steps: 10
-  gait_prior: true           # 在 trot 开环先验之上学残差
+  gait_prior: true           # 在 trot 开环先验之上学残差。**别关**：关掉后六级全 0
+                             # （原地站到超时，|a|≈0.09），见 train.md §3.6
   gait_file: artifacts/trot_stairs.json
-  # 观测开关；默认 42 + 3 + 1 = 46 维/帧 × 10 帧 = 460 维
+  # 观测开关；history_len=1 时每帧 42 + 3 + 1 = 46 维，即观测总量 46 维
   obs:
     base_lin_vel_body: true
     base_height: false
     gait_phase: false
     step_height: true
+    # 历史帧数。实测 1 帧（46 维）**不亏**：课程内每一级都不差、3cm/6cm
+    # 还更好（92% vs 62%、22% vs 0%），课程外 3/5cm 都是 100%。50 Hz 下
+    # 相邻帧几乎相同，10 帧绝大部分是冗余。见 train.md §3.6。
+    history_len: 1
 
 
 # --- 奖励 -----------------------------------------------------------------
