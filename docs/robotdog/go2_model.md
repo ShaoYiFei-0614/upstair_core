@@ -29,7 +29,8 @@
 * 不修改 `models/` 下任何 vendored 文件（只读）。
 * 不定义楼梯参数与高度剖面（`robotdog/tools/terrain.py` 的 `StairSpec` / `build_terrain_xml`）。
 * 不建 `MjData`、不推进物理、不做控制 —— 那是 `robotdog/env.py`。
-* 不做接触力读取与射线投射（`robotdog/tools/touch.py`）。
+* **不做任何接触力读取与射线投射**。仓库里已经没有触觉模块（`robotdog/tools/touch.py`
+  已在「盲走」重构中删除），所以本模块也不必为测距仪准备任何 geom 分组约定。
 * 不训练、不评估、不渲染、不导出。
 * 不使用 `<include>`（见 §3.1）。
 
@@ -58,7 +59,8 @@ vendored 的 `models/unitree_go2/scene.xml` 本身就是一个「`<include file=
 通常只说「某行某处」，没有 XML 很难定位。
 
 `TERRAIN_GEOM_GROUP = 1` 的问题在这里只涉及一句：地形与地板必须落在 **group 1**
-（默认可见区），细节归 `docs/robotdog/tools/terrain.md` / `touch.md`，见 §3.5。
+（MuJoCo 默认隐藏 group 3/4/5，而 Unitree 的 MJCF 占用了 2/3），细节归
+`docs/robotdog/tools/terrain.md`，见 §3.5。
 
 ### 3.2 `meshdir` 保持相对 `"assets"`，网格走内存 VFS
 
@@ -124,11 +126,10 @@ f'<geom name="floor" type="plane" pos="0 0 {z:g}" size="{size:g} {size:g} 0.05" 
 f'condim="3" friction="0.9 0.005 0.0001" material="groundplane" group="{TERRAIN_GEOM_GROUP}"/>'
 ```
 
-* 地板必须带 `group=TERRAIN_GEOM_GROUP(=1)`：`robotdog/tools/touch.py` 的前向测距仪用
-  `mj_ray(..., geomgroup=TERRAIN_GEOM_MASK, ...)` 投射，只启用地形组，于是**构造上就看不见
-  机器人自己的前腿**。地板不在地形组里，测距仪就会在平地上什么也测不到。
-* 同时 group 1 在 `mjv_defaultOption` 的默认可见范围 `[1,1,1,0,0,0]` 内 ——
-  把地形盖进 group 4 会让楼梯在所有离屏渲染里消失而物理照常爬（`experience.md` §1.2）。
+* 地板必须带 `group=TERRAIN_GEOM_GROUP(=1)`，理由是**可见性**：group 1 落在
+  `mjv_defaultOption` 的默认可见范围 `[1,1,1,0,0,0]` 内。把地形盖进 group 4 会让楼梯
+  在全部离屏渲染里消失、而物理照常爬（`experience.md` §1.2）。
+  历史上还有第二个理由（触觉测距仪只启用地形组），它随触觉模块一起被删除。
   `Go2StairsEnv.render()` 另外强制打开全部六组，所以改这个常量也不会再静默隐藏世界。
 * `friction="0.9 0.005 0.0001"` 与台阶块一致（`tools/terrain.py` 的 `DEFAULT_STAIR_FRICTION`），
   避免「地板和台阶摩擦不同」这种隐性口径差。

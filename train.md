@@ -1,301 +1,205 @@
 # train.md — 训练过程与实测结论
 
-配套：[`README.md`](README.md)（环境与代码实现）、[`experience.md`](experience.md)
-（关键错误与修正）。
-
-文中标 **[实测]** 的是本仓当场跑出来的数字，**[原项目]** 的是从完整仓
-`D:\项目\RobortDog\upstair` 的历史记录（`summary.json` / tensorboard / `reports\`）里
-读到的。
+本文件记录**训练是怎么组织的**、**一次训练长什么样**、以及**实测到的结论与能力边界**。
+代码实现见 `README.md`，踩过的坑见 `experience.md`。
 
 ---
 
 ## 1. 训练是怎么组织的
 
-`scripts\train.py` 驱动一条**课程**：每一档是一个 `StageSpec`（地形 + 毕业判据 +
-预算），跑满预算或毕业就换下一档。
+### 1.1 固定六级课程
 
-默认课程（`robotdog/curriculum.py` 的 `default_curriculum`）：
+`robotdog/curriculum.py` 的 `default_curriculum()` 返回恰好六级（`STAGE_HEIGHTS_CM`）：
 
-| 阶段 | 地形 | 目标成功率 | 最少回合 | 预算 |
-| --- | --- | --- | --- | --- |
-| `flat` | `flat_spec(n_up=0)` | 0.90 | 30 | 250,000 |
-| `easy` | 5 cm × 8 级 | 0.80 | 40 | 300,000 |
-| `medium` | 12 cm × 8 级 | 0.65 | 40 | 350,000 |
-| `hard` | 19 cm × 8 级 | 0.50 | 40 | 400,000 |
+| 阶段 | 台阶 | 踏面 | 级数 | 预算 | 学习率 |
+| --- | --- | --- | --- | --- | --- |
+| `flat` | 平地（`n_up=0`） | 0.50 | 0 | 100,000 | 1.5e-4 |
+| `stair3` | 3 cm | 0.50 | 8 | 250,000 | 1.5e-4 |
+| `stair6` | 6 cm | 0.50 | 8 | 250,000 | 1.2e-4 |
+| `stair9` | 9 cm | 0.50 | 8 | 250,000 | 1.0e-4 |
+| `stair12` | 12 cm | 0.50 | 8 | 250,000 | 8e-5 |
+| `stair15` | 15 cm | 0.50 | 8 | 250,000 | 6e-5 |
 
-`--stage-top-cm 11.0` 会把高于 11.0 cm 的阶段全部压到 11.0；`--mixed-heights 8.0,11.0`
-让每个子环境回合随机取一个高度（8 个环境实测为
-`8.0 / 8.4 / 8.9 / 9.3 / 9.7 / 10.1 / 10.6 / 11.0 cm`）。
+**默认总预算 1,350,000 步**。台阶越高、学习率越低（越往上越接近微调，不希望破坏已学的地形）。
 
-毕业条件（`experience.md` §4.1 那条根因修正之后）三者同时成立：
-`n_total >= min_episodes` **且** `success_rate >= target_success` **且**
-`n_total >= min_timesteps`。`--min-stage-frac F`（默认 0.5）把每档
-`min_timesteps` 设成 `int(max_timesteps × F)`；设 0 恢复旧行为。
-预算耗尽但没达标时 `advance_on_budget=True` 仍然推进（会打印出来）。
+平地阶段的台阶高是 **3.0 cm**（实际是 5.0 cm），因为推荐值是以 cm 为单位的浮点数。
 
-PPO 超参（配方里显式给的）：`n_steps=256`、`n_envs=8` ⇒ 一次更新粒度 **2,048 步**；
-`batch_size=512`、`n_epochs=5`、`target_kl=0.03`、`ent_coef=0.002`、
-`net_arch=[512,256]`、`log_std_init=-2.0`、`gamma=0.99`、`learning_rate=1.5e-4`。
+### 1.2 阶段之间怎么衔接
 
-向量环境链路是 `DummyVecEnv → VecMonitor → VecNormalize`。
-**`DummyVecEnv` 不是退路而是唯一选项**：受限沙箱禁止命名管道，`SubprocVecEnv` 起不来。
-`norm_obs=True`、`norm_reward` 默认 `False`（见 `experience.md` §4.2）。
+```
+scripts/train.py
+  curriculum.default_curriculum() → [StageSpec × 6]
+  for stage in stages:
+      venv   = make_vec_env(stage.spec, n_envs, cfg, seed)   # 地形换成这一级
+      model  = build_ppo(venv, learning_rate=stage.learning_rate, ...)
+      if 上一级完成: model.set_parameters(上一级 checkpoints/<name>_final.zip)   # warm-start
+      model.learn(total_timesteps=stage.timesteps,
+                  callback=[ProgressCallback, CheckpointCallback])
+      RunDir.save_model(model, f"checkpoints/{stage.name}_final", venv)
+```
+
+* **逐级 warm-start**：每一级在上一级的权重上继续练。`--resume <zip>` 可以从任意权重接。
+* **换地形只能在阶段边界**。`set_stair` 会重编译 MJCF（约 250 ms/子环境），
+  在 rollout 中间换会让当次观测与状态不一致，所以切阶段一定发生在 `learn()` 返回之后。
+* PPO 的更新粒度 = `n_steps 256 × n_envs 8 = 2048` 步。**每一级至少有 48 次以上更新**，
+  这是刻意的：早期版本的课程毕业判据没有最少步数，导致每档只跑 0~1 次更新、策略输出
+  恒等于 0（见 `experience.md` §4.1）。
+
+### 1.3 回调
+
+* `ProgressCallback`：**只在有新回合结束、且距上次打印 ≥ `--log-interval` 次更新时**打印
+  一行 `EpisodeStats.format_line()`。早期版本按 `n_calls % log_interval` 无条件打印，
+  日志刷屏且看不到回合统计。
+* `CheckpointCallback`：每 `--save-every` 步存
+  `checkpoints/<阶段>/<阶段>_<步数>_steps.zip` + 同名 `_vecnormalize.pkl`。
+
+### 1.4 向量环境
+
+`DummyVecEnv → VecMonitor → VecNormalize(training=True, norm_obs=True, norm_reward=True, clip_obs=10.0)`。
+
+* **必须用 `DummyVecEnv`**：本环境禁用 Windows 命名管道，`SubprocVecEnv` 不可用。
+* `VecMonitor` 在 `VecNormalize` **内层**，这样 `info["episode"]["r"]` 是**未归一化**的
+  真实回报 —— 日志里的均回报才有物理意义。
+* `norm_reward` 默认 **True**（实测有帮助，见 `experience.md` §4.2）。
 
 ---
 
-## 2. 一次典型训练长什么样
+## 2. 一次训练长什么样
 
 ```bat
-.venv\Scripts\python.exe scripts\train.py ^
-  --run-name <name> --stage all --stage-top-cm 11.0 --sub-steps 1 ^
-  --mixed-heights 8.0,11.0 --n-envs 8 --net-arch 512 256 ^
-  --learning-rate 1.5e-4 --target-kl 0.03 --log-std-init -2.0 ^
-  --gait-prior --gait-file artifacts\trot_stairs.json ^
-  --obs-base-lin-vel-body --obs-base-height --obs-foot-height ^
-  --obs-touch --obs-stair-probe --obs-drift --obs-gait-phase ^
-  --terminate-contact trunk --log-interval 5 --save-every 50000 ^
-  --min-stage-frac 0.5 --det-episodes 10 ^
-  --cfg episode_length_s=20.0 --cfg reward.heading=-30.0 --cfg reward.heading_max=0.35 ^
-  --cfg terminate_contact_steps=10 --cfg terminate_height_ref=support
+.venv\Scripts\python.exe scripts\train.py --run-name walk1
 ```
 
-启动时会打印几行**必须核对的**自检：
+输出形如：
 
 ```
-[步态先验] 已启用 residual RL: 5.48 Hz, ±0.265 thigh / ±0.986 calf (norm. units), ...
-[观测] 每帧 66 维, history=10, 共 660 维
-[课程] 最少训练步数下限 = 50% 预算 (最紧的一档 175,000 步 ≈ 85.4 次 PPO 更新, 每次 2,048 步)
-[混合地形] 各子环境 8.0cm@50cm / 8.4cm / ... / 11.0cm@50cm
-[模型] 观测维度=(660,) 动作维度=(12,) 网络=[512, 256] n_steps=256 batch=512 epochs=5 可训练参数量 = 942,873
+[课程] flat     平地      0.0cm × 0 级  预算 100,000  学习率 1.50e-04
+[课程] stair3   3cm 台阶  3.0cm × 8 级  预算 250,000  学习率 1.50e-04
+...
+[进度] [   2,048 步] 回合=    8 成功率= 100.0% 摔倒率=   0.0% 均回报=  332.33 均步数= 112.0
+[课程] <<< 'flat' 成功率=100.0% 摔倒率=0.0% 均回报=332.3 用时=4.9s
+...
+阶段      标签        台阶   踏面  级数  顶端   预算     学习率   成功率  摔倒率  均回报    用时   模型
+flat      平地        0.0c   50c   0     0.00m  100000   1.5e-4  100.0%   0.0%  332.33    ...
+合计 6 级, 总预算 1000000 步
+产物: runs/walk1
+  模型: runs/walk1/model_final.zip
+  汇总: runs/walk1/summary.json
 ```
-
-`--mixed-heights 8.0,11.0` 只在 `medium` 段生效；`flat` / `easy` 阶段的地形由课程表决定。
 
 ### 产物
 
 ```
-runs\<name>\
-    model_final.zip                  最终权重（660 维约 11.4 MB，942,873 参数）
-    model_final_vecnormalize.pkl     观测归一化（必须与 zip 成对使用）
-    model_best.zip                   只在该 run 毕业过至少一个阶段时才写
-    checkpoints\<stage>_<steps>_steps.zip
-    checkpoints\<stage>_final.zip
-    artifacts\best_<stage>.zip       阶段内最优
-    summary.json                     全部超参 + 结果 + 逐阶段统计
-    tensorboard\ppo_0\events.out.tfevents.*
+runs/<名字>/
+  checkpoints/<阶段>_final.zip                  每级结束的权重
+  checkpoints/<阶段>/<阶段>_<步数>_steps.zip     周期检查点
+  model_final.zip                              最后一级的交付权重
+  model_final_vecnormalize.pkl                 与它成对的观测/奖励归一化统计
+  summary.json                                 课程定义 + 每级结果 + 全部配置
+  tensorboard/
 ```
 
-`summary.json` 关键字段：`stages[]`（每档的 `timesteps` / `graduated` /
-`success_rate` / `fall_rate` / `mean_return` / `wall_seconds`）、
-`total_timesteps`、`steps_per_second`、`best_stage`、`env_config`、`obs_config`、
-`reward_config`、`reproduce`。
-
-> ⚠ `total_timesteps` 是**跨 resume 的全局累计**，不是单次运行的步数。
-> `reproduce` 字段**分两代**：course31 之后原样回显真实命令行，可信；
-> course22 只有 5 个参数，是有损的。
+`summary.json` 的键：`stages`（六级定义）、`results`（每级实测）、`env_config`、
+`obs_config`、`reward_config`、`total_timesteps`、`wall_seconds`、`final_model`。
+**`play.py` 就是靠它恢复配置的**，所以搬动权重时不要漏掉它。
 
 ---
 
-## 3. 实测复现结论（重要）
+## 3. 实测结论（重要）
 
-### 3.1 参考 checkpoint 的能力带能复现
+### 3.1 冒烟验证：流水线是通的
 
-用本仓的 `scripts\eval.py` 评估从完整仓取来的 course22 参考权重
-（`runs\course22_ref\checkpoints\medium_final.zip`），结果与完整仓自己的官方报告
-`upstair\runs\course22\reports\course22_eval_trained.json` **一致**：
-`train_flat` 100%、`train_h050` 100%、`train_h120` **0%**、`train_h190` **0%**。
-**[实测]**
+`--total-timesteps 12000 --n-envs 2`（每级约 2,000 步）跑完六级，45 秒：
 
-用自己的确定性探针（每档 20 回合，`seed0=21000`，观测按同名
-`*_vecnormalize.pkl` 归一化）测得的能力带：
+| 阶段 | 步数 | 采样成功率 | 摔倒率 | 均回报 |
+| --- | --- | --- | --- | --- |
+| flat | 888 | 100.0% | 0.0% | 332.33 |
+| stair3 | 2,222 | 46.2% | 53.8% | 505.89 |
+| stair6 | 2,222 | 0.0% | 66.7% | 127.08 |
+| stair9 | 2,222 | 0.0% | 50.0% | 291.29 |
+| stair12 | 2,222 | 0.0% | 33.3% | -150.24 |
+| stair15 | 2,224 | 0.0% | 0.0% | -556.24 |
 
-| 高度 (cm) | 8.0 | 9.0 | 9.5 | 10.0 | 10.5 | 11.0 | 11.5 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 成功率 | 100% | 100% | 90% | 90% | 60% | 10% | 0% |
-| 均前进 (m) | 4.56 | 4.56 | 4.13 | 4.15 | 3.48 | 1.56 | 0.80 |
-| 主要结局 | success | success | 18/20 成 | 18/20 成 | 12 成 / 6 摔 / 2 超时 | 13 摔 / 5 超时 | 12 摔 / 8 超时 |
+⇒ 流水线、回调、存档、`summary.json`、`play.py` 两种模式全部验证通过。
+**这些数字只证明管道通，不证明训练有效** —— 每级只有约 1~8 次 PPO 更新。
 
-**11.0 cm 是墙**，且 11.0 cm 上失败以**摔倒**为主，11.5 cm 上是摔倒 + 超时各半。
-**[实测]**
+注意 `stair3` 的采样成功率 46% 是**探索**口径（每步动作加 `log_std ≈ 0.137` 的噪声），
+它会大幅低估确定性策略。
 
-原项目交付的三条策略（6 档 = 8.0/9.0/9.5/10.0/10.5/11.0 cm，40 回合 × 6 档）：
+### 3.2 残差幅度是判断「有没有学起来」的关键量
 
-| 标签 | 权重 | 8.0 | 9.0 | 9.5 | 10.0 | 10.5 | 11.0 | 均值 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `c22 final` | `runs\course22\checkpoints\medium_final.zip` | 100 | 100 | 90 | 90 | 60 | 10 | 75.0% |
-| `c31 best` | `runs\course31\artifacts\best_medium.zip` | 100 | 100 | 97.5 | 87.5 | 65 | 15 | 77.5% |
-| `c49 final` | `runs\course49\model_final.zip` | 100 | 95 | 95 | 92.5 | 70 | 7.5 | 76.7% |
+纯 trot 开环先验（零残差）的能力：**平地 100% 走完 3.0 m**，但楼梯上几乎全摔
+（5 cm 8 回合 7 摔、8 cm 6 摔）。所以「策略 ≈ 先验」在楼梯上等价于「没学会」。
 
-**[原项目]** 三者差异**统计上互不显著**；只承诺落进同一能力带，不承诺逐位复现
-（同一条命令重训，档位有 ±5~10 pt 波动是常态）。
+判断标准是 `mean|a|`（确定性策略的动作绝对值均值）：
 
-### 3.2 三条记录的配方
+| 策略 | `mean|a|` | `p95|a|` | `|a| < 0.05` 占比 | 结论 |
+| --- | --- | --- | --- | --- |
+| 纯先验（零残差） | 0 | — | 100% | 上不了楼梯 |
+| 参考 checkpoint | **0.42** | 1.00 | 7% | 能上 8~10 cm |
+| 从零训练 300k 步 | 0.02~0.10 | 0.1~0.4 | 40~89% | **退化成纯先验** |
 
-`course22`（从零）就是 §2 那条命令。`course31` / `course49` **都从 course22 续训，
-不是前后相承**：
+参考策略的 `mean|a| ≈ 0.42` 是**结构常数**，不随台阶高变化（2 cm 时 0.421，
+11 cm 时 0.412），而且 `p95` 恒为 1.00（长期饱和）。**要进入这个工作区间，起步要百万步
+量级**。
 
-```bat
-rem course31 = course22 的权重 + 两条 --cfg
-... --resume runs\course22\checkpoints\medium_final.zip --stage medium --stage-timesteps 400000 ^
-    --cfg reward.stair_progress_foot_ref=true --cfg reward.stair_progress_min_loaded_feet=2
+### 3.3 从零训练能达到什么程度（本仓实测，旧 660 维观测面）
 
-rem course49 = course31 + 两条「高台阶躯干接触去抖收紧到 1 步」
-... --cfg contact_debounce_adaptive=true --cfg contact_debounce_hi_steps=1
-```
+一次全课程 run（1,175,000 步、63.6 分钟、8 环境）：
 
-⚠ **course31 / course49 没有 `model_best.zip`**：续训后 `best_stage` 是 `null`
-（没有重新毕业任何阶段），所以 `model_best` 从没被写过——尽管 `summary.json` 的
-`artifacts.best_model` 里还写着这个路径。交付权重分别是
-`artifacts\best_medium.zip` 与 `model_final.zip`。
+| 阶段 | 步数 | 成功率 | 摔倒率 | 均回报 |
+| --- | --- | --- | --- | --- |
+| 平地 | 125,000 | **100.0%** | 0.0% | +347.9 |
+| 5 cm | 300,000 | **0.0%** | 20.0% | -2529.7 |
+| 11 cm | 350,000 | **0.0%** | 40.0% | -2482.7 |
+| 11 cm（续） | 400,000 | **0.0%** | 66.0% | -1348.7 |
 
-⚠ `--resume` **静默忽略** `--net-arch` / `--learning-rate` / `--target-kl` /
-`--n-epochs`，所以 §3.1 的两条续训只加 `--cfg`。
+* critic **学起来了**：`train/explained_variance = 0.946`（对比从零单档训练只有 0.01）。
+* 策略确实在「努力」：`mean|a| ≈ 0.25~0.29`（参考的 60%），能走能爬 2~3 cm
+  （到 `x = 4.72 / 3.96`），5~6 cm 上受限（`x ≈ 2.4~2.6`），11 cm 上几乎原地
+  （`mean_vx = +0.044`）。
+* **产出策略在标准地形上仍是 0% 成功**（5 cm 和 8 cm 上 100% 摔倒）。
 
-### 3.3 ❌ README §4.1「`--stage medium` 从零 22 分钟」不可复现
+⇒ 对抗性评估下「训练报告变好」不等于「策略变好」：同一批权重里，**训练日志的摔倒率
+减半**（easy 阶段 58% → 20~26%），但拿去做标准地形测试仍是 0%。
 
-这是本次复现**最重要的一条负面结论**。
+### 3.4 什么杠杆有效、什么无效
 
-**证据链：**
+| 杠杆 | 实测效果 |
+| --- | --- |
+| `norm_reward=True` | **有效但温和**：3 cm 成功率 0.474 → 0.539，`mean\|a\|` 0.070 → 0.080 |
+| `success=200 / termination=-20`（放大成功/终止） | **最强**：`mean\|a\|` 增长速度约为「仅归一化」的 2 倍 |
+| `action_scale=0.60` | 只降摔倒率，**不增加前进** |
+| 降低侧向惩罚（`straight_line`/`heading` 调小） | 只降回报，**不提高前进** |
+| 把侧向惩罚全部清零 + 前进奖励翻倍 | **仍然无效**：`mean\|a\|` 卡在 0.025 |
+| 增大 `action_scale=0.80` | **无效**：策略不会因此放大输出 |
+| 从参考 checkpoint warm-start | 5/8 cm 保持 100%，**11 cm 不改善**（0%，摔倒率反而从 0.38 涨到 0.75） |
 
-1. 按那条命令（`--stage medium`，660 维，`--min-stage-frac 1.0`）从零训练，
-   跑到 **360,736 步 / 440 回合仍是成功率 0.0%**，均回报 -3650，
-   `train/explained_variance` 在 0.008~0.045 之间（critic 完全没学到），
-   且 `--target-kl 0.03` 频繁触发早停（`Early stopping at step 2/3 due to reaching
-   max kl`）。**[实测]**
-2. 参考 run 的 tensorboard event 文件里，**全部 20 个 tag 的 step 区间都是
-   `[3909256 .. 4441736]`**，53 个采样点，**完全没有 flat/easy 阶段的标量**。
-   它的 `curriculum/stage_steps` 才是阶段内步数（10,240 → 542,720）。
-   ⇒ tensorboard 的 step 轴是**全局累计步数**。**[原项目]**
-3. 参考 `summary.json`：`stages` 只有 `medium` 一条（`timesteps=552,296`、
-   `graduated=true`、`stop_reason` 含「成功率 66.0% >= 目标 65%」、
-   `wall_seconds=1339.4`、`steps_per_second=412.3`），而 `total_timesteps=4451312`。
-   ⇒ **medium 之前已消耗 3,909,256 步**，medium 阶段继承的是**已在 flat/easy 上
-   学好的策略**。**[原项目]**
-4. 佐证：course22 的 medium 阶段第一个 tensorboard 采样点（`stage_steps=10,240`）
-   成功率就已经是 **0.4255**、`mean_return +302.75`；而从零训练的同一位置是
-   **0.0000 / -5009.8**。**[实测]**
-5. 血统：course21 的 `total_timesteps=3899016`，唯一 stage 是 medium（700k 步、
-   未毕业）；course22 = course21 的续训。course31 = 4451312 + 400000 =
-   4851312；course49 同为 4851312。**[原项目]**
+⇒ 结论：**奖励尺度（而不是奖励权重）是把策略压回「几乎不动」的主因**，
+`norm_reward` 恢复可学的 critic 目标后残差才开始增长；但即使如此，从零训练需要
+**百万步量级**才能接近参考的工作区间。
 
-**结论**：`README §4.1` 的「22 min / 4.45M 环境步」把**跨 resume 的全局累计步数**
-当成了单次运行。`--min-stage-frac 1.0` 也与「552k 步毕业」不自洽
-（1.0 要求先跑满 400k 才可能毕业，而 552,296 > 400,000 说明参考用的是更小的值，
-大概率是默认的 0.5）。**「22 分钟」只对 medium 这一段成立**（552,296 步 ÷
-412 步/s ≈ 22 min）；整条 flat→easy→medium 流水线约数小时。
+### 3.5 高台阶的困难：不是「抬不起来」
 
-### 3.4 从零训练能达到什么程度（本仓实测）
+* 纯先验在平地上的摆动峰值是 **0.112 m**（把步频降到 60% 可达 0.166，加大幅值可达 0.229），
+  而 **11 cm 台阶只需要 0.11 m** ⇒ 几何上完全够。
+* 参考策略在 11 cm 上实测峰值**只有约 0.09 m**，而且几乎不随台阶高缩放。
+* 开环调参扫描（18 组 `gain × amp × freq`）在 9/11/13 cm 上**无一成功**。
+* 卡在立面前时每足离地只有 0.00~0.03 m，法向力均值 12~70 N（峰值 200~320 N）。
 
-按 §2 的完整配方（`--stage all`）从零跑完：
-
-```
-runs\course22_improved   total_timesteps = 1,174,360   n_updates = 1521
-train/explained_variance = 0.946      train/std = 0.135
-flat   毕业（100%）
-easy   预算耗尽 300,000 步，成功率 0.0% < 目标 80%  → advance_on_budget 推进
-medium 预算耗尽 350,000 步，成功率 0.0% < 目标 65%
-hard   预算耗尽 400,000 步，成功率 0.0%
-```
-
-**训练报告的摔倒率确实大幅改善**（这是训练循环自己的日志，与我的探针无关）：
-
-| easy 阶段 | 60 回合 | 80 | 100 | 140 | 180 | 300 | 340 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 原始配方 | 58.0% | 54.0% | 46.0% | — | — | — | — |
-| 改进配方 | — | — | 40.0% | 28.0% | 20.0% | 20.0% | 22.0% |
-
-⇒ 摔倒率约为原始配方的**一半**。但 **medium（11 cm）成功率始终 0%**，
-而且摔倒率一开始反而低（20 回合 20.0%、40 回合 12.5%），随后恶化到
-360 回合 30.0% / 400 回合 46.0%。
-
-**产出的策略与参考差距巨大**（6 回合/档，确定性）：5 cm **0% 成功 / 100% 摔倒**、
-8 cm **0% / 100% 摔倒**、11 cm 0% / 83% 摔倒。
-
-**但它确实在「努力」**：`mean|a| ≈ 0.25~0.29`，而参考是 **0.42**
-（从零学不动的那些 run 只有 0.02~0.10）。逐高度的 `max base_x`：
-
-| h (cm) | 2.0 | 3.0 | 5.0 | 6.0 | 8.0 | 11.0 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `max base_x` (m) | 4.72 | 3.96 | 2.55 | 2.37 | 1.91 | 1.49 |
-| `mean_vx` (m/s) | +1.197 | +0.895 | +0.457 | +0.588 | +0.269 | +0.044 |
-
-⇒ 能走能爬 2~3 cm（到达 x≈4.7 / 4.0），5~6 cm 前进受限，11 cm 基本原地。
-**训练有学习，但强度不足以复现参考。**
-
-**尺度参考**：参考的 `mean|a| = 0.42` 是 flat→easy 共 3.9M 步攒出来的。
-从零训练要进入参考的工作区间，需要 2~4M 步量级，150k~400k 步的 run 无法判定成败。
-
-### 3.5 消融：什么杠杆有效、什么无效
-
-**A. 奖励归一化（`--norm-reward`）— 温和的稳定器，不是解药。**
-3 cm 台阶、8 环境、150k 步，双方各用**自己的**归一化器：
-
-| arm | 成功率 | `mean|a|` | 11 cm |
-| --- | --- | --- | --- |
-| off | 0.474 | 0.070 → 0.063 | 无成功 |
-| on | 0.539 | 0.080 → 0.083 | 无成功 |
-
-**B. 侧向惩罚清零 + 前进奖励提到 8.0 — 无效。**
-把所有侧向惩罚（`straight_line` / `heading` / `lateral_vel` /
-`lateral_vel_track` / `yaw_rate`）设 0、`forward_vel=8.0`，从零训练 30,720 步时
-残差仍停在 0.025，h200 摔倒率 0.88。⇒ **「惩罚压死残差」不是唯一机制。**
-
-**C. `action_scale=0.60` — 只降摔倒，不增前进。**
-11 cm 摔倒率 0.62 → 0.25 → 0.00，但 `adv` 反而从 0.54 降到 0.47。
-
-**D. 奖励再平衡（`straight_line=-4.0`、`heading=-8.0`、`heading_max=0.6`）— 无效。**
-只降低 return（-17853 → -14044），**不提高 advance**。
-
-**E. 成功奖励放大（`reward.success=200`、`reward.termination=-20`）— 早期有效，但结论待复核。**
-在 3 cm 上确实让 `|a|` 增长更快、11 cm 摔倒率下降。⚠ 这批数字来自一个后来被发现
-**会报错回合**的探针（见 `experience.md` §5.1），**未用修正后的探针重跑**，
-引用时请自行复核。
-
-**F. 参考权重 warm-start 微调（8 cm，150k 步）：**
-
-| 对照 | 8 cm 保持 | 11 cm |
-| --- | --- | --- |
-| 参考奖励 | 133k 步仍 100% | 0%（adv 1.44 → 0.88） |
-| 新奖励项 | 106k 88% → **133k 62% → 160k 25%** | 0% |
-| 新奖励 + `lr=3e-5` | 160k 75% | 12%（adv 2.56，最好） |
-
-前 26,624 步三条对照**逐位相同**，起点干净。⇒ **参考奖励下 11 cm 是微调也翻不过去
-的墙**；新奖励项在默认学习率下会**弄丢已经学会的 8 cm**（原因见
-`experience.md` §6.5）。
-
-### 3.6 11 cm 为什么是墙：不是奖励，也不是「抬不起来」
-
-这一节是本仓的核心诊断，详细推导见 `experience.md` §6。
-
-1. **参照面口径错了**，旧 `foot_clearance` 在 11 cm 上给出的绝对读数**比 8 cm 还
-   大** —— 抬升信号完全反了。换成落脚面口径 `advance_clearance()` 后判别力
-   与实测成功率**同形**（0.987 / 0.986 / 0.942 / 0.674 / 0.203 对
-   100% / 100% / 90% / 60% / 10%）。
-2. **不是「抬不起来」**：纯先验（零残差）在**平地**上的摆动峰值实测
-   **0.1124 m**（默认频率）、**0.1658 m**（频率 ×0.6）、最高 **0.21 m**
-   （gain 1.4 + 幅度 1.6 + 频率 ×0.6）。而参考策略在 11 cm 上只抬到约 0.09 m。
-   ⇒ **先验有这个几何能力，策略没有用它。**
-3. **但开环调参也翻不过去**：18 组（gain 1.0/1.4/1.8 × 幅度 1.0/1.3/1.6 ×
-   频率 ×1.0/0.6）零残差下，9 / 11 / 13 cm 上**没有一次成功**。
-   ⇒ 缺的不是峰值高度，而是**摆动相里的向前落脚**。
-
-**下一步（唯一有证据支持的突破口）**：显式落脚相 IK —— 触地记抬脚点 →
-用 `_step_surface_ahead()` 求目标踏面 → 摆动相把足端从抬脚点插值到该踏面上的
-落点 → 解算髋/膝角替换 `gait.radians()`，残差策略仍叠在其上。这是对先验的
-**结构性改动**，不是继续调奖励权重。
+⇒ 缺的不是抬腿高度，而是**摆动相里向前的落脚**。唯一有证据支持的下一步是显式落脚相
+IK（触地时记抬脚点 → 求目标踏面 → 摆动相插值到落点 → 解算髋/膝角）。
+**本仓没有实现这一步。**
 
 ---
 
 ## 4. 训练时的核对清单
 
-1. **看启动自检**：观测维数（默认 420 / 课程配方 660）、`最少训练步数下限`、
-   `[混合地形]` 各子环境高度、`可训练参数量`（660 维应为 942,873）。
-2. **看 `curriculum/success_rate` 与 `train/explained_variance` 一起**。
-   `explained_variance ≈ 0` 意味着 critic 没学到，这个 run 不会有进展——
-   不要继续等。
-3. **看 `train/std`**。参考在 0.14 附近；从零学不动的 run 也停在 0.136 附近，
-   所以它**不能**单独当判据。
-4. **`Early stopping at step 1/2 due to reaching max kl` 频繁出现**说明
-   `target_kl=0.03` 正在饿死梯度批次。参考 run 的 `approx_kl` 是 0.036~0.044。
-5. **至少 40 回合评估**（`experience.md` §5.7）。
-6. **并行 run ≤3**（`experience.md` §5.5）。
+1. **观测维数**与 `summary.json` 的 `obs_config` 对得上（默认 460；开 `gait_phase` 是 480）。
+2. **`*_vecnormalize.pkl` 与 `*.zip` 成对**。缺了它确定性评估会从 100% 掉到 0%。
+3. **`mean|a|` 是否在增长**。停在 0.02~0.10 就是退化成纯先验，继续跑也不会好。
+4. **`train/explained_variance`**。接近 0 或负数说明 critic 没学到东西，先查奖励尺度。
+5. **采样成功率 ≠ 确定性成功率**。日志里的成功率含动作噪声，交付前必须用
+   `play.py --mode eval` 复测。
+6. **至少 40 个回合**（`play.py` 默认 100）。
+7. 看产品权重在**没训练过的台阶高**上的表现（泛化）比看训练台阶更有信息量。

@@ -1,21 +1,19 @@
-"""Reusable, dependency-light helpers for the robot-dog RL project.
+"""可复用、依赖很轻的工具层。
 
-Everything in this subpackage is a *tool*: it knows nothing about PPO, the
-curriculum or the training loop, and none of it imports :mod:`robotdog.env`.
-The core environment / training modules live one level up in
-:mod:`robotdog`.
+这里的模块都是**工具**：不知道 PPO、课程或训练循环的存在，而且**都不 import**
+:mod:`robotdog.env`。核心的环境 / 训练模块在上一层 :mod:`robotdog` 里，依赖方向
+永远是 ``训练层 → 环境层 → 工具层``，不会成环。
 
-* :mod:`robotdog.tools.paths`   -- canonical filesystem locations
-* :mod:`robotdog.tools.console` -- the UTF-8 console fix
-* :mod:`robotdog.tools.png`     -- dependency-free PNG read/write
-* :mod:`robotdog.tools.terrain` -- parametric stair geometry + MJCF terrain
-* :mod:`robotdog.tools.touch`   -- contact forces and the forward rangefinder
+* :mod:`robotdog.tools.paths`   —— 规范文件系统位置
+* :mod:`robotdog.tools.console` —— 控制台 UTF-8 修复
+* :mod:`robotdog.tools.png`     —— 不依赖图像库的 PNG 读写
+* :mod:`robotdog.tools.terrain` —— 参数化楼梯几何 + MJCF 地形
 
-Design notes for each module are in ``docs/robotdog/tools/``.
+每个模块的设计说明在 ``docs/robotdog/tools/``。
 """
 
 from __future__ import annotations
 
-from robotdog.tools import console, paths, png, terrain, touch
+from robotdog.tools import console, paths, png, terrain
 
-__all__ = ["console", "paths", "png", "terrain", "touch"]
+__all__ = ["console", "paths", "png", "terrain"]

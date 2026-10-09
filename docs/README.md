@@ -1,29 +1,34 @@
 # `docs/` —— 模块设计文档
 
-本目录为 `robotdog/` 下的**每一个 `.py`** 提供一份设计文档，
-**目录结构与 `robotdog/` 一一对应**：`robotdog/` 下共 14 个 `.py`（8 个在顶层，
-6 个在 `tools/`），因此本目录共 14 份模块文档 + 本索引。
+本目录为 `robotdog/` 下的**每一个 `.py`** 提供一份设计文档，**目录结构与
+`robotdog/` 一一对应**：`robotdog/` 下共 11 个 `.py`（7 个在顶层，4 个在
+`tools/`），因此本目录共 11 份模块文档 + 本索引。
 
 ```
 docs/
   README.md                 本索引 + 文档规范（就是你正在读的这份）
   robotdog/
     __init__.md             包入口
-    env.md                  ★ 核心环境
+    env.md                  ★ 核心环境（盲走：无触觉、无测距）
     gait.md                 trot 步态先验
     go2_model.md            Go2 MJCF 组装与场景编译
+    policy.md               训练产物的加载与观测归一化
     training.md             PPO 组装 / 向量环境 / 运行目录
-    curriculum.md           课程与回调
-    evaluate.md             评估矩阵与导出
-    render.md               GIF 渲染
+    curriculum.md           六级课程（平地 + 3/6/9/12/15 cm）
     tools/
       __init__.md           工具子包入口
       console.md            UTF-8 控制台
       paths.md              路径常量
       png.md                无依赖 PNG 读写
       terrain.md            参数化楼梯几何
-      touch.md              接触力与前方测距
 ```
+
+入口脚本在 `scripts/` 下，不属于 `robotdog/` 包，因此没有对应文档；它们的用法
+写在仓根 `README.md` §4 与 `train.md`：
+
+* `scripts/train.py` —— 按课程训练，产物落进 `runs/<名字>/`。
+* `scripts/play.py` —— 评估现有权重：`--mode gif`（渲染 10 个回合合成 GIF）
+  或 `--mode eval`（跑 100 个回合统计成功率）。
 
 ## 分层规则
 
@@ -31,14 +36,10 @@ docs/
 | --- | --- | --- | --- |
 | 工具层 | `robotdog/tools/` | 只依赖标准库、numpy、mujoco，以及**同层**模块 | **不 import `robotdog.env`**，不知道 PPO / 课程 / 训练循环 |
 | 环境层 | `robotdog/env.py`、`go2_model.py`、`gait.py` | 工具层 | 一个 Gymnasium 环境及其模型装配 |
-| 训练层 | `robotdog/training.py`、`curriculum.py`、`evaluate.py`、`render.py` | 环境层 + 工具层 | PPO、课程、评估、渲染 |
+| 训练层 | `robotdog/training.py`、`curriculum.py`、`policy.py` | 环境层 + 工具层 | PPO 组装、课程调度、权重与归一化统计的加载 |
 
-依赖是**单向**的：`训练层 → 环境层 → 工具层`。`render.py` 因为要驱动环境而
-依赖 `env`，所以它留在 `robotdog/` 顶层而**没有**进 `tools/`（否则
-`tools ↔ env` 成环）。
-
-工具层的模块**只有一条导入路径**：`robotdog.tools.<name>`。仓里不存在同名的
-顶层兼容模块，所以
+依赖是**单向**的：`训练层 → 环境层 → 工具层`。按这个规则，工具层的模块只有
+一条导入路径 `robotdog.tools.<name>`，仓里不存在同名的顶层兼容模块：
 
 ```python
 from robotdog.tools.terrain import StairSpec
@@ -78,3 +79,9 @@ from robotdog.tools import paths
 改代码时同步改文档。文档里的 API 签名与默认值必须能在源码里 grep 到；
 如果某个符号在源码中已经不存在，文档里就必须删掉它，而不是保留「历史说明」。
 历史结论请写进 `experience.md`。
+
+## 本轮重构删掉了哪些文档
+
+`render.md`、`evaluate.md`、`tools/touch.md` 随源码一起删除：`robotdog/render.py`
+与 `robotdog/evaluate.py` 不再存在（GIF 能力内联进 `scripts/play.py`，评估就是
+`play.py --mode eval`），触觉/测距整套逻辑已删除（本仓的目标是**盲走楼梯**）。

@@ -1,13 +1,14 @@
-"""Robot-dog stair-climbing RL project (MuJoCo + Gymnasium + Stable-Baselines3).
+"""Go2 上下楼梯强化学习的最小核心包。
 
-Importing this package also repairs the console encoding, so Chinese log output
-survives Windows redirection (see :mod:`robotdog.tools.console`).
+导入本包会自动把控制台切成 UTF-8（见 :func:`robotdog.tools.console.setup_utf8_console`），
+否则 Windows 下打印中文 HUD / 报表会撞 ``UnicodeEncodeError``。
 """
 
+from __future__ import annotations
+
+from robotdog.tools import console, paths, png, terrain
 from robotdog.tools.console import setup_utf8_console
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-setup_utf8_console()
-
-__all__ = ["__version__", "setup_utf8_console"]
+__all__ = ["console", "paths", "png", "setup_utf8_console", "terrain"]

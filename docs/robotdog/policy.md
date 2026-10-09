@@ -1,0 +1,228 @@
+# `robotdog/policy.py` 设计文档
+
+## 1. 一句话定位
+
+**训练层**的「读回」模块：把一个已经训练完的产物（SB3 `.zip` 权重、配套的
+`*_vecnormalize.pkl`、`summary.json` 配置）还原成**能直接推理的策略 + 能直接建环境的
+配置**，并集中处理「配置怎么恢复 / 观测维度是多少 / 归一化统计怎么用」这三个陷阱。
+
+## 2. 职责边界
+
+**做**：
+
+* 定义推理侧的最小接口 `Policy`（只要 `predict(obs, deterministic=True)`）。
+* 把 `VecNormalize` 的观测统计拷成只读的 `ObsNorm`，并提供 `normalize()`。
+* 从 `summary.json` / `<模型>_env.json` / `.zip` 里保存的观测维度，三种途径恢复
+  `EnvConfig`。
+* 由台阶高度（cm）造一条 `StairSpec`。
+
+**不做**：
+
+* **不加载 PPO**。加载 PPO 需要先有一个环境，那是 `robotdog/training.py` 的
+  `load_ppo()` / `load_policy()` 的活；本模块只负责「环境怎么配」和「观测怎么归一化」。
+* **不训练、不评估、不渲染**。评估与 GIF 在 `scripts/play.py`。
+* **不碰奖励归一化**。`VecNormalize.ret_rms` 只在导出时有用，推理不需要。
+* **不写文件**。
+
+## 3. 关键设计决策与理由
+
+### 3.1 `ObsNorm` 是 `VecNormalize` 的一份**拷贝**，不是引用
+
+`pickle.loads("..._vecnormalize.pkl")` 得到的是一个 **`VecNormalize` 对象**，它有三个
+致命问题，全都实测踩过：
+
+| 问题 | 报错原文 |
+| --- | --- |
+| 不能当 dict 用 | `TypeError: 'VecNormalize' object is not subscriptable` |
+| **多访问一个不存在的属性就递归爆栈** | `RecursionError: maximum recursion depth exceeded`（`BaseVecEnv.__getattr__` → `getattr_depth_check` → `_get_all_attributes`） |
+| 不可调用 | `TypeError: 'VecNormalize' object is not callable` |
+
+所以 `from_path()` 把 `obs_rms.mean`、`obs_rms.var`、`epsilon`、`clip_obs` 四个值拷出来，
+然后 **`del raw`**（在 `finally` 里），此后整个仓只使用这份普通 dataclass。
+
+**被否决的方案**：直接持有 `VecNormalize` 引用并写一个受限的访问包装器。
+否决原因：递归问题来自 SB3 的 `__getattr__` 本身，任何 `getattr` 都可能触发它，
+包装器无法保证不踩到；拷贝是唯一没有隐藏路径的做法。
+
+### 3.2 观测维度的恢复有**三条**路径，优先级从精确到猜测
+
+```
+1. 同目录 summary.json            —— 精确（train.py 写下的完整配置）
+2. <模型名>_env.json              —— 精确（权重被单独搬走时用）
+3. 从 .zip 里保存的 obs 维度反推   —— 猜测（会打印一行提示）
+```
+
+**为什么必须有第 3 条**：`EnvConfig()` 默认 460 维，而开
+`--obs-base-height --obs-gait-phase` 训出来是 474 维。拿默认配置去加载会抛
+`ValueError: Observation spaces do not match`，而用户往往只从别处拷来一个 `.zip`。
+
+**为什么反推是安全的**：四个开关的维度互不互质（3 / 1 / 2 / 1），组合数只有 16 种，
+枚举一遍就能唯一确定；`base_lin_vel_body` 默认开，所以把它排在枚举顺序最前面，
+使最简配置优先命中。反推不出来时**主动报错**而不是静默用默认值：
+
+```
+模型观测维度 {dim} 无法用 EnvConfig 的观测块还原。请把模型放回它的 runs/<name>/ 目录
+（读 summary.json），或显式指定观测开关。
+```
+
+### 3.3 为什么 `observation_dim()` 不解包整个模型
+
+`zipfile` 只读 `data` 这一个条目：
+
+* SB3 ≥ 2.0：`data` 是 JSON，观测空间在 `observation_space[":serialized:"]` 里是一段
+  base64 pickle；
+* SB3 < 2.0：`data` 整个是 pickle。
+
+只读一个条目意味着**不需要 torch、不需要构造环境、几十毫秒返回**。这是一个探测函数，
+所以所有异常都吞掉并返回 `None`，由调用方决定怎么报错。
+
+### 3.4 `_TUPLE_FIELDS` 是必须的
+
+JSON 往返会把元组变成 list。`EnvConfig.kp` / `kd` 和 `GaitParams` 里的
+`gravity` / `friction` 在代码里是元组，不转回来的话下游 `for kp, kd in zip(...)` 之类
+的行为会变（更糟的是不报错、只是悄悄用错）。
+
+### 3.5 `stair_from_height()` 用 `flat_spec` 表示平地
+
+**不能用** `demo_stairs_spec(step_height=0.0, n_up=8)`：那会生成
+`size="0.250000 1.000000 0.000000"` 的 box，MuJoCo 直接抛
+`ValueError: Error: size 2 must be positive in geom`。平地必须走
+`flat_spec(n_up=0, n_down=0, ...)`（见 `experience.md` §1.3）。
+
+## 4. 公开 API
+
+```python
+class Policy(Protocol):
+    def predict(self, obs: np.ndarray, deterministic: bool = True) -> np.ndarray: ...
+
+@dataclass
+class ObsNorm:
+    mean: np.ndarray
+    var: np.ndarray
+    epsilon: float = 1e-8
+    clip: float = 10.0
+
+    def normalize(self, obs: np.ndarray) -> np.ndarray: ...      # float32
+    @classmethod
+    def from_path(cls, path: str | Path) -> ObsNorm: ...
+
+def env_config_from_summary(summary_path: str | Path) -> EnvConfig: ...
+def observation_dim(model_path: str | Path) -> int | None: ...
+def env_config_for_model(model_path: str | Path) -> EnvConfig: ...
+def stair_from_height(height_cm: float | None, *, tread: float = 0.50,
+                      n_up: int = 8) -> StairSpec | None: ...
+
+__all__ = ["ObsNorm", "Policy", "env_config_for_model", "env_config_from_summary",
+           "observation_dim", "stair_from_height"]
+```
+
+语义与异常：
+
+* `ObsNorm.normalize(obs)` — `clip((x - mean) / sqrt(var + epsilon), ±clip)`，返回
+  `float32`。与 SB3 的 `VecNormalize` 逐位一致（同一公式、同一 `epsilon`、同一 `clip`）。
+* `ObsNorm.from_path(path)` — 读**裸 pickle**。文件不存在时由 `open()` 抛
+  `FileNotFoundError`；文件不是 `VecNormalize` 时 `raw.obs_rms` 抛 `AttributeError`。
+* `env_config_from_summary(path)` — 读 `env_config` / `obs_config` / `reward_config`
+  三段；未知键被忽略（`_rebuild` 只保留 dataclass 有的字段），所以旧 `summary.json`
+  里的废弃字段不会让它崩。`gait` 段用 `GaitParams.from_dict` 重建。
+* `observation_dim(model_path)` — **从不抛异常**，任何问题都返回 `None`。
+* `env_config_for_model(model_path)` — 三条路径都失败时抛 `SystemExit`（带中文提示）。
+* `stair_from_height(height_cm, *, tread, n_up)` — `None` → `None`（沿用配置里的地形）；
+  `<= 0` → `flat_spec(n_up=0, n_down=0, step_height=0.0, tread=tread)`；否则
+  `demo_stairs_spec(step_height=height_cm/100, tread=tread, n_up=n_up, top_landing=1.20)`。
+
+## 5. 内部结构与数据流
+
+```
+play.py
+  resolve_target(run)
+      _resolve_model(run)            → 找到 .zip
+      _resolve_norm(.zip)            → 找到同名 *_vecnormalize.pkl
+      env_config_for_model(.zip) ──┐
+                                   │
+env_config_for_model ──┬── summary.json 存在 → env_config_from_summary()
+                       ├── <stem>_env.json 存在 → env_config_from_summary()
+                       └── observation_dim() → _obs_config_for_dim() → EnvConfig(obs=…)
+
+training.load_policy(model_path, cfg, stair)
+      → 建 1 环境 DummyVecEnv（cfg 来自上面那条链）
+      → PPO.load / set_parameters
+      → ObsNorm.from_path(norm_path)      # 读裸 pickle 后立刻 del
+      → (PPO, ObsNorm | None)
+
+play.Runner.predict(obs)
+      → ObsNorm.normalize(obs) → PPO.predict(x, deterministic=True)
+```
+
+## 6. 关键常量与默认值
+
+| 名称 | 值 | 说明 |
+| --- | --- | --- |
+| `ObsNorm.epsilon` | `1e-8` | 与 SB3 `VecNormalize` 的默认一致 |
+| `ObsNorm.clip` | `10.0` | 来自 `VecNormalize.clip_obs`，训练时就是 10.0 |
+| `_TUPLE_FIELDS` | `frozenset({"kp", "kd", "gravity", "friction"})` | JSON 往返后要转回元组的字段 |
+| `_obs_config_for_dim` 的 `history_len` | `10` | 观测块枚举时的固定历史长度 |
+| `_obs_config_for_dim` 的枚举顺序 | `("base_lin_vel_body", "base_height", "gait_phase", "step_height")` | `product((False, True), repeat=4)`；`base_lin_vel_body` 默认开 ⇒ 最简配置先命中 |
+| `stair_from_height` 的 `tread` / `n_up` | `0.50` / `8` | 与课程一致 |
+| `stair_from_height` 的 `top_landing` | 硬编码 `1.20` | 与 `demo_stairs_spec` 的课程默认一致 |
+| `EnvConfig()` 默认观测 | `frame_size=46`、`size=460` | 反推失败时的兜底值 |
+
+## 7. 与其它模块的关系
+
+```
+                 robotdog/tools/terrain.py  (StairSpec / flat_spec / demo_stairs_spec)
+                              ▲
+robotdog/env.py (EnvConfig/ObsConfig/RewardConfig) ──►  robotdog/policy.py
+                              ▲                              ▲
+                     robotdog/training.py ──────────────────┘   (load_policy / load_ppo)
+                              ▲
+                        scripts/play.py
+```
+
+* **向下**依赖 `env`（三个 dataclass）与 `tools/terrain`（几何）。它是训练层里唯一
+  只读 `env` 的**配置类**、而完全不需要实例化环境的模块 —— 这是刻意的：`.zip` 的
+  观测维度探测必须在**没有环境**的情况下也能跑。
+* **向上**被 `training.load_policy()` 与 `scripts/play.py` 使用。
+* **为什么 `env_config_from_model` 住在这里而不是 `training.py`**：`training.py` 要
+  import `stable_baselines3`（重），而「读 `summary.json`」不需要 SB3。分开之后，
+  只想读配置的调用方不必拖进 torch。
+
+## 8. 实测与经验教训
+
+* `experience.md` §5.4 —— `pickle.loads(vecnormalize.pkl)` 的三个坑（subscriptable /
+  递归 / 不可调用），`ObsNorm` 就是这三条的直接产物。
+* `experience.md` §5.3 —— 打开观测归一化却没跟上权重 ⇒ 5 cm 上成功率从 100% 掉到 0%。
+* `experience.md` §1.3 —— 零高度台阶无法编译，所以平地走 `flat_spec`。
+* `README.md` §3.2 —— 观测块的维度表（42 基础块 + 3/1/2/1 四个开关）。
+* `README.md` §4.1 —— `*_vecnormalize.pkl` 必须与 `.zip` 成对。
+
+## 9. 已知限制与坑
+
+* **`env_config_for_model()` 的第 3 条路径是启发式的**。若将来观测块出现维度相同的
+  不同组合（例如再加一个 1 维开关），反推结果可能不是训练时用的那个；此时应当把
+  权重放回它的 `runs/<名字>/` 目录（有 `summary.json`）。
+* `observation_dim()` 只读 `data` 条目。SB3 改掉这个内部布局就会返回 `None`（静默）。
+* `_config_from_env_json()` **只有 `training.py` 会写 `<stem>_env.json` 时才有用**；
+  当前 `train.py` 不写这个文件，所以这条路径实际是空的，保留是为了兼容搬动过的权重。
+* `stair_from_height()` 的 `top_landing=1.20` 是硬编码的，不接受参数；要别的平台长度
+  就直接用 `tools.terrain` 的函数。
+* `Policy` 是 `Protocol`，**不提供任何实现**；实现分别在 `training.load_policy()`
+  （PPO）与 `scripts/play.py` 的 `Runner`（PPO + 归一化）里。
+
+## 10. 示例用法
+
+```python
+from robotdog.policy import ObsNorm, env_config_for_model, stair_from_height
+
+# 恢复训练时的配置（优先 summary.json，其次按观测维度反推）
+cfg = env_config_for_model("runs/walk1/model_final.zip")
+print(cfg.obs.frame_size, cfg.obs.size)          # 46 460
+
+# 归一化统计
+norm = ObsNorm.from_path("runs/walk1/model_final_vecnormalize.pkl")
+z = norm.normalize(obs)                          # float32，已 clip
+
+# 造一条 9 cm 的楼梯 / 一条平地
+stair = stair_from_height(9.0)
+flat = stair_from_height(0.0)
+```

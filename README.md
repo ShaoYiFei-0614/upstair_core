@@ -1,21 +1,36 @@
-# Go2 上下楼梯强化学习 · 最小核心仓
+# Go2 盲走楼梯 · 最小强化学习仓
 
-在一段 8 级、踏面 50 cm 的楼梯上（`start_x = 1.50`，顶层平台 0.88 m）训练一只
-Unitree Go2 上下楼梯。**动作空间是「trot 步态先验 + PPO 残差」，不是从零学步态**：
-策略只需要学「怎么改」先验，不需要学怎么抬腿。
+在一段 **8 级、踏面 50 cm** 的楼梯上训练 Unitree Go2 上下楼梯。
+
+两个刻意的设定：
+
+* **盲走（blind）**。整套代码里**没有任何触觉传感器、射线测距或接触力读取**。
+  机器人只能看本体感觉（关节角/角速度、机身姿态与角速度、上一帧动作、机身线速度）
+  加上一个**台阶高度标量**，靠自己撞出来怎么上台阶。
+* **残差 RL**。动作不是从零学的关节目标角，而是「trot 开环先验 + PPO 残差」：
+
+  ```
+  target = home + gait_gain * gait.radians(t) + action_scale * action
+  ```
+
+  策略只学「怎么改」先验，不学怎么抬腿。
+
+课程固定六级：**平地 → 3 cm → 6 cm → 9 cm → 12 cm → 15 cm**，每级在上一级的权重上
+继续练。入口脚本只有两个：`scripts/train.py`（训练）与 `scripts/play.py`（评估 /
+渲染 GIF）。
 
 本文件只讲**环境配置**与**具体代码实现**。配套两份：
 
 * [`experience.md`](experience.md) —— 踩过的坑、错过的判据、以及为什么默认值是现在这个值。
 * [`train.md`](train.md) —— 训练过程、实测复现结论、能力边界。
+* [`docs/`](docs/README.md) —— `robotdog/` 下**每个 `.py`** 的设计文档（目录一一对应）。
 
 ---
 
 ## 1. 环境
 
 * **Python 3.10+**（实测 3.13.0）
-* **CPU 就够**。8 个环境串行（`DummyVecEnv`，单进程）实测约 **250~420 向量步/秒**，
-  视并行负载而定
+* **CPU 就够**。8 个环境串行（`DummyVecEnv`，单进程）实测约 **320~400 向量步/秒**
 * Windows 10/11 实测；代码里没有平台相关分支
 
 ```bat
@@ -25,10 +40,8 @@ python -m venv .venv
     --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-`torch==2.14.1+cpu` 的 `+cpu` 后缀来自 PyTorch 官方 CPU 源，所以命令里**必须**带
-`--extra-index-url https://download.pytorch.org/whl/cpu`（清华/清华镜像是主源）。
-
-依赖（`requirements.txt`，版本就是训练时用的版本）：
+`torch` 的 `+cpu` 后缀来自 PyTorch 官方 CPU 源，所以命令里**必须**带
+`--extra-index-url https://download.pytorch.org/whl/cpu`（清华镜像是主源）。
 
 | 包 | 版本 | 必需 |
 | --- | --- | --- |
@@ -38,60 +51,49 @@ python -m venv .venv
 | torch | 2.14.1+cpu | ✔ |
 | numpy | 2.2.4 | ✔ |
 | tensorboard | 2.21.0 | ✔ |
-| onnx / onnxruntime | 1.23.1 / 1.30.0 | 导出用 |
-| pillow | 10.4.0 | 渲染用 |
-| matplotlib | 3.9.2 | 画图用 |
+| pillow | 10.4.0 | 只有 `play.py --mode gif` 需要 |
 
-`models\unitree_go2\`（MJCF + obj 网格）和 `artifacts\trot_stairs.json`（trot 步态
-先验，11 KB，**唯一不可重建的 artifact**）已经在仓里；想重新拉一份 Go2 模型跑
-`scripts\download_go2.py`。
+### 1.1 两个环境侧的坑（装依赖时会撞上）
 
-> 沙箱注意：`python -m venv .venv` 可能因 `ensurepip` 失败而报
-> `No module named pip`，退路是 `--without-pip` 再喂 `get-pip.py`；且 pip 会往
-> 临时目录写，受限沙箱下需要放宽权限。详见 `experience.md` §5.8。
+* **`python -m venv .venv` 可能直接失败**（`ensurepip` 返回非零 ⇒ `No module named pip`）。
+  退路：`python -m venv .venv --without-pip`，再用 `get-pip.py` 补 pip。
+* **沙箱/受限环境下 curl 与 `Invoke-WebRequest` 的 HTTPS 可能被 TLS 层挡住**
+  （`SEC_E_NO_CREDENTIALS` / `接收时发生错误`，http_code 000），但 **Python 的
+  `urllib` 正常**。要下载东西时用 Python，不要用 curl。
+* 约束模式下 pip 需要写系统临时目录，可能被拒绝（`PermissionError: [Errno 13]`）。
 
 ---
 
 ## 2. 目录
 
 ```
-robotdog\
-    env.py         Gymnasium 环境（观测/奖励/终止/域随机化）★核心
-    curriculum.py  课程（平地 → 3~8 → 8~11 cm，含混合高度）
-    training.py    PPO 组装 / 运行目录 / VecNormalize / 断点续训
-    evaluate.py    评估矩阵 + ONNX / TorchScript 导出
-    render.py      渲染与 GIF 写出（GIF 用 Pillow；PNG 帧走 tools\png.py 的纯 zlib 路径）
-    go2_model.py   组装 Go2 MJCF（字符串手术 + 场景编译）
-    gait.py        trot 步态先验（GaitParams）
-    tools\         工具层：不 import robotdog.env、不知道 PPO/课程
-        paths.py       所有路径常量（工作区 = 本仓根目录）
-        terrain.py     楼梯地形（解析式高度场 height_at(x) + MuJoCo 几何体）
-        touch.py       触觉/前视探测（足底法向力、滑移、立面擦碰、前方射线扇）
-        png.py         PNG 写出（zlib，无第三方依赖）
-        console.py     UTF-8 控制台
-scripts\
-    train.py               训练入口（所有开关都在这里）
-    eval.py                评估 / 导出入口
-    render_checkpoint.py   渲染 GIF
-    download_go2.py        （可选）重新下载 Go2 MJCF
-tools\
-    ab_pair.py   6 档高度 × 40 回合的配对普查（验收用）
-    ab_merge.py  合并多份普查缓存并出表
-models\unitree_go2\          Go2 MJCF + 网格
-artifacts\trot_stairs.json   trot 先验
-docs\robotdog\              每个模块的设计文档（目录与本目录对应）
+upstair_core/
+  README.md  experience.md  train.md     三份根文档
+  requirements.txt
+  artifacts/
+    trot_stairs.json                     trot 开环先验（唯一不可重建的 artifact）
+  models/unitree_go2/                    vendored Go2 MJCF + 网格 + scene.xml
+  robotdog/                              库代码（分层见 docs/README.md）
+    __init__.py      包入口，导入即修 UTF-8 控制台
+    env.py           ★ Go2StairsEnv：观测 / 奖励 / 终止 / 成功判据
+    gait.py          开环 trot 先验的参数化与 (de)serialize
+    go2_model.py     Go2 MJCF 组装 + 场景编译 + 元信息提取
+    policy.py        训练产物的加载：配置 / 观测维度 / 归一化统计
+    training.py      PPO 组装、向量环境、运行目录
+    curriculum.py    六级课程与阶段回调
+    tools/           工具层（不 import env）
+      console.py     UTF-8 控制台
+      paths.py       路径常量
+      png.py         纯 zlib 的 PNG 读写（不依赖 Pillow）
+      terrain.py     参数化楼梯几何（StairSpec / XML / 高度查询）
+  scripts/
+    train.py         训练入口（调 curriculum）
+    play.py          评估入口（gif / eval 两种模式）
+    download_go2.py  重新下载 vendored Go2 模型
+  docs/              每个 .py 的设计文档
+  runs/<名字>/       训练产物
+  output/gifs/       play.py 渲染出来的 GIF
 ```
-
-训练/评估产物都落在本仓根目录下（`runs\`、`logs\`、`output\gifs\`），目录由
-`robotdog\tools\paths.py` 自己建。`robotdog\__init__.py` **只**导出
-`setup_utf8_console`，脚本要显式 `from robotdog.env import ...`。
-
-**分层规则**：`robotdog\tools\` 里的模块**都不 import `robotdog.env`**，所以
-`env → tools` 是单向的；`render.py` 因为要驱动环境而依赖 `env`，因此留在
-`robotdog\` 顶层而不是进 `tools\`（否则 tools↔env 成环）。工具层只有一条导入
-路径 `robotdog.tools.<name>`（没有同名的顶层兼容模块），所以写
-`from robotdog.tools.terrain import StairSpec` 或 `from robotdog.tools import paths`。
-每个模块的设计细节见 `docs\robotdog\` 下对应文件。
 
 ---
 
@@ -99,155 +101,189 @@ docs\robotdog\              每个模块的设计文档（目录与本目录对�
 
 ### 3.1 时间与动作管线
 
-| 量 | 值 |
-| --- | --- |
-| 物理步长 `timestep` | 0.002 s（500 Hz） |
-| `decimation` | 10 |
-| 控制频率 | 50 Hz（`control_dt = timestep × decimation`） |
-| PD 增益 | `kp = (30, 30, 45)`、`kd = (0.6, 0.6, 0.9)` |
+| 量 | 值 | 说明 |
+| --- | --- | --- |
+| 物理步长 `timestep` | 0.002 s | MuJoCo 积分步（500 Hz） |
+| 抽控 `decimation` | 10 | 每个控制步做 10 次 `mj_step` |
+| 控制频率 | **50 Hz** | `control_dt = timestep * decimation = 0.02 s` |
+| `episode_length_s` | 20.0 s | 1000 个控制步 |
+| 动作维度 | 12 | 每条腿 `hip / thigh / calf`，顺序 `FL, FR, RL, RR` |
+| `action_mode` | `"residual"` | 先验 + 残差 |
+| `action_scale` | 0.30 rad | 残差的权限；先验走 `GaitParams.action_scale`，**两者独立** |
+| 增益 `kp` / 阻尼 `kd` | `[30, 30, 45]` / `[0.6, 0.6, 0.9]` | 关节 PD，力矩 `tau = kp*(target-q) - kd*qd` 后按 `ctrlrange` 截断 |
 
-动作是 12 个关节目标角，`action_mode="residual"` 时：
+`residual` 模式的目标角：
 
+```python
+target = home + gait_gain * gait.radians(phase) + action_scale * action
+target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 ```
-target = home_angles + gait_gain × gait.radians(phase) + action_scale × action
-```
 
-`action_scale=0.30` 是**策略**的权限，`gait.action_scale` 是**先验**的幅度，两者
-刻意分开：共用一个 scale 会让策略的探索噪声随先验放大（实测 2 s 内就摔）。  
-先验与目标都先 `clip` 到 `[act_low, act_high]`（来自 MJCF 的关节限位）。
-`_apply_latency` 每控制步只抽一次延迟，缓冲用第一条命令 priming，**不能用 zeros**。
+`absolute` 模式忽略先验：`target = lo + (a + 1) * 0.5 * (hi - lo)`。
 
 ### 3.2 观测 `ObsConfig`
 
-`obs.size = frame_size × history_len`，默认 `history_len = 10`。一帧的固定 42 维：
+**每帧 42 维固定块 + 按开关追加的块**，再沿时间堆叠 `history_len = 10` 帧：
 
-```
-关节角(12) + 关节角速度(12) + 机身 rpy(3) + 机身角速度(3) + 上一帧动作(12)
-```
+| 块 | 维度 | 默认 | 内容 |
+| --- | --- | --- | --- |
+| 基础块 | 12 + 12 + 3 + 3 + 12 = **42** | 恒开 | 关节角、关节角速度、机身 roll/pitch/yaw、机身角速度（本地系）、上一帧动作 |
+| `base_lin_vel_body` | 3 | **开** | 机身系线速度 |
+| `base_height` | 1 | 关 | 机身相对其正下方地形的高度 |
+| `gait_phase` | 2 | 关 | 步态时钟的 `sin/cos`（残差策略需要知道自己处在周期哪一点） |
+| `step_height` | 1 | **开** | 本回合的台阶高度（m）—— 唯一直接告诉策略「在哪条楼梯上」的量 |
 
-可选块按开关追加，**全部默认关闭**：
+默认 `frame_size = 42 + 3 + 1 = 46` ⇒ **观测 460 维**。开 `gait_phase` 得 480 维。
 
-| 开关 | 维度 | 含义 |
-| --- | --- | --- |
-| `base_lin_vel` | 3 | 世界系线速度（不推荐，yaw 一转含义就变） |
-| `base_lin_vel_body` | 3 | **机身系**线速度 |
-| `base_height` | 1 | 机身高度（参照面见 `base_height_support`） |
-| `base_height_support` | +0 | 只换参照面：改用四足足下最低地形，不改变维度 |
-| `foot_height` | 4 | 每足离地间隙 |
-| `gait_phase` | 2 | sin/cos 步态时钟（有先验时应有） |
-| `touch` | 9 | 4 足底法向力 + 4 滑移比 + 1 蹭立面标志 |
-| `stair_probe` | 3 | 前方障碍高度 / 距离 / 是否命中 |
-| `stair_probe_full` | +2 | 追加 `probe_slope`、`probe_far_step` |
-| `drift` | 2 | 横向偏移（对楼梯中线）+ 航向误差（对楼梯轴） |
+帧约定（与 MuJoCo 一致）：`qpos[0:3]` 世界位置、`qpos[3:7]` 四元数 `(w,x,y,z)`、
+`qvel[0:3]` 世界线速度、**`qvel[3:6]` 是机身本地角速度**（IMU 陀螺直接就是这个）。
 
-常用维度：默认 **420**（42×10）；课程配方（`base_lin_vel_body + base_height +
-foot_height + gait_phase + touch + stair_probe + drift`）⇒ 每帧 66、共 **660**。
-
-帧约定：`qpos[0:3]` 世界位置、`qpos[3:7]` 四元数 `(w,x,y,z)`、`qvel[0:3]` 世界
-线速度、**`qvel[3:6]` 本地（机身）角速度** —— IMU 陀螺直接就是后者。
+**刻意不给**的量：足端离地高度、机身高度（默认）、任何测距/接触读数。
+`step_height` 是标量，它告诉策略「这条楼梯多高」，**但不告诉它下一个立面在哪**。
 
 ### 3.3 奖励 `RewardConfig`
 
-用户原始要求的五项标 `[SPEC]`：
-
 | 项 | 默认 | 口径 |
 | --- | --- | --- |
-| `forward_vel` | 2.5 | `exp(-(vx - command_vx)² / σ²)`，`σ = 0.22` |
+| `forward_vel` | +2.5 | `exp(-((vx - command_vx)/0.25)^2)`，`command_vx = 0.55 m/s` |
+| `forward_progress` | +1.5 | `clip(vx, -0.5, 1.5)` 线性项 —— vx=0 时恰为 0，堵住「站着不动」的局部最优 |
 | `orientation` | -1.2 | `roll² + pitch²` |
-| `torque` | -2.0e-4 | `Σ τ²`（`data.actuator_force`） |
-| `foot_lift` | 0.6 | 见下 |
-| `body_collision` | -4.0 | 躯干碰地形 |
+| `torque` | -1.5e-4 | `Σ tau²` |
+| `foot_lift` | +0.9 | 三维足端速度门控 × `clip(离地/目标, 0, 1)`，目标 `= max(0.08, 1.4 × 台阶高)` |
+| `air_time` | +0.6 | 落地那一步结算：`clip(滞空 - 0.30, 0, ...)`，超过 0.60 s 反罚 |
+| `base_height` | -2.0 | 机身高度偏离其正下方地形（**只用于奖励**，与观测开关无关） |
+| `joint_vel` | -2.0e-5 | `Σ qd²` |
+| `action_rate` | -0.02 | `Σ (a - a_prev)²` |
+| `joint_limit` | -0.5 | 关节越限程度 |
+| `leg_collision` | -0.25 | 小腿/大腿碰地，逐帧 |
+| `body_collision` | -4.0 | 躯干碰地，逐帧 |
+| `alive` | +0.15 | 每步存活（**故意小**：0.4 时占「站桩」回合回报的 49%） |
+| `stair_progress` | +3.0 | `max(0, 参考面高度 - 起始高度)`，参考面取躯干正下方地形 |
+| `success` | **+50.0** | 一次性，到达顶端平台 |
+| `termination` | **-15.0** | 一次性，摔倒/终止 |
 
-补齐与 shaping：
+两个关键点：
 
-| 项 | 默认 | 口径 |
+* 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
+  （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
+  拆解可以安全地相加。
+* **成功/终止的权重被刻意放大**（50 / -15，原值 20 / -2）。这是实测能让 PPO 残差
+  幅度增长的最强杠杆。
+
+### 3.4 终止与成功
+
+| 开关 | 默认 | 语义 |
 | --- | --- | --- |
-| `forward_progress` | 1.0 | 线性 `clip(vx, -0.5, 1.5)`，`vx=0` 时恰为 0 |
-| `air_time` | 0.6 | 落地那一步按滞空时长结算（`target=0.30`、`max=0.60`） |
-| `lateral_vel` / `yaw_rate` | -0.8 / -0.15 | `vy²` / `(wz - cmd)²` |
-| `base_height` | -3.0 | **仍用单点参照面**（故意不跟着观测改） |
-| `joint_vel` / `action_rate` / `joint_limit` | -2e-5 / -0.02 / -0.5 | |
-| `alive` / `termination` / `success` | 0.12 / -2.0 / 20.0 | 终局项记在 `terms["terminal"]` |
-| `stair_progress` | 2.5 | 爬升进度；`foot_ref` / `min_loaded_feet` 见下 |
-| `foothold` | 0.0 | 四足足下最低地形相对上一步的**增量** / 台阶高 |
-| `riser_graze` | -0.60 | 蹭立面；`mode` / `probe_gate` 见下 |
-| `touch_impact` | -0.50 | 落地法向力超 `target=95 N` 的平方超量 |
-| `touch_slip` | -0.35 | 只对承重脚（`force > 10 N`） |
-| `stair_probe_lift` | 1.20 | 测距看到台阶 **且**前两足已抬起 |
-| `leg_collision` | -0.25 | 腿 geom 碰地形（**不是**终局） |
-| `straight_line` | -20.0 | `clip(横向偏移, ±1.0)²` |
-| `heading` | -8.0 | `clip(航向误差, ±0.60)²` |
-| `lateral_vel_track` | 0.5 | `exp(-(vy - cmd_vy)² / 0.15²)` |
+| `terminate_contact_steps` | 10 | 躯干持续接触 10 个控制步（0.2 s）才算摔倒 —— 去抖，避免单帧擦碰就判死 |
+| `terminate_height_ref` | `"support"` | 摔倒的高度参照面：`"support"` = 四足足下地形最低点；另有 `"base"`（躯干正下方）与 `"support_mean"` |
+| `terminate_min_height` | 0.13 m | 低于参照面这么多就判摔 |
+| `terminate_max_tilt` | 1.0 rad | `|roll|` 或 `|pitch|` 超过就判摔 |
+| `terminate_on_success` | True | 到达顶端即终止回合 |
 
-`_compute_reward` 返回 `(sum(terms), terms)`，**账目恒等**
-（`sum(reward_terms) == reward`，终局步也成立）。
+成功判据：躯干 x 越过 `stair.up_end_x` **且** 机身高度 ≥ 顶端高度。达成后
+`_reached_top` 是 sticky 的，回合以 `is_success=True` 结束。
 
-抬升目标：`target = max(foot_lift_target, foot_lift_step_ratio × h)`，连续项按
-`clip(foot_clearance / target, 0, 1)` 给分。`foot_lift_step_ratio = 1.4` 是针对
-**正下方参照面**标定的（鞋底必须抬过头高才能跨过去）；5 cm 时
-`max(0.08, 0.07) = 0.08`，与最初的常数目标逐位相同，所以已经学会的 easy 档不会退化。
-这个参照面在台阶处是阶跃的，由此引出的问题与「为什么没换成落脚面口径」见
-`experience.md` §6.1 与 `train.md` §3.6。
+`info["reward_terms"]` 之外的 `info` 字段：`trunk_contact`、`leg_contact`、
+`terminate_contact_steps`、`trunk_contact_streak`、`base_x/y/z`、`terrain_height`、
+`forward_vel`、`roll`、`pitch`、`crest_height`、`reach_top_x`、`reached_top`、
+`is_success`、`fallen`、`gait_prior`。
 
-### 3.4 终止 `EnvConfig`
+### 3.5 地形
 
-| 开关 | 默认 | 说明 |
-| --- | --- | --- |
-| `terminate_contact` | `"trunk"` | `any` / `trunk` / `none` |
-| `terminate_contact_steps` | 1 | 需**连续** N 个控制步才判死 |
-| `contact_debounce_adaptive` | False | 高台阶上收紧到 `contact_debounce_hi_steps` |
-| `terminate_height_ref` | `"base"` | `base` / `support_mean` / `support_load` / `support` |
-| `terminate_min_height` | 0.13 | 低于此判摔 |
-| `terminate_max_tilt` | 1.0 rad | 倾角超过此判摔 |
-| `terminate_body_contact` | True | 关掉则任何接触都不致命 |
-| `trunk_contact_adaptive` | False | 高台阶上躯干接触**不致命**（仍照常扣分） |
+`robotdog/tools/terrain.py` 的 `StairSpec` 描述一段楼梯：`step_height`、`tread`、
+`width`、`n_up`、`n_down`、`start_x`、`landing`、`top_landing`、`center_y`。
+课程里固定 `tread = 0.50`、`n_up = 8`、`width = 2.0`、`start_x = 1.50`、
+`top_landing = 1.20`。
 
-摔倒检测（`_terminated`）：`height < terminate_min_height` 或
-`max(|roll|, |pitch|) > terminate_max_tilt`。参照面由
-`_fall_reference_height()` 决定，**默认是机身 x 处的单点高度**（阶跃，会幽灵摔倒），
-配方里统一用 `terminate_height_ref=support`。
+三个必须知道的细节：
 
-### 3.5 其它环境侧要点
-
-* `_success_reached()`：楼梯上要求 `base_x > up_end_x` **且**
-  `terrain_height_under_base >= crest_height`；平地上用 `flat_success_distance`。
-  成功是 **sticky** 的（`_reached_top`）。
-* `reset()`：x 从 `start_x - spawn_back(0.55)` 起、带 `reset_xy_noise=0.12`；
-  z = 地形高 + `reset_z(0.32)`；yaw 带 `reset_yaw_noise=0.10`；关节加
-  `reset_joint_noise=0.06`；`qvel = U(-0.05, 0.05)`。
-* `_apply_domain_randomization()`：摩擦 / 质量 / 惯量 / 观测延迟 / IMU 偏置，
-  全部由 `randomize_scale` 统一收缩，默认**全关**。
-* `render()` 内部**强制打开 6 个 geomgroup**，否则 group 3/4/5 默认隐藏、楼梯在
-  GIF 里会消失。
-* 课程切换地形靠 `set_stair()`；先验靠 `set_gait_prior(enable, gait)` —— 注意它只设
-  `cfg.gait_prior`，构造时若漏设同一个字段，先验会完全不加（见 `experience.md` §5.1
-  的同类陷阱）。
+* **踏面不能改**。实测 0.40 / 0.60 会让 34% 掉到 10%，0.65 直接 0%。
+* 地形几何用 `group = 1`。Go2 的 MJCF 占了 group 2/3，而 MuJoCo 默认隐藏
+  3/4/5 —— 用别的组会看到「狗在爬空气」。
+* 顶层平台向最后一级**回伸一个踏面**（`CREST_SEAM_OVERLAP`）：两个共面 box 的接缝
+  会在 z 向没有支撑，把脚夹死。
 
 ---
 
-## 4. 常用命令
+## 4. 用法
+
+### 4.1 训练
 
 ```bat
-rem 从零训练（完整配方见 train.md）
-.venv\Scripts\python.exe scripts\train.py --help
-
-rem 冒烟：4 个阶段各压到 512 步，约 1 分钟
-.venv\Scripts\python.exe scripts\train.py --smoke --run-name smoke --n-envs 2
-
-rem 评估（trained = 训练时见过的 4 个地形；unseen = 9 个没见过的）
-.venv\Scripts\python.exe scripts\eval.py --run <run> --model runs\<run>\model_final.zip --only trained --episodes 40
-
-rem 导出 ONNX + TorchScript（归一化已烘焙进计算图）
-.venv\Scripts\python.exe scripts\eval.py --run <run> --model runs\<run>\model_final.zip --only trained --episodes 6 --export --export-dir runs\<run>\export --export-name policy
-
-rem 渲染 GIF
-.venv\Scripts\python.exe scripts\render_checkpoint.py --run <run> --checkpoint runs\<run>\model_final.zip --step-height-cm 10.5 --n-up 8 --episodes 4 --name-tag demo --no-strip --no-report
-
-rem 验收：6 档 × 40 回合配对普查
-.venv\Scripts\python.exe tools\ab_pair.py "label=runs/<run>/model_final.zip=runs/<run>" --episodes 40
+.venv\Scripts\python.exe scripts\train.py --run-name walk1
 ```
 
-`--model` 指到哪个 zip，就自动配同目录的 `<同名>_vecnormalize.pkl`。
-**观测归一化必须跟着权重走**，手工加载时别只加载 zip。
-`scripts\eval.py` 会从 `--run` 目录的 `summary.json` 恢复训练时的 `EnvConfig`，
-所以评估参考 checkpoint 时观测维度自动正确。
+按 `default_curriculum()` 的六级串行训练，每级在上一级的权重上 warm-start。
+默认预算合计 **1,350,000 步**（平地 100k + 5 × 250k），8 环境单进程约 320~400 步/s。
+
+常用开关（完整清单见 `scripts/train.py --help`）：
+
+| 开关 | 默认 | 说明 |
+| --- | --- | --- |
+| `--run-name` | `course1` | 产物目录 `runs/<名字>/` |
+| `--total-timesteps` | 按每级预算 | 所有阶段的总步数上限 |
+| `--from-stage` | 无 | 从课程某一级开始 |
+| `--resume` | 无 | 从某个 `.zip` 继续 |
+| `--n-envs` / `--seed` / `--device` | 8 / 0 / cpu | |
+| `--net-arch` | `512 256` | |
+| `--n-steps` / `--batch-size` / `--n-epochs` | 256 / 512 / 5 | PPO 更新粒度 = 256 × 8 = 2048 步 |
+| `--target-kl` / `--log-std-init` | 0.03 / -2.0 | |
+| `--norm-reward` | **开** | 奖励归一化 |
+| `--gait-prior` / `--gait-file` | 开 / `artifacts/trot_stairs.json` | 步态先验 |
+| `--obs-base-lin-vel-body` | 开 | |
+| `--obs-step-height` | 开 | |
+| `--obs-base-height` / `--obs-gait-phase` | 关 | |
+
+产物（`runs/<名字>/`）：
+
+```
+checkpoints/<阶段>_final.zip         每级结束的权重
+checkpoints/<阶段>/<阶段>_<步数>_steps.zip
+model_final.zip + model_final_vecnormalize.pkl    最后一级的交付权重
+summary.json                          课程定义 + 每级结果 + 完整 env/obs/reward 配置
+tensorboard/
+```
+
+⚠ **观测归一化必须跟权重成对使用**：`model_final.zip` 要配
+`model_final_vecnormalize.pkl`。`play.py` 会自动找同名的那个文件，找不到时会打印警告
+（缺了它确定性评估会从 100% 掉到 0%）。
+
+### 4.2 评估：跑 100 个回合看成功率
+
+```bat
+.venv\Scripts\python.exe scripts\play.py --run walk1 --mode eval --episodes 100
+```
+
+`--run` 可以给运行名（查 `runs/<名字>/`）、目录或直接的 `.zip` 路径。默认在
+**5 cm** 楼梯上评估，用 `--stage-height-cm 9` 或 `--stage stair9` 换高度/换课程级。
+结束时打印成功率、摔倒率、超时率、平均前进/爬升/速度/步数；加 `--report out.json`
+写 JSON 报告。
+
+⚠ **至少跑 40 个回合**。10 个回合能给出 ±15 个百分点的错觉。
+
+### 4.3 评估：渲染 GIF
+
+```bat
+.venv\Scripts\python.exe scripts\play.py --run walk1 --mode gif --episodes 10
+```
+
+在 `output/gifs/<名字>.gif` 出一个**连续 10 回合**的 GIF（每 2 个控制步取一帧 = 25 fps，
+左上角有 HUD）。`--camera {side,track,chase,front,top}`、`--width/--height`、
+`--fps`、`--scale`（整数放大）、`--name` 可调。
+
+GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mosaic 做中位切分量化，
+再逐帧套用），否则回合之间的色块会闪。
+
+---
+
+## 5. 已知限制
+
+* **没有触觉/测距**。这是刻意的设计目标，不是缺失：高台阶上机器人在几何上「看不见」
+  立面，只能靠撞上之后的机身姿态反馈调整。
+* **`EnvConfig` 没有 `stair` 字段**。地形只能通过
+  `Go2StairsEnv(stair=..., cfg=..., seed=...)` 传入；`set_stair()` 用于换地形。
+* `scripts/play.py` 里若同时给出 `--stage-height-cm`，会另建一个环境（旧环境未显式
+  `close()`，属已知的小泄漏）。
+* PPO 的 `batch_size=512` 大于单环境 `n_steps=256`，`play.py` 建 1 环境加载模型时会
+  触发 SB3 的 `UserWarning`（无害，训练时是 8 环境 = 2048）。
+* 本仓的课程是**固定六级**，没有自动晋级/回退、没有域随机化、没有高度带混合。

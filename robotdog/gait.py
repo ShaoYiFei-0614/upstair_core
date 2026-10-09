@@ -1,44 +1,25 @@
-"""Open-loop gait priors -- the warm start that makes residual RL work here.
+"""开环步态先验 —— 让残差 RL 在这里能学起来的热启动。
 
-Why this module exists
-----------------------
-With 8 CPU environments in a single process (this sandbox forbids Windows
-named pipes, so ``SubprocVecEnv`` is unavailable -- see ``robotdog/training.py``)
-PPO never discovered a gait from scratch.  Two calibration runs, 120k and 150k
-steps on flat, both ended at 0% success and ~0.02 m travelled; the learned
-policy scored *worse* than a zero-action stance (466 vs 496 return per episode).
+为什么需要它
+------------
+单进程 8 环境（沙箱禁用 Windows 命名管道，`SubprocVecEnv` 用不了，见
+`robotdog/training.py`）下 PPO 从零学不出步态：两次标定（平地 120k / 150k 步）
+都以 0% 成功率、位移约 0.02 m 收场，学到的策略比「零动作站桩」还差
+（回合回报 466 vs 496）。原因是平台期而非权重 bug —— 随机关节抖动不产生净推进，
+前进速度奖励在出现**协调的周期步态**之前是平的，50 Hz 采样的 MLP 撞不上它。
 
-The reason is a plateau, not a weight bug: random joint jitter produces no net
-propulsion, so the forward-velocity reward is flat until a *coordinated*
-periodic gait appears.  Nothing in a 350k-parameter MLP sampled at 50 Hz finds
-that by accident.
-
-So we search for a fixed open-loop trot offline and let the policy learn the
-*residual* on top of it:
+所以离线先搜好一个固定的开环 trot，再让策略学**残差**：
 
     target = home + gait_gain * gait.radians(t) + action_scale * action
 
-This is ordinary residual RL (Johannink et al., "Residual Reinforcement
-Learning", 2019).  Everything about the observation/action interface the user
-asked for is unchanged -- the action is still 12 joint-target offsets, and the
-result is still a joint-space position command.  The prior is a fixed,
-inspectable trajectory, not a hidden controller, and ``gait_prior`` defaults to
-``False`` so the plain formulation is still available.
+即常规的残差 RL（Johannink et al., "Residual Reinforcement Learning", 2019）。
+观测/动作接口不变：动作仍是 12 个关节目标角偏移。先验是固定的、可检查的轨迹，
+不是隐藏控制器；`EnvConfig.gait_prior` 默认 `False`，纯残差写法依然可用。
 
-Measured by ``scripts/search_trot.py`` on flat ground with the real
-``Go2StairsEnv`` (deterministic reset, zero action noise):
-
-* speed objective, target 0.55 m/s -> **0.550 m/s**, 4.39 m in 8 s, 100%
-  survival, body height 0.268 m (this is ``GaitParams.default_trot()``)
-* distance objective -> **1.702 m/s**, 10.19 m in 6 s, 100% survival
-  (``GaitParams.fast_trot()``)
-
-Frame conventions
------------------
-Amplitudes and offsets are expressed in **normalised action units** (the same
-units as ``action``), so multiplying by ``action_scale`` yields radians.  This
-keeps the gait valid if ``action_scale`` changes: ``|off| + amp <= 1`` is
-enforced when loading.
+帧约定
+------
+幅值与偏置都是**归一化动作单位**（与 `action` 同尺度），乘 `action_scale` 才是弧度，
+于是 `action_scale` 变了先验依然成立；加载时强制 `|off| + amp <= 1`。
 """
 
 from __future__ import annotations
@@ -55,10 +36,8 @@ LEG_ORDER = ("FL", "FR", "RL", "RR")
 TROT_PHASE = (0.0, math.pi, math.pi, 0.0)
 CALF_SHAPES = ("sin", "dip", "half")
 
-# Default prior = the winner of the *speed* objective search
-# (``artifacts/trot_gait.json``), i.e. the gait whose natural forward speed is
-# already the commanded 0.55 m/s: 0.550 m/s mean, 4.39 m in 8 s, 100% survival,
-# body height 0.268 m (nominal stance is 0.27 m).
+# 默认先验 = 「速度目标」搜索的赢家：自然前进速度已是 0.55 m/s（实测 0.550 m/s
+# 均值、8 s 走 4.39 m、100% 存活、机身 0.268 m，标称站姿 0.27 m）。
 _FALLBACK_TROT = dict(
     freq=6.0,
     amp_th=0.24914502679724,
@@ -71,8 +50,7 @@ _FALLBACK_TROT = dict(
     action_scale=0.90,
 )
 
-# The distance-objective winner, kept because it is the cleanest proof that the
-# model can locomote fast: 1.702 m/s, 10.19 m in 6 s, 100% survival.
+# 「距离目标」搜索的赢家（1.702 m/s、6 s 走 10.19 m、100% 存活），留作速度快照。
 FAST_TROT = dict(
     freq=4.0,
     amp_th=0.6093323116494958,
