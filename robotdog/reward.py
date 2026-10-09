@@ -40,16 +40,11 @@ class RewardConfig:
 
     # --- 五个要求的项 ----------------------------------------------------- #
     forward_vel: float = 2.5            # [SPEC] 对 command_vx 的高斯跟踪
-    forward_vel_sigma: float = 0.25
+    forward_vel_sigma: float = 0.25     # m/s，高斯的标准差（**平方后作分母**）
     orientation: float = -1.2           # [SPEC] roll^2 + pitch^2（平方和）
     torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
     foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
     body_collision: float = -4.0        # [SPEC] 躯干接触地形
-
-    # --- 前进运动 ---------------------------------------------------------- #
-    forward_progress: float = 1.5       # 对 vx 线性，所以 vx=0 时一分也拿不到
-    forward_progress_max: float = 1.5
-    forward_progress_min: float = -0.5
 
     # --- 摆动足抬升 -------------------------------------------------------- #
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
@@ -108,14 +103,15 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     terms: dict[str, float] = {}
 
     # 1) 前进速度奖励 -- 前向速度跟踪 ------------------------------------
+    # ``sigma`` 是**标准差**，所以平方后作分母：vx=0 时 err=0.55 m/s，
+    # 指数是 exp(-(0.55/0.25)^2) = exp(-4.84) ≈ 0.0079，奖励约 +0.02/步，
+    # 而不是原来写成 exp(-err^2/sigma) 时的 +0.72/步。历史那个「没平方」的
+    # 写法等于把 0.55 m/s 的偏差只按 sqrt(0.25)=0.5 m/s 折算，「站着不动」
+    # 因此白拿 +0.86/步，是「原地拖延」局部最优的第一根支柱
+    # （见 experience.md §12）。
     err = lin[0] - env.cfg.command_vx
     terms["forward_vel"] = (
-        rc.forward_vel * float(np.exp(-(err * err) / rc.forward_vel_sigma))
-    )
-    # 线性伴随项：机器人不动时恰好为 0，所以「原地站死」的策略一分也
-    # 拿不到。
-    terms["forward_progress"] = rc.forward_progress * float(
-        np.clip(lin[0], rc.forward_progress_min, rc.forward_progress_max)
+        rc.forward_vel * float(np.exp(-(err * err) / (rc.forward_vel_sigma ** 2)))
     )
 
     # 2) 姿态稳定奖励 -- 惩罚 roll 与 pitch -----------------------------
@@ -186,11 +182,19 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     terms["alive"] = rc.alive
 
     # --- 爬升进展 -------------------------------------------------------
-    # 机身下方的地形高度相对回合起点的高度，所以在已经到达的台阶上原地
-    # 不动拿不到任何新奖励。
-    terms["stair_progress"] = rc.stair_progress * float(
-        max(0.0, env.terrain_height_under_base - env._start_terrain_height)
-    )
+    # 一次性结算：只有当机身下方的地形**刷新了本回合的最高高度**时才付，
+    # 付的是这次新增的高度。
+    #
+    # 原来的写法是 ``stair_progress * max(0, 下方地形高 - 回合起点高)``，它
+    # 每步都付 —— 只要机身正下方是高台阶就一直拿钱，于是「爬到某一级然后
+    # 站着不动」每一步都白拿 +0.083/步（15 cm），这是「原地拖延」局部最优
+    # 的第二根支柱（见 experience.md §12）。改成按最大值结算后，累计总量
+    # 仍是 ``stair_progress × 爬升高度``，与走多少步无关 —— 但站着不动再也
+    # 拿不到新的钱。
+    climbed = max(0.0, env.terrain_height_under_base - env._peak_terrain_height)
+    if climbed > 0.0:
+        env._peak_terrain_height = env.terrain_height_under_base
+    terms["stair_progress"] = rc.stair_progress * float(climbed)
 
     # --- 终止 -----------------------------------------------------------
     # 到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出楼梯远端摔下去。

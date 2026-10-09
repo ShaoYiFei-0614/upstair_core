@@ -50,9 +50,9 @@ def _compute_reward(self, action, trunk_contact, foot_contact=None,
 代价是明细里看不出「原始量有多大」，但那个量在 `info` 里另有一份
 （`base_x` / `forward_vel` / `roll` / `pitch` / `base_z` …）。
 
-**实测**：`robotdog/env.py:368` 的转发方法返回的 `terms` 与
-`robotdog/reward.py` 的 `compute_reward()` 的 `terms` 有 14 个共同键；`info["reward_terms"]` 再补一个
-`"terminal"`，共 **15 键**。
+**实测**：`robotdog/env.py:370` 的转发方法返回的 `terms` 与
+`robotdog/reward.py` 的 `compute_reward()` 的 `terms` 有 13 个共同键；`info["reward_terms"]` 再补一个
+`"terminal"`，共 **14 键**。
 
 ### 3.3 终止奖励单列而不是塞进 `terms`（D3）
 
@@ -92,9 +92,6 @@ class RewardConfig:
     torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
     foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
     body_collision: float = -4.0        # [SPEC] 躯干接触地形
-    forward_progress: float = 1.5       # 对 vx 线性，所以 vx=0 时一分也拿不到
-    forward_progress_max: float = 1.5
-    forward_progress_min: float = -0.5
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
     foot_lift_step_ratio: float = 1.4   # 取较大者：target = max(target, ratio * step_height)
     foot_lift_gate_speed: float = 0.25  # m/s，三维足端速度门限
@@ -129,8 +126,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
 
 | key | 公式 |
 | --- | --- |
-| `forward_vel` | `forward_vel * exp(-(lin[0] - command_vx)² / forward_vel_sigma)`（σ **不**平方） |
-| `forward_progress` | `forward_progress * clip(lin[0], forward_progress_min, forward_progress_max)` |
+| `forward_vel` | `forward_vel * exp(-(lin[0] - command_vx)² / forward_vel_sigma²)`（分母是 **σ²**） |
 | `orientation` | `orientation * (rpy[0]² + rpy[1]²)` |
 | `torque` | `torque * sum(tau²)` |
 | `foot_lift` | `foot_lift * mean(gate * lift)`；`gate = clip(foot_speed / max(foot_lift_gate_speed,1e-6), 0, 1)`，`foot_speed = ‖(feet - _prev_foot_pos)/control_dt‖`（三维），`lift = clip(clearance / lift_target, 0, 1)` |
@@ -142,13 +138,18 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
 | `action_rate` | `action_rate * sum((action - _prev_action)²)` |
 | `joint_limit` | `joint_limit * sum(clip(lo - q, 0, None) + clip(q - hi, 0, None))` |
 | `alive` | `alive`（常数） |
-| `stair_progress` | `stair_progress * max(0.0, terrain_height_under_base - _start_terrain_height)` |
+| `stair_progress` | `stair_progress * max(0.0, terrain_height_under_base - _peak_terrain_height)`，并在 `> 0` 时把 `_peak_terrain_height` 前移（**一次性结算**，站桩拿不到第二次） |
 | `terminal` | `success` 若 `env._reached_top` 否则 `termination`；仅当 `terminated=True` |
 
-`RewardConfig` 的 **24 个字段**里有 10 个是**参数**而不是键：`forward_vel_sigma`、
-`forward_progress_max`、`forward_progress_min`、`foot_lift_target`、
-`foot_lift_step_ratio`、`foot_lift_gate_speed`、`air_time_target`、`air_time_max`、
-`termination`、`success`。
+`RewardConfig` 的 **21 个字段**里有 8 个是**参数**而不是键：`forward_vel_sigma`、
+`foot_lift_target`、`foot_lift_step_ratio`、`foot_lift_gate_speed`、`air_time_target`、
+`air_time_max`、`termination`、`success`。
+
+> 本轮删掉了 `forward_progress` / `forward_progress_max` / `forward_progress_min`
+> 三个字段以及对应的线性项：`forward_vel_sigma` 原来漏了平方，等于按
+> `sqrt(0.25)=0.5 m/s` 折算，`vx=0` 时白拿 `exp(-(0.55)²/0.25) ≈ 0.30` ⇒ **+0.72/步**；
+> 改成 `σ²` 后只剩 **+0.02/步**，线性伴项在 0.55 m/s 附近反而给出 +1.1/步的超线性
+> 加成，故一并删除（见 `experience.md` §12）。
 
 ## 5. 内部结构与数据流
 
@@ -160,9 +161,9 @@ robotdog/env.py:597  step()
     │  terminated, truncated = _terminated(...)               env.py:474
     │  if _success_reached(): _reached_top = True             env.py:242
     ▼
-robotdog/env.py:368  _compute_reward(..., terminated=terminated)
+robotdog/env.py:370  _compute_reward(..., terminated=terminated)
     ▼
-robotdog/reward.py:83  compute_reward(env, action, trunk_contact,
+robotdog/reward.py:78  compute_reward(env, action, trunk_contact,
                                       foot_contact, leg_contact, terminated)
     │  读 env.cfg.reward / env.base_rpy / env.base_lin_vel_world / env.data.actuator_force
     │     env.foot_pos / env._prev_foot_pos / env.foot_clearance / env.stair.step_height
@@ -193,8 +194,7 @@ robotdog/env.py:597  reward, terms = ...；_advance_foot_air_time(foot_contact) 
 | 名字 | 值 | 含义 |
 | --- | --- | --- |
 | `RewardConfig.forward_vel` | `2.5` | 唯一的大额正项 |
-| `RewardConfig.forward_vel_sigma` | `0.25` | 高斯分母（不平方），对应 ~0.25 m/s 的速度容差 |
-| `RewardConfig.forward_progress` | `1.5` | 线性项，`vx=0` 时恰为 0 |
+| `RewardConfig.forward_vel_sigma` | `0.25` | 高斯分母，**平方后**作分母（`σ² = 0.0625`），对应 ~0.25 m/s 的速度容差；`vx=0` 时该项只剩 +0.02/步 |
 | `RewardConfig.foot_lift` | `0.9` | 抬脚成形项上限 |
 | `RewardConfig.foot_lift_target` | `0.08` m | 目标下限；`1.4 × 0.05 = 0.07 < 0.08`，所以 5 cm 处取它 |
 | `RewardConfig.foot_lift_step_ratio` | `1.4` | 台阶越高目标越高 |
@@ -203,7 +203,7 @@ robotdog/env.py:597  reward, terms = ...；_advance_foot_air_time(foot_contact) 
 | `RewardConfig.alive` | `0.15` | 每步常数 |
 | `RewardConfig.success` | `50.0` | 成功登顶一次性 |
 | `RewardConfig.termination` | `-15.0` | 摔倒一次性 |
-| `RewardConfig.stair_progress` | `3.0` | 爬升进展（相对回合起点） |
+| `RewardConfig.stair_progress` | `3.0` | 爬升进展（**一次性结算**：只在刷新本回合最高台阶时付） |
 
 ## 7. 与其它模块的关系
 

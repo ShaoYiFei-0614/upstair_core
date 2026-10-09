@@ -34,7 +34,11 @@ env:
   episode_length_s: 20.0
   action_scale: 0.30         # 残差动作上限 [rad]，策略的权限
   command_vx: 0.55           # 前进速度指令 [m/s]
-  terminate_contact_steps: 10
+  # 摔倒判据：机身高度（base_z 减参照面）低于 terminate_min_height 就判摔倒。
+  # 躯干碰撞体最低点在 0.118 m，所以 0.15 留了 3.2 cm 余量。
+  # 注意：躯干「接触地形」本身**不再**终止回合（旧 terminate_contact_steps
+  # 字段已删，那条规则实测从未生效且随时误杀），代价由 body_collision 逐步承担。
+  terminate_min_height: 0.15
   gait_prior: true           # 在 trot 开环先验之上学残差。**别关**：关掉后六级全 0
                              # （原地站到超时，|a|≈0.09），见 train.md §3.6
   gait_file: artifacts/trot_stairs.json
@@ -59,8 +63,7 @@ env:
 reward:
   # 前进
   forward_vel: 2.5           # 跟踪 command_vx 的高斯项
-  forward_vel_sigma: 0.25
-  forward_progress: 1.5      # 线性项，vx=0 时恰为 0（避免站桩）
+  forward_vel_sigma: 0.25    # 标准差（平方后作分母）；vx=0 时该项只有 +0.02/步
   # 姿态与能耗
   orientation: -1.2          # roll² + pitch²
   torque: -1.5e-4            # Στ²
@@ -77,7 +80,7 @@ reward:
   air_time_target: 0.30
   air_time_max: 0.60
   # 推进与碰撞
-  stair_progress: 3.0
+  stair_progress: 3.0        # 只在本回合刷新「最高台阶」时一次性付，站桩拿不到
   body_collision: -4.0
   leg_collision: -0.25
   # 结局

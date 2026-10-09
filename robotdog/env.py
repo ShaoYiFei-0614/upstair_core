@@ -113,14 +113,15 @@ class EnvConfig:
     kd: tuple[float, float, float] = (0.6, 0.6, 0.9)
 
     # --- 终止 -------------------------------------------------------------- #
-    # 回合结束前躯干必须持续接触地形的连续控制步数。>1 可以对单帧的
-    # 撞击消抖。
-    terminate_contact_steps: int = 10
-    # 「躯干是否摔倒」的高度判据以哪个面为基准：
-    #   "base" -> 机身下方的地形（阶梯函数，会产生幽灵摔倒）
+    # 高度判据（"摔倒了没有"）以哪个面为基准：
     #   "support" -> 四足下方的地形（真正支撑它的那个面）
+    #   "support_mean" -> 四个支撑面取均值（台阶边界处更平滑）
+    #   "base" -> 机身下方的地形（阶梯函数，会产生幽灵摔倒）
     terminate_height_ref: str = "support"
-    terminate_min_height: float = 0.13
+    # 摔倒的高度阈值：机身高度（base_z 减参照面）低于它就判摔倒。
+    # 取值依据见 experience.md §12：躯干碰撞体最低点在 0.118 m，所以
+    # 0.15 留了 3.2 cm 余量，同时比原来的 0.13 更早抓到「趴下去」。
+    terminate_min_height: float = 0.15
     terminate_max_tilt: float = 1.0         # rad，roll 或 pitch
     terminate_on_success: bool = True
 
@@ -184,11 +185,12 @@ class Go2StairsEnv(gym.Env):
         self._last_action = np.zeros(self.num_act, dtype=np.float64)
         self._step_count = 0
         self._start_terrain_height = 0.0
+        # 本回合机身正下方地形曾达到的最大高度，用于「爬升进展」的一次性
+        # 结算（见 ``robotdog/reward.py`` 的 ``stair_progress``）。
+        self._peak_terrain_height = 0.0
         self._reached_top = False
-        # 躯干 / 腿部持续接触地形（见 ``EnvConfig.terminate_contact_steps``）
-        # 的连续步数。
-        self._trunk_contact_streak = 0
         self._leg_contact_streak = 0
+
         self._success_x = self._success_target_x()
         self.nominal_pose = float(self.meta.home_qpos[2])  # 0.27 m 站立高度
         self._prev_foot_pos = self.foot_pos.copy()
@@ -444,23 +446,24 @@ class Go2StairsEnv(gym.Env):
                 leg_hit = True
         return trunk_hit, leg_hit
 
-    def _effective_contact_steps(self) -> int:
-        """会让回合结束的躯干接触连续控制步数。"""
-        return max(1, int(self.cfg.terminate_contact_steps))
-
     def _contact_fatal(self, trunk_contact: bool, leg_contact: bool) -> bool:
-        """躯干接触地形的时间是否已长到致命？
+        """接触地形是否会结束回合 —— 现在**恒为 False**。
 
-        连续计数在这里推进而不是在 ``step`` 里，这样当测试直接驱动它时，
-        「调用本方法一次 == 一个控制步」也成立。胫部蹭立面由
-        ``reward.leg_collision`` 定价，永不致命 —— 因它而终止回合会抹掉高
-        台阶恰恰需要的那个信号。
+        历史上这里对躯干接触计数：连续 ``terminate_contact_steps`` 步就判
+        摔倒。实测证明那条规则从未生效过，而且随时可能误杀（见
+        ``experience.md`` §12）：躯干碰撞体最低点在 0.118 m，而高度阈值
+        ``terminate_min_height`` 比它还高，所以躯干一碰地，高度判据早就触发
+        了；反过来，躯干在 ``h ≈ 0.28 m`` 的完全安全姿态下贴着立面蹭可以
+        连续到 8 步，只差 2 步就会被判死 —— 那正是「机身上台架天然要蹭上去」
+        的情形。
+
+        保留这个方法是为了让 ``_terminated`` 的调用形状不变，也为了留住
+        膝盖/胫部接触的连续计数（诊断用，永不致命 —— 因它而终止回合会抹掉
+        高台阶恰恰需要的那个信号）。代价由 ``reward.body_collision``（逐步、
+        有界）承担，不由终止承担。
         """
-        self._trunk_contact_streak = self._trunk_contact_streak + 1 if trunk_contact else 0
         self._leg_contact_streak = self._leg_contact_streak + 1 if leg_contact else 0
-        if not trunk_contact:
-            return False
-        return self._trunk_contact_streak >= self._effective_contact_steps()
+        return False
 
     def _support_height(self) -> float:
         """四足下方最低的地形高度 —— 支撑面。
@@ -544,11 +547,11 @@ class Go2StairsEnv(gym.Env):
 
         self.nominal_pose = float(self.meta.home_qpos[2])
         self._start_terrain_height = self.terrain_height_under_base
+        self._peak_terrain_height = self.terrain_height_under_base
         self._prev_action = np.zeros(self.num_act)
         self._last_action = np.zeros(self.num_act)
         self._step_count = 0
         self._reached_top = False
-        self._trunk_contact_streak = 0
         self._leg_contact_streak = 0
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
@@ -643,8 +646,7 @@ class Go2StairsEnv(gym.Env):
             "reward_terms": terms,
             "trunk_contact": float(trunk_contact),
             "leg_contact": float(leg_contact),
-            "terminate_contact_steps": int(self.cfg.terminate_contact_steps),
-            "trunk_contact_streak": int(self._trunk_contact_streak),
+            "leg_contact_streak": int(self._leg_contact_streak),
             "base_x": float(self.base_pos[0]),
             "base_y": float(self.base_pos[1]),
             "base_z": float(self.base_pos[2]),

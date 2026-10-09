@@ -137,7 +137,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 #### `kp` / `kd` 是怎么定的
 
 `kp` / `kd` 是**关节 PD** 的增益（`tau = kp*(target-q) - kd*qd`），每条腿三个（hip / thigh / calf）
-再 `tile(..., 4)` 成 12 维（`robotdog/env.py:157` 与 `:172-176`）。它们不是拍脑袋的，而是按**实测关节惯量**
+再 `tile(..., 4)` 成 12 维（`robotdog/env.py:112-113` 与 `:179-180`）。它们不是拍脑袋的，而是按**实测关节惯量**
 配到目标带宽与阻尼比上的。用 `mujoco.mj_fullM(model, data, M)`（mujoco 3.12 的签名是
 `mj_fullM(model, data, dst)`）在 `home_qpos` 姿态下取关节空间惯量的对角元 `J`：
 
@@ -193,8 +193,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 
 | 项 | 默认 | 口径 |
 | --- | --- | --- |
-| `forward_vel` | +2.5 | `exp(-((vx - command_vx)/0.25)^2)`，`command_vx = 0.55 m/s` |
-| `forward_progress` | +1.5 | `clip(vx, -0.5, 1.5)` 线性项 —— vx=0 时恰为 0，堵住「站着不动」的局部最优 |
+| `forward_vel` | +2.5 | `exp(-((vx - command_vx)/0.25)^2)`，`command_vx = 0.55 m/s`；**分母是 σ²**，所以 `vx = 0` 时只剩 +0.02/步 |
 | `orientation` | -1.2 | `roll² + pitch²` |
 | `torque` | -1.5e-4 | `Σ tau²` |
 | `foot_lift` | +0.9 | 三维足端速度门控（阈值 `foot_lift_gate_speed = 0.25 m/s`）× `clip(离地/目标, 0, 1)`，目标 `= max(0.08, 1.4 × 台阶高)` |
@@ -206,14 +205,14 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 | `leg_collision` | -0.25 | 小腿/大腿碰地，逐帧 |
 | `body_collision` | -4.0 | 躯干碰地，逐帧 |
 | `alive` | +0.15 | 每步存活（**故意小**：0.4 时占「站桩」回合回报的 49%） |
-| `stair_progress` | +3.0 | `max(0, 参考面高度 - 起始高度)`，参考面取躯干正下方地形 |
+| `stair_progress` | +3.0 | **一次性结算**：只在刷新本回合最高台阶时付 `max(0, 新最高 - 旧最高)`（站桩拿不到第二次） |
 | `success` | **+50.0** | 一次性，到达顶端平台 |
 | `termination` | **-15.0** | 一次性，摔倒/终止 |
 
 两个关键点：
 
 * **所有奖励数学都在 `robotdog/reward.py`**（纯函数 `compute_reward(env, ...)`），
-  `robotdog/env.py:368` 只留一个三行转发方法。为了便于研究与改动，单看那一个文件就够。
+  `robotdog/env.py:370` 只留一个三行转发方法。为了便于研究与改动，单看那一个文件就够。
 * 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
   （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
   拆解可以安全地相加。
@@ -224,9 +223,8 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 
 | 开关 | 默认 | 语义 |
 | --- | --- | --- |
-| `terminate_contact_steps` | 10 | 躯干持续接触 10 个控制步（0.2 s）才算摔倒 —— 去抖，避免单帧擦碰就判死 |
 | `terminate_height_ref` | `"support"` | 摔倒的高度参照面：`"support"` = 四足足下地形最低点；另有 `"base"`（躯干正下方）与 `"support_mean"` |
-| `terminate_min_height` | 0.13 m | 低于参照面这么多就判摔 |
+| `terminate_min_height` | 0.15 m | 低于参照面这么多就判摔（躯干碰撞体最低点在 0.118 m，故留 3.2 cm 余量） |
 | `terminate_max_tilt` | 1.0 rad | `|roll|` 或 `|pitch|` 超过就判摔 |
 | `terminate_on_success` | True | 到达顶端即终止回合 |
 
@@ -234,9 +232,15 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 `_reached_top` 是 sticky 的，回合以 `is_success=True` 结束。
 
 `info["reward_terms"]` 之外的 `info` 字段：`trunk_contact`、`leg_contact`、
-`terminate_contact_steps`、`trunk_contact_streak`、`base_x/y/z`、`terrain_height`、
+`leg_contact_streak`、`base_x/y/z`、`terrain_height`、
 `forward_vel`、`roll`、`pitch`、`crest_height`、`reach_top_x`、`reached_top`、
-`is_success`、`fallen`、`gait_prior`。
+`is_success`、`fallen`、`gait_prior`（共 17 项）。
+
+> **躯干接触本身不再终止回合。** 原来有一条「躯干连续接触 `terminate_contact_steps=10`
+> 个控制步（0.2 s）才算摔倒」的去抖规则，已删除：实测躯干在 `h ≈ 0.28 m` 的完全
+> 安全姿态下贴立面蹭可以连续到 8 步，阈值 10 只差 2 步，是纯风险零收益，而且那条
+> 规则在所有驱动实验里**从未生效过**。躯干接触的代价改由 `body_collision`（逐步、
+> 有界）承担；终止只由高度、倾角与超时决定。
 
 ### 3.5 地形
 

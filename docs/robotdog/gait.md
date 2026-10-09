@@ -23,7 +23,7 @@
 * **不含闭环**：不读 qpos/qvel、不做平衡、不知道台阶，相位纯由外部累加的时间 `t` 决定；
 * 不做 PD 控制、不写 `mjData`、不碰 MuJoCo；
 * 不决定「先验开不开」——`gait_prior` / `gait` / `gait_gain` 都是 `EnvConfig` 的字段，
-  `_gait_action()`（`robotdog/env.py:567-575`）才决定要不要用它；
+  `_gait_action()`（`robotdog/env.py:570-578`）才决定要不要用它；
 * 不决定观测里有没有步态时钟——那是 `ObsConfig.gait_phase`（`robotdog/env.py:65`）；
 * **不做相位随机化**：`gait_phase_randomize` 字段已从 `EnvConfig` 删除，
   `reset()` 里 `_gait_t = _gait_phase = 0.0` 是固定值（`robotdog/env.py:651-652`）。
@@ -47,7 +47,7 @@
 **被否决的方案**：把先验做成一个隐藏的闭环控制器（如相位驱动的足端 IK）。否决原因——
 那条路会让「策略学到什么」不可解释，而且先验变成不可检查的黑盒；本模块的先验是一条
 可打印、可存 JSON、可离线重现的**轨迹**。`EnvConfig.gait_prior` 默认 `False`
-（`robotdog/env.py:157`），所以「纯残差、无先验」的朴素形式依然可用；
+（`robotdog/env.py:179-180`），所以「纯残差、无先验」的朴素形式依然可用；
 而 `config.yaml` 的 `env.gait_prior` 默认 `true`，训练侧默认是**开**先验的
 （`robotdog/config.py:159-171`；CLI 不再有 `--gait-prior` 开关）。
 
@@ -204,7 +204,7 @@ _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
 
 ```
 EnvConfig()
-  → field(default_factory=GaitParams.default_trot)          # robotdog/env.py:157
+  → field(default_factory=GaitParams.default_trot)          # robotdog/env.py:110
     → GaitParams.from_dict(dict(_FALLBACK_TROT))            # robotdog/gait.py:165-167
       → cls(**kw).normalize()
 ```
@@ -212,10 +212,10 @@ EnvConfig()
 **控制步（每个 `step()` 一次）**：
 
 ```
-Go2StairsEnv.step(action)                                    # robotdog/env.py:692
-  → self._gait_phase = self._gait_t                          # env.py:697（本步实际用的相位）
-  → self._target_from_action(action)                         # env.py:670
-    → self._gait_action()                                    # env.py:660
+Go2StairsEnv.step(action)                                    # robotdog/env.py:600
+  → self._gait_phase = self._gait_t                          # env.py:605（本步实际用的相位）
+  → self._target_from_action(action)                         # env.py:580
+    → self._gait_action()                                    # env.py:570
        若 not cfg.gait_prior 或 cfg.gait_gain == 0.0 → zeros(12)
        否则 → cfg.gait_gain * cfg.gait.radians(self._gait_phase)
               → GaitParams.radians(t)                        # gait.py:94
@@ -224,14 +224,14 @@ Go2StairsEnv.step(action)                                    # robotdog/env.py:6
                     → GaitParams.leg_phases(t)               # gait.py:77
                     → GaitParams._calf_wave(p + ph_ca)       # gait.py:68
   → target = home + _gait_action() + cfg.action_scale * action
-  → np.clip(target, act_low, act_high)                       # env.py:690
-  → self._gait_t += cfg.control_dt                           # env.py:699（20 ms）
+  → np.clip(target, act_low, act_high)                       # env.py:581-582
+  → self._gait_t += cfg.control_dt                           # env.py:607（20 ms）
 ```
 
 **观测里的步态时钟**（`ObsConfig.gait_phase=True`，每帧 2 维）：
 
 ```
-_obs_frame()                                                 # robotdog/env.py:364
+_obs_frame()                                                 # robotdog/env.py:341
   → theta = 2π * cfg.gait.freq * self._gait_phase
   → np.array([np.sin(theta), np.cos(theta)])
 ```
