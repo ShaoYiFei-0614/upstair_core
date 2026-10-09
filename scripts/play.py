@@ -52,8 +52,8 @@ from stable_baselines3.common.vec_env import VecEnv  # noqa: E402
 #: 渲染时的每帧步数：50 Hz 控制下每 2 步取一帧 = 25 fps。
 FRAME_STRIDE = 2
 
-#: 各模式用的相机（固定，不暴露到命令行）。
-CAMERA_GIF = "track"
+#: 评估模式用的相机（固定，不暴露到命令行）。
+#: GIF 模式的相机不在这里 —— 它来自 ``config.yaml`` 的 ``play.camera``。
 CAMERA_EVAL = "side"
 
 #: 字体候选（HUD 用），按顺序取第一个存在的。
@@ -130,10 +130,6 @@ class Runner:
         self.model = model
         self.norm = norm
         model.policy.set_training_mode(False)
-
-    @property
-    def normalised(self) -> bool:
-        return self.norm is not None
 
     def predict(self, obs: np.ndarray) -> np.ndarray:
         x = obs if self.norm is None else self.norm.normalize(obs)
