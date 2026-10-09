@@ -51,6 +51,7 @@ python -m venv .venv
 | torch | 2.14.1+cpu | ✔ |
 | numpy | 2.2.4 | ✔ |
 | tensorboard | 2.21.0 | ✔ |
+| pyyaml | 6.0.3 | ✔（读 `config.yaml`） |
 | pillow | 10.4.0 | 只有 `play.py --mode gif` 需要 |
 
 ### 1.1 两个环境侧的坑（装依赖时会撞上）
@@ -69,6 +70,7 @@ python -m venv .venv
 ```
 upstair_core/
   README.md  experience.md  train.md     三份根文档
+  config.yaml                            ★ 全部超参（脚本不再从命令行输入）
   requirements.txt
   artifacts/
     trot_stairs.json                     trot 开环先验（唯一不可重建的 artifact）
@@ -78,13 +80,14 @@ upstair_core/
     env.py           ★ Go2StairsEnv：观测 / 奖励 / 终止 / 成功判据
     gait.py          开环 trot 先验的参数化与 (de)serialize
     go2_model.py     Go2 MJCF 组装 + 场景编译 + 元信息提取
-    policy.py        训练产物的加载：配置 / 观测维度 / 归一化统计
+    policy.py        训练产物的加载：配置 / 观测维度 / 网络结构 / 归一化统计
+    config.py        读 config.yaml → EnvConfig + 课程阶段表
     training.py      PPO 组装、向量环境、运行目录
     curriculum.py    六级课程与阶段回调
     tools/           工具层（不 import env）
       console.py     UTF-8 控制台
       paths.py       路径常量
-      png.py         纯 zlib 的 PNG 读写（不依赖 Pillow）
+      png.py         纯 zlib 的 PNG 读写（不依赖 Pillow；当前无调用者，见下）
       terrain.py     参数化楼梯几何（StairSpec / XML / 高度查询）
   scripts/
     train.py         训练入口（调 curriculum）
@@ -210,37 +213,30 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 ### 4.1 训练
 
 ```bat
+.venv\Scripts\python.exe scripts\train.py
 .venv\Scripts\python.exe scripts\train.py --run-name walk1
 ```
 
-按 `default_curriculum()` 的六级串行训练，每级在上一级的权重上 warm-start。
-默认预算合计 **1,350,000 步**（平地 100k + 5 × 250k），8 环境单进程约 320~400 步/s。
+按 `config.yaml` 的 `curriculum` 段串行训练（默认平地 → 3 → 6 → 9 → 12 → 15 cm），
+每级在上一级的权重上 warm-start。默认预算合计 **1,350,000 步**（平地 100k + 5 × 250k），
+8 环境单进程约 320~400 步/s。
 
-常用开关（完整清单见 `scripts/train.py --help`）：
+**脚本只认两个开关**，其余全部来自 `config.yaml`：
 
 | 开关 | 默认 | 说明 |
 | --- | --- | --- |
-| `--run-name` | `course1` | 产物目录 `runs/<名字>/` |
-| `--total-timesteps` | 按每级预算 | 所有阶段的总步数上限 |
-| `--from-stage` | 无 | 从课程某一级开始 |
-| `--resume` | 无 | 从某个 `.zip` 继续 |
-| `--n-envs` / `--seed` / `--device` | 8 / 0 / cpu | |
-| `--net-arch` | `512 256` | |
-| `--n-steps` / `--batch-size` / `--n-epochs` | 256 / 512 / 5 | PPO 更新粒度 = 256 × 8 = 2048 步 |
-| `--target-kl` / `--log-std-init` | 0.03 / -2.0 | |
-| `--norm-reward` | **开** | 奖励归一化 |
-| `--gait-prior` / `--gait-file` | 开 / `artifacts/trot_stairs.json` | 步态先验 |
-| `--obs-base-lin-vel-body` | 开 | |
-| `--obs-step-height` | 开 | |
-| `--obs-base-height` / `--obs-gait-phase` | 关 | |
+| `--run-name` | `config.yaml` 的 `run.name` | 产物目录 `runs/<名字>/`；目录已存在会拒绝启动 |
+| `--config` | 仓根 `config.yaml` | 换一份配置文件（例如做 A/B） |
 
 产物（`runs/<名字>/`）：
 
 ```
-checkpoints/<阶段>_final.zip         每级结束的权重
-checkpoints/<阶段>/<阶段>_<步数>_steps.zip
-model_final.zip + model_final_vecnormalize.pkl    最后一级的交付权重
-summary.json                          课程定义 + 每级结果 + 完整 env/obs/reward 配置
+checkpoints/<阶段>_final.zip                每级结束的权重
+checkpoints/<阶段>_final_vecnormalize.pkl   与它成对的观测归一化统计
+checkpoints/<阶段>_final_env.json           该权重训练时的地形（台阶高）与完整配置
+checkpoints/<阶段>/<阶段>_<步数>_steps.zip  周期检查点
+model_final.zip / _vecnormalize.pkl / _env.json   最后一级的交付权重（三件套）
+summary.json                                课程定义 + 每级结果 + 完整 env/obs/reward 配置
 tensorboard/
 ```
 
@@ -251,28 +247,48 @@ tensorboard/
 ### 4.2 评估：跑 100 个回合看成功率
 
 ```bat
-.venv\Scripts\python.exe scripts\play.py --run walk1 --mode eval --episodes 100
+.venv\Scripts\python.exe scripts\play.py --run walk1 --mode eval
 ```
 
-`--run` 可以给运行名（查 `runs/<名字>/`）、目录或直接的 `.zip` 路径。默认在
-**5 cm** 楼梯上评估，用 `--stage-height-cm 9` 或 `--stage stair9` 换高度/换课程级。
-结束时打印成功率、摔倒率、超时率、平均前进/爬升/速度/步数；加 `--report out.json`
-写 JSON 报告。
+`--run` 可以给运行名（查 `runs/<名字>/`）、目录或直接的 `.zip` 路径。
+回合数、种子、地形与设备都在 `config.yaml` 的 `play` 段（默认 100 回合）。
+
+**地形默认取权重自带的记录**：`<模型>_env.json` 里写了这个 checkpoint 训练时的台阶高，
+所以 `checkpoints/stair9_final.zip` 会自动在 9 cm 上评估。想强制换成别的楼梯，把
+`play.stage_height_cm` 取消注释（`0` = 平地）。
+
+结束时打印成功率、摔倒率、超时率、平均前进/爬升/速度/步数。
 
 ⚠ **至少跑 40 个回合**。10 个回合能给出 ±15 个百分点的错觉。
 
 ### 4.3 评估：渲染 GIF
 
 ```bat
-.venv\Scripts\python.exe scripts\play.py --run walk1 --mode gif --episodes 10
+.venv\Scripts\python.exe scripts\play.py --run walk1 --mode gif
 ```
 
-在 `output/gifs/<名字>.gif` 出一个**连续 10 回合**的 GIF（每 2 个控制步取一帧 = 25 fps，
-左上角有 HUD）。`--camera {side,track,chase,front,top}`、`--width/--height`、
-`--fps`、`--scale`（整数放大）、`--name` 可调。
+在 `output/gifs/<模型名>.gif` 出一个**连续 10 回合**的 GIF（默认每 2 个控制步取一帧 =
+25 fps，左上角有 HUD）。相机固定为 `track`；分辨率、fps、缩放、回合数都在
+`config.yaml` 的 `play` 段。
 
 GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mosaic 做中位切分量化，
 再逐帧套用），否则回合之间的色块会闪。
+
+### 4.4 所有超参在 `config.yaml`
+
+`config.yaml` 分六段，注释里写了每个键的含义与取值理由：
+
+| 段 | 管什么 |
+| --- | --- |
+| `run` | 运行名、seed、检查点间隔、日志间隔 |
+| `curriculum` | 台阶高度梯度、踏面、级数、每级步数与学习率 |
+| `env` | 向量环境数、回合长度、动作尺度、速度指令、终止阈值、观测开关 |
+| `reward` | 全部奖励权重 |
+| `ppo` | 网络结构、rollout 粒度、优化器与 PPO 超参、奖励归一化、设备 |
+| `play` | 回合数、相机、分辨率、fps、缩放、可选的强制台阶高 |
+
+读配置的是 `robotdog/config.py`：没写的键保持代码默认值，**写错的键会直接报错**
+并列出可用键（打错一个字母立刻看得见，而不是被静默忽略）。
 
 ---
 
@@ -282,8 +298,12 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
   立面，只能靠撞上之后的机身姿态反馈调整。
 * **`EnvConfig` 没有 `stair` 字段**。地形只能通过
   `Go2StairsEnv(stair=..., cfg=..., seed=...)` 传入；`set_stair()` 用于换地形。
-* `scripts/play.py` 里若同时给出 `--stage-height-cm`，会另建一个环境（旧环境未显式
-  `close()`，属已知的小泄漏）。
-* PPO 的 `batch_size=512` 大于单环境 `n_steps=256`，`play.py` 建 1 环境加载模型时会
-  触发 SB3 的 `UserWarning`（无害，训练时是 8 环境 = 2048）。
+* 地形由**权重自带的 `<模型>_env.json`** 决定；老权重（在本轮配置化之前训的）没有这个
+  文件，会退回 `stair_from_height` 的默认 3 cm，需要手动在 `config.yaml` 里写
+  `play.stage_height_cm`。
 * 本仓的课程是**固定六级**，没有自动晋级/回退、没有域随机化、没有高度带混合。
+* **`robotdog/tools/png.py` 目前没有调用者**。它的三个历史消费者（`render.py` /
+  `render_checkpoint.py` / `eval.py`）都已删除，GIF 与拼图现在由 `scripts/play.py`
+  直接用 Pillow 完成。它仍被 `robotdog/tools/__init__.py` 导入，所以
+  `import robotdog` 会连带加载 `numpy`。保留是为了避免在没有需求时反复改动包入口；
+  它是全仓最明确的候选删除项（见 `docs/robotdog/tools/png.md` §9）。

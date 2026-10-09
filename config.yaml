@@ -1,0 +1,110 @@
+# ===========================================================================
+#  盲走楼梯 · 训练与播放配置
+#
+#  所有超参只在这里改，脚本只用它，不再从命令行输入。
+#  train.py 只认 --run-name / --resume；play.py 只认 --run / --mode。
+#  被注释掉的行表示「与代码默认值相同」，取消注释即可覆盖。
+# ===========================================================================
+
+# --- 运行 -----------------------------------------------------------------
+run:
+  name: course1              # 输出目录 runs/<name>/
+  seed: 0
+  # 每个阶段存一次 checkpoint 的间隔（步）；0 = 只在阶段末存
+  save_every: 50000
+  # 每多少步更新打印一次进度行
+  log_every: 20
+
+
+# --- 课程 -----------------------------------------------------------------
+# 固定六级：平地 → 3 → 6 → 9 → 12 → 15 cm。顺序即高度顺序，不要打乱。
+curriculum:
+  heights_cm: [0.0, 3.0, 6.0, 9.0, 12.0, 15.0]
+  tread: 0.50                # 踏面 [m] —— 不要改，0.40/0.60 会让成功率掉一个量级
+  n_up: 8                    # 每级台阶数
+  # 每级的步数预算；必须与 heights_cm 等长
+  timesteps: [100000, 250000, 250000, 250000, 250000, 250000]
+  # 每级的学习率；台阶越高越小，免得把已学会的步态踢掉
+  learning_rate: [1.5e-4, 1.5e-4, 1.2e-4, 1.0e-4, 8e-5, 6e-5]
+
+
+# --- 环境 -----------------------------------------------------------------
+env:
+  n_envs: 8                  # 向量环境数；单进程 DummyVecEnv
+  episode_length_s: 20.0
+  action_scale: 0.30         # 残差动作上限 [rad]，策略的权限
+  command_vx: 0.55           # 前进速度指令 [m/s]
+  terminate_contact_steps: 10
+  gait_prior: true           # 在 trot 开环先验之上学残差
+  gait_file: artifacts/trot_stairs.json
+  # 观测开关；默认 42 + 3 + 1 = 46 维/帧 × 10 帧 = 460 维
+  obs:
+    base_lin_vel_body: true
+    base_height: false
+    gait_phase: false
+    step_height: true
+
+
+# --- 奖励 -----------------------------------------------------------------
+# 权重与公式见 README.md §3.3，每个权重关掉哪个失败见 experience.md §2。
+reward:
+  # 前进
+  forward_vel: 2.5           # 跟踪 command_vx 的高斯项
+  forward_vel_sigma: 0.25
+  forward_progress: 1.5      # 线性项，vx=0 时恰为 0（避免站桩）
+  # 姿态与能耗
+  orientation: -1.2          # roll² + pitch²
+  torque: -1.5e-4            # Στ²
+  # 抬脚
+  foot_lift: 0.9
+  foot_lift_target: 0.08     # 目标下限 [m]
+  foot_lift_step_ratio: 1.4  # 有效目标 = max(target, ratio × 台阶高)
+  # 支撑相 shaping
+  base_height: -2.0
+  joint_vel: -2.0e-5
+  action_rate: -0.02
+  joint_limit: -0.5
+  air_time: 0.6
+  air_time_target: 0.30
+  air_time_max: 0.60
+  # 推进与碰撞
+  stair_progress: 3.0
+  body_collision: -4.0
+  leg_collision: -0.25
+  # 结局
+  alive: 0.15
+  success: 50.0
+  termination: -15.0
+
+
+# --- PPO ------------------------------------------------------------------
+ppo:
+  net_arch: [512, 256]
+  n_steps: 256               # × n_envs = 每次更新的样本量（8 → 2048）
+  batch_size: 512
+  n_epochs: 5
+  learning_rate: 1.5e-4      # 会被 curriculum.learning_rate 按级覆盖
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.002
+  vf_coef: 0.5
+  max_grad_norm: 1.0
+  target_kl: 0.03
+  log_std_init: -2.0
+  norm_reward: true          # 奖励归一化：温和的稳定器，不是解药
+  device: cpu
+
+
+# --- 播放 / 评估 ----------------------------------------------------------
+# 渲染参数固定在这里，命令行不再暴露。
+play:
+  episodes_gif: 10           # 模式 1：连续渲染多少个回合
+  episodes_eval: 100         # 模式 2：跑多少个回合统计成功率
+  seed: 0
+  camera: track              # 相机固定
+  width: 960
+  height: 540
+  fps: 25
+  scale: 2                   # GIF 编码前的整数缩小倍数
+  # stage_height_cm: 5.0     # 取消注释可覆盖楼梯高度（0 = 平地），否则用权重自带的地形

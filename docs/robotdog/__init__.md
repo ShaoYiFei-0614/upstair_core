@@ -69,7 +69,7 @@ stdout/stderr 就已是 UTF-8。**为什么放这里**：本仓所有入口（`s
 
 ### `__version__: str`
 
-包版本，字面量 `"0.1.0"`（`robotdog/__init__.py:9`）。只被脚本与报告引用，
+包版本，字面量 `"0.2.0"`（`robotdog/__init__.py:12`）。只被脚本与报告引用，
 不参与任何逻辑分支。
 
 ### `setup_utf8_console() -> None`（重导出）
@@ -116,8 +116,8 @@ import robotdog
 ```
 
 **推论**：`robotdog.tools` 是重的（eager 导入 `terrain`，于是 `numpy` 必然进
-`sys.modules`），而它的 `__init__` 恰好被本文件第 7 行提前触发。所以
-「避免重依赖开销」这件事上，包入口本身已经做不到——见 §9。
+`sys.modules`），而它的 `__init__` 恰好被本文件第 9 行 `from robotdog.tools import ...`
+提前触发。所以「避免重依赖开销」这件事上，包入口本身已经做不到——见 §9。
 （触觉模块 `tools/touch.py` 曾在这里，它把 `mujoco` 也一起拉进来；该模块已在
 「盲走」重构中删除，所以 `import robotdog` 现在不再加载 MuJoCo。）
 
@@ -125,10 +125,10 @@ import robotdog
 
 | 名字 | 值 | 位置 |
 | --- | --- | --- |
-| `__version__` | `"0.1.0"` | `robotdog/__init__.py:9` |
-| `__all__` | `["__version__", "setup_utf8_console"]` | `robotdog/__init__.py:13` |
-| 文件行数 | 13 行 | — |
-| import 副作用 | `setup_utf8_console()` 调用 1 次 | `robotdog/__init__.py:11` |
+| `__version__` | `"0.2.0"` | `robotdog/__init__.py:12` |
+| `__all__` | `["console", "paths", "png", "setup_utf8_console", "terrain"]` | `robotdog/__init__.py:14` |
+| 文件行数 | 14 行 | — |
+| import 副作用 | `setup_utf8_console()` 调用 0 次（`:10` 只导入符号，真正的调用由 `robotdog/tools/console.py` 在被导入时执行） | `robotdog/__init__.py:9-10` |
 | UTF-8 目标流 | `("stdout", "stderr")` | `robotdog/tools/console.py:19` |
 | 编码 / 错误策略 | `encoding="utf-8"`、`errors="replace"` | `robotdog/tools/console.py:25` |
 

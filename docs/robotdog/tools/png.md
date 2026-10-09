@@ -2,7 +2,9 @@
 
 ## 1. 一句话定位
 
-**工具层**（`robotdog/tools/`）里的图像 I/O 原语：用 `zlib` + `struct` 手写 PNG 容器，提供「把 `mujoco.Renderer` 给出的 `(H, W, 3)` uint8 数组写成 PNG」「读回来」「整数倍降采样」「横向拼接」四个操作。它解决的问题是：**渲染/验证脚本必须能在不装 Pillow 的环境里把一帧图像落盘**，否则「看一眼策略到底做了什么」这件事就被一个图像库的安装状态绑住了。
+**工具层**（`robotdog/tools/`）里的图像 I/O 原语：用 `zlib` + `struct` 手写 PNG 容器，提供「把 `(H, W, 3)` uint8 数组写成 PNG」「读回来」「整数倍降采样」「横向拼接」四个操作。它解决的问题是：**渲染/验证脚本必须能在不装 Pillow 的环境里把一帧图像落盘**，否则「看一眼策略到底做了什么」这件事就被一个图像库的安装状态绑住了。
+
+> ⚠️ **当前状态：本模块在仓内没有任何使用者**。历史上它服务于 `robotdog/render.py`、`scripts/render_checkpoint.py`、`scripts/eval.py` 三个消费者，这三个文件已全部删除（GIF 编码内联进 `scripts/play.py` 并直接用 Pillow）。它仍然被 `robotdog/tools/__init__.py:17` 导入，因此每次 `import robotdog` 都会加载它（连带 `numpy`）。见 §9 第一条。
 
 ## 2. 职责边界
 
@@ -11,15 +13,15 @@
 * `write_png`：把 `(H, W, 3)` 的 uint8 RGB 数组写成 8-bit truecolour PNG，自动建父目录，返回最终路径。
 * `read_png`：读回 PNG，解 `IHDR` / `IDAT` / `IEND`，实现全部 5 种行滤波（None / Sub / Up / Average / Paeth）。
 * `downscale`：整数倍盒式（box-filter）降采样，用于把大帧压到 GIF/HUD 友好的尺寸。
-* `hstack`：把多张图左右拼成一张对比图（评估脚本的 contact sheet 基础）。
+* `hstack`：把多张图左右拼成一张对比图（历史上是评估脚本 contact sheet 的基础）。
 
 **不做**：
 
 * **不处理调色板（colour type 3）、灰度（0）、带 alpha（4/6）、16-bit（depth 16）、隔行（interlace）**：`write_png` 只写 colour type 2 / depth 8，`read_png` 遇到别的组合直接 `raise ValueError`。
 * **不写/读非 PNG 格式**（JPEG、BMP、PPM 全不支持）。
 * **不做有损压缩、不做缩放插值**（`downscale` 是均值盒式，没有双线性/双三次）。
-* **不做 GIF 编码**（那是 `robotdog/render.py` 用 Pillow 做的），**不做 ffmpeg 调用**。
-* **不做色彩空间转换**（sRGB/线性、gamma 一律不管）、不做文字/HUD 叠加（那是 `robotdog/render.py:overlay_hud` 用 Pillow 做的）。
+* **不做 GIF 编码**（现在是 `scripts/play.py` 用 Pillow 做的），**不做 ffmpeg 调用**。
+* **不做色彩空间转换**（sRGB/线性、gamma 一律不管）、不做文字/HUD 叠加（现在是 `scripts/play.py` 用 Pillow 做的）。
 * **不 import `robotdog.env`**，不知道 PPO / 课程 / 训练循环。
 * 本模块**没有 `__all__`**（与同层其它模块不同），四个函数都是公开的。
 
@@ -256,27 +258,36 @@ scripts/eval.py:237, 254, 256
 
 **上游**：stdlib `struct`、`zlib`、`pathlib.Path` + 第三方 `numpy`。**不依赖 mujoco**（虽然数组约定为 `mujoco.Renderer` 的输出格式）、**不依赖 Pillow**、**不依赖任何 robotdog 模块**。
 
-**下游**：
+**下游：当前为零**。全仓扫描 `from robotdog.tools.png import` / `tools.png` 只剩包入口自己：
 
-| 位置 | 使用的符号 | 依赖方向为什么是这样 |
+| 位置 | 使用的符号 | 说明 |
 | --- | --- | --- |
-| `robotdog/render.py:31` | `downscale, hstack, write_png` | 渲染层（`render.py` 在顶层，因为它驱动 `Go2StairsEnv`）需要落盘帧与拼图，于是向下依赖工具层；它自己用 Pillow 处理 GIF，与本模块**分工不重叠** |
+| `robotdog/tools/__init__.py:17` | 整体导入 `png` 模块 | 只是把它绑进 `robotdog.tools` 命名空间，不使用任何函数 |
+| `robotdog/__init__.py:9` | 同上（经包入口） | 于是 `import robotdog` 会加载 `numpy` |
+
+**历史上**的下游（已随那三个文件一起删除，保留这张表是为了说明本模块当初的设计意图）：
+
+| 曾经的位置 | 使用的符号 | 当时的依赖方向 |
+| --- | --- | --- |
+| `robotdog/render.py:31` | `downscale, hstack, write_png` | 渲染层驱动 `Go2StairsEnv`，用本模块落盘帧与拼图，自己用 Pillow 编 GIF |
 | `scripts/render_checkpoint.py:54` | `downscale, write_png` | 脚本层用最小依赖落盘渲染结果 |
 | `scripts/eval.py:216` | `downscale, hstack, write_png` | 评估脚本生成 contact sheet |
 
-**为什么方向是「渲染层 → png 工具层」而不是反过来**：本模块只认识「数组 ↔ 文件」，不需要知道数组从哪来（MuJoCo 渲染、读回的旧图、甚至人工合成）。反过来若 `png.py` import `render.py`（为了知道渲染尺寸或调色板），就会把「图像容器」与「机器人渲染」耦合起来，任何渲染改动都会波及验证脚本 —— 而验证脚本的独立性正是它有价值的原因。
+**为什么当初方向是「渲染层 → png 工具层」而不是反过来**：本模块只认识「数组 ↔ 文件」，不需要知道数组从哪来（MuJoCo 渲染、读回的旧图、甚至人工合成）。反过来若 `png.py` import 渲染模块（为了知道渲染尺寸或调色板），就会把「图像容器」与「机器人渲染」耦合起来，任何渲染改动都会波及验证脚本 —— 而验证脚本的独立性正是它有价值的原因。
 
-**与 `render.py` 的分工边界**（两个模块都碰图像，必须说清）：`png.py` 负责 **PNG 容器 + 像素数组运算**（无 Pillow）；`render.py` 负责 **GIF 编码 + HUD 文字叠加**（用 Pillow）。同一个渲染流程里两者接力：帧数组 → `write_png`（本模块）落盘/拼图 → `save_gif`（Pillow）编动画。
+**与 `scripts/play.py` 的分工边界**（现在两者都碰图像，必须说清）：`png.py` 负责 **PNG 容器 + 像素数组运算**（无 Pillow），但目前**没有调用者**；`scripts/play.py` 自己用 Pillow 完成 **帧拼图 + GIF 编码 + HUD 文字叠加**，完全不经过本模块。也就是说「纯 zlib 落盘」这条能力现在是**无人使用的空转实现**。
 
 ## 8. 实测与经验教训
 
 * 「地形在视觉上不可见 / 狗在爬空气但 HUD 仍在报高度」这类只有**看渲染图**才能发现的物理坑，以及为什么必须把帧 dump 出来，见 `experience.md` §1.2、§1.1。
 * 小样本评估得出的百分比会有 ±15 pt 量级的错觉，视觉对比图（contact sheet）是交叉验证手段之一，见 `experience.md` §5.7。
-* 渲染产物（GIF 是交付物、stills/frames/reports 是工作目录）在训练/渲染流程中的位置，见 `train.md` §1、§2「产物」（本文档不重复其结论）。
+* 渲染产物（GIF 是交付物）在训练/渲染流程中的位置，见 `train.md` §1、§2「产物」（本文档不重复其结论）。
+* **教训：「无依赖」这个卖点会随消费者一起消失**。本模块当初的全部价值来自「验证脚本不该被 Pillow 的安装状态绑住」；当验证脚本本身被删掉后，手写 PNG 容器就只剩维护成本（130 行 zlib/struct/CRC 代码 + 每行一个 bug 面），而 `import robotdog` 依然要付 `numpy` 的加载代价。**删模块时要顺带问一句「它的 `__init__` 导出还留着吗」** —— 本文档与 `tools/__init__.md` 都曾长期没回答这个问题。
 
 ## 9. 已知限制与坑
 
-* **docstring 与现实不一致（务必注意）**：`robotdog/tools/png.py:3` 写 `The sandbox has no Pillow and installing one just to dump a frame is wasteful`，但当前仓库 `robotdog/render.py:223, 285, 337, 368` 确实 `from PIL import Image, ImageDraw, ImageFont`，且 `README.md` 把 `pillow 10.4.0` 列为依赖。正确读法是「本模块**刻意不依赖** Pillow」，不是「环境里没有 Pillow」。
+* **本模块在仓内没有任何功能调用者**。删除 `robotdog/render.py` / `scripts/render_checkpoint.py` / `scripts/eval.py` 之后，四个函数**没有一处外部调用**（`grep write_png\|read_png\|downscale\|hstack` 只命中 `png.py` 自身）。它仍然被 `robotdog/tools/__init__.py:17` 导入 —— 所以「删掉它」不只是删一个文件，还要决定是否同时从包入口的导入行与 `__all__` 里摘掉它。当前**刻意保留**（避免在没有需求时反复改动包入口），但它是全仓最明确的候选删除项。
+* **docstring 与现实的偏差已修正**：`robotdog/tools/png.py:3-6` 现在写的是「Pillow **确实**装着（渲染用），但本写入器刻意不用它」，与 `README.md` 把 `pillow 10.4.0` 列为依赖一致。历史上这里曾写死判断句 `The sandbox has no Pillow and installing one just to dump a frame is wasteful`，读起来像「装了 Pillow 就会坏」—— 正确读法始终是「本模块**刻意不依赖** Pillow」。
 * **`write_png` 不接受浮点图像**：传 `float32` 的 0~1 图像会得到
   `ValueError: 需要 uint8, 收到 float32`。
 * **`write_png` 不接受灰度/alpha**：`(H, W)` 与 `(H, W, 4)` 都会得到
@@ -299,10 +310,12 @@ import numpy as np
 
 from robotdog.tools.png import downscale, hstack, read_png, write_png
 
+# 注意：仓内目前没有调用者（见 §9 第一条）。下面只是本模块自身的用法演示。
+
 # 1) 写一张图（父目录自动创建，返回最终 Path）
 img = np.zeros((480, 640, 3), dtype=np.uint8)
 img[..., 0] = 200                                  # 偏红的一帧
-out = write_png("output/stills/demo.png", img)     # -> Path('output/stills/demo.png')
+out = write_png("output/gifs/demo.png", img)       # -> Path('output/gifs/demo.png')
 print(out)
 
 # 2) 读回来并核对形状（round-trip）
@@ -312,9 +325,9 @@ assert back.shape == (480, 640, 3) and back.dtype == np.uint8
 # 3) 降采样 + 横向拼接成对比图（pad=8 像素白缝）
 small = downscale(back, 2)                          # (240, 320, 3)
 sheet = hstack([small, small], pad=8)               # (240, 328, 3)
-write_png("output/stills/demo_strip.png", sheet, compress_level=9)
+write_png("output/gifs/demo_strip.png", sheet, compress_level=9)
 
-# 4) 与 MuJoCo 渲染器直接对接（Renderer 返回的就是 write_png 期望的格式）
+# 4) 与 MuJoCo 渲染器对接（Renderer 返回的就是 write_png 期望的格式）
 #    frame = renderer.render()
-#    write_png(paths.OUTPUT_STILLS_DIR / "frame0.png", frame)
+#    write_png(paths.OUTPUT_GIFS_DIR / "frame0.png", frame)
 ```

@@ -48,7 +48,8 @@
 那条路会让「策略学到什么」不可解释，而且先验变成不可检查的黑盒；本模块的先验是一条
 可打印、可存 JSON、可离线重现的**轨迹**。`EnvConfig.gait_prior` 默认 `False`
 （`robotdog/env.py:148`），所以「纯残差、无先验」的朴素形式依然可用；
-而 `scripts/train.py` 的 `--gait-prior` 默认 `True`，训练侧默认是**开**先验的。
+而 `config.yaml` 的 `env.gait_prior` 默认 `true`，训练侧默认是**开**先验的
+（`robotdog/config.py:170`；CLI 不再有 `--gait-prior` 开关）。
 
 ### D2 —— 幅度单位用「归一化动作单位」，不用弧度
 
@@ -104,14 +105,15 @@ target = home + gait_gain * gait.radians(t) + action_scale * action
 
 ### D6 —— 出货先验是搜索结果，不是 `default_trot()`
 
-出货命令用 `--gait-file artifacts\trot_stairs.json`（`scripts/train.py:237` 的默认值），
+出货用 `config.yaml` 的 `env.gait_file: artifacts/trot_stairs.json`（经
+`robotdog/config.py:_load_gait()` 解析，路径**相对仓根**），
 `load_gait()` 看到文件里有 `"top"` 键就走 `from_search_json(path, rank=0)`，
 并把条目上的 `action_scale` 抬到顶层：所以**先验幅度是 1.00 rad**，不是 dataclass
 默认的 `0.70`，也不是 `_FALLBACK_TROT` 的 `0.90`。
 
 `GaitParams.default_trot()` 是另一条（`_FALLBACK_TROT`，6.0 Hz / scale 0.90）：
-它只在 `load_gait(None)` 时兜底，而 `scripts/train.py` **总会**传一个路径
-（`--gait-file` 默认非 None），所以训练路径上 `default_trot()` 其实用不到。
+它只在 `load_gait(None)`（即 `env.gait_file` 留空）时兜底，而默认配置**总会**给一个
+路径，所以训练路径上 `default_trot()` 其实用不到。
 两者刻意不是同一条：`default_trot()` 是「速度目标 0.55 m/s 那一档搜索的胜者」，
 出货 JSON 是「**stairs** 目标重新搜出来的胜者」。
 
@@ -228,12 +230,12 @@ _obs_frame()                                                 # robotdog/env.py:4
 **CLI 加载**：
 
 ```
-scripts/train.py --gait-prior [--gait-file PATH]             # scripts/train.py:235-237, 194-196
-  → load_gait(PATH)                                          # robotdog/gait.py:233
-      → GaitParams.from_search_json(PATH)                    # 有 "top" 键时
+config.yaml: env.gait_prior / env.gait_file                    # robotdog/config.py:159-171
+  → load_gait(PATH)                                            # robotdog/config.py:184 → robotdog/gait.py:211
+      → GaitParams.from_search_json(PATH)                      # 有 "top" 键时
         → from_dict(entry["gait"] | action_scale=entry["action_scale"])
   → cfg.gait_prior = True; cfg.gait = gait
-  → print(f"[步态] {cfg.gait.summary()}")                     # scripts/train.py:278
+  → play.py 打印 f"[步态] {cfg.gait.summary()}"                 # scripts/train.py:260-262 的启动自检
 ```
 
 ## 6. 关键常量与默认值
@@ -319,7 +321,8 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
 * `robotdog/policy.py` `env_config_from_summary()` 里**延迟 import**
   `from robotdog.gait import GaitParams`，把 `summary.json` 里的 `env_config.gait`
   字典还原成 `GaitParams.from_dict(...)`；
-* `scripts/train.py:53` `from robotdog.gait import load_gait` —— CLI 开关；
+* `robotdog/config.py:33` `from robotdog.gait import GaitParams, load_gait` —— 由
+  `config.yaml` 的 `env.gait_prior` / `env.gait_file` 驱动（CLI 开关已删除）；
 * 文档与评估侧的「纯先验（动作=0）」基线本质上也是「只跑这条轨迹」，
   现在由 `scripts/play.py` 用**零动作策略**实现（历史上那个 `PriorPolicy`
   在已删除的 `scripts/render_checkpoint.py` 里）。
@@ -342,7 +345,9 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   （sin/cos 两维）。实现就在 `robotdog/env.py:408-410`。
 * 先验自身的标定数字（在平地、确定性 reset、零动作噪声下用真实 `Go2StairsEnv` 测）：
   `default_trot()` 速度目标 0.550 m/s、8 s 走 4.39 m、100% 存活、机身高度 0.268 m；
-  `fast_trot()` 1.702 m/s、6 s 走 10.19 m。见 `robotdog/gait.py:28-34` 的模块 docstring。
+  `fast_trot()` 1.702 m/s、6 s 走 10.19 m。速度目标写在两个 classmethod 的 docstring 里
+  （`robotdog/gait.py:190-191` 与 `:195-196`）；**模块 docstring（`:1-23`）只记「从零学
+  学不出步态」的两次标定**，不记这几个速度数字。
 * 先验的几何能力（摆动峰值 0.1124 m / 频率 ×0.6 → 0.1658 m）与「开环调参也翻不过去」
   见 `experience.md` §6（能力边界：11 cm 的墙）、§6.3、§6.4；`train.md` §3 的消融说明
   **改先验/改策略权限都不等于能上更高的台阶**。
@@ -353,16 +358,18 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
 ## 9. 已知限制与坑
 
 * **开环楼梯小跑对台阶高不单调**：实测 2 cm → 40%、3 cm → 40%、**4 cm → 100%**、
-  5 cm → 20%、6 cm → 0%（`robotdog/curriculum.py` 的课程注释里记录了这个数）。原因：
-  固定 **183 ms** 的步态周期在约 4 cm 处与 50 cm 踏面**共振**。所以「从 2 cm 起步」
-  的阶梯会从先验自身能力**之下**开始，白费第一级（`expand_stage(start_step_height=...)`
-  就是为绕开它而存在的）。
+  5 cm → 20%、6 cm → 0%（数字来自历史消融，见 `train.md` §3）。原因：
+  固定 **183 ms** 的步态周期在约 4 cm 处与 50 cm 踏面**共振**。所以若将来要重排课程，
+  「从 2 cm 起步」的阶梯会从先验自身能力**之下**开始 —— 这是选起点时要避开的坑
+  （历史上有一个 `expand_stage(start_step_height=...)` 就是为绕开它而写的，
+  已随自动课程一起删除，见 `experience.md` §6.1）。
 * **纯先验（零残差）能上 4.4 m 但会摔**：1.5 cm → 88%、2.0 cm → 50%、2.5 cm → 12%、
   3.0 cm → 12%、4.0 cm → 25%。它能迈上去，但不稳——先验是**起点不是解**。
-* **`_FALLBACK_TROT` 注释里的 `artifacts/trot_gait.json` 在仓里不存在**：`artifacts/`
-  下只有 `trot_stairs.json`（`robotdog/gait.py:59` 的引用已过期）。
-* **产生出货 JSON 的脚本不在仓里**：`robotdog/gait.py:28` 与 `from_search_json`
-  的 docstring（`robotdog/gait.py:201`）都写 `scripts/search_trot.py`，
+* **`_FALLBACK_TROT` 的注释不再指向任何文件**：它引用过 `artifacts/trot_gait.json`，
+  该文件从未入库，现在 `artifacts/` 下只有 `trot_stairs.json`（`_FALLBACK_TROT` 在
+  `robotdog/gait.py:41`，注释里已经不带路径）。
+* **产生出货 JSON 的脚本不在仓里**：`from_search_json` 的 docstring
+  （`robotdog/gait.py:179`）与加载分支的注释（`:219`）都写 `scripts/search_trot.py`，
   但 `scripts/` 下现在只有 `download_go2.py` / `play.py` / `train.py` / `__init__.py`。
   所以 `artifacts/trot_stairs.json` 是**不可重建的 artifact**——改了它无法重搜。
 * **`from_dict()` 静默忽略未知键**（`kw = {k: v for k, v in d.items() if k in known}`）：

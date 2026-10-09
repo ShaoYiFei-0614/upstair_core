@@ -1,19 +1,14 @@
 """训练盲走楼梯策略。
 
-按 :mod:`robotdog.curriculum` 的固定课程串行训练：**平地 → 3 → 6 → 9 → 12 → 15 cm**。
-每一级做一个地形、训完保存，下一级从上一级的权重 warm-start（``PPO.set_parameters``），
-所以策略会逐级迁移。
+按 ``config.yaml`` 的 ``curriculum`` 段串行训练：默认是
+**平地 → 3 → 6 → 9 → 12 → 15 cm**。每一级只对应一种台阶几何，训满该级的步数预算后
+保存权重，下一级从上一级的权重 warm-start（``PPO.set_parameters``），所以策略逐级迁移。
 
 用法::
 
-    # 完整课程（默认）
-    .venv\\Scripts\\python.exe scripts\\train.py --run-name course1
-
-    # 只训某一级起（调试用）
-    .venv\\Scripts\\python.exe scripts\\train.py --run-name dbg --from-stage stair3
-
-    # 从头短跑一遍（每个阶段 20k 步）
-    .venv\\Scripts\\python.exe scripts\\train.py --run-name smoke --total-timesteps 120000
+    # 全部超参在 config.yaml 里，脚本只认运行名与配置文件
+    .venv\\Scripts\\python.exe scripts\\train.py
+    .venv\\Scripts\\python.exe scripts\\train.py --run-name course2
 
 产物落在 ``runs/<名字>/``：
 
@@ -24,14 +19,11 @@
 
 **观测归一化必须跟权重一起用**：``*_vecnormalize.pkl`` 与 ``*.zip`` 是成对的，
 play 会按同名自动配对。
-
-⚠ ``--resume`` 只会恢复权重与进度，**不会**应用 ``--net-arch`` / ``--learning-rate`` /
-``--target-kl``（PPO 构造时已固定），要改这些必须从头训。
 """
 
 from __future__ import annotations
 
-import argparse
+import shutil
 import sys
 import time
 from dataclasses import asdict
@@ -42,23 +34,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from stable_baselines3.common.callbacks import BaseCallback  # noqa: E402
 
+from robotdog.config import (  # noqa: E402
+    DEFAULT_CONFIG_PATH,
+    config_to_env,
+    config_to_ppo,
+    config_to_run,
+    config_to_stages,
+    load_config,
+    n_envs as cfg_n_envs,
+)
 from robotdog.curriculum import (  # noqa: E402
     EpisodeStats,
     StageSpec,
-    default_curriculum,
     format_curriculum,
     write_summary,
 )
 from robotdog.env import EnvConfig  # noqa: E402
-from robotdog.gait import load_gait  # noqa: E402
-from robotdog.tools import paths  # noqa: E402
+from robotdog.policy import env_json_path, save_env_json  # noqa: E402
+from robotdog.tools import console  # noqa: E402
 from robotdog.training import (  # noqa: E402
-    DEFAULT_NET_ARCH,
     RunDir,
     build_ppo,
     format_duration,
     make_vec_env,
+    save_vecnormalize,
 )
+
+#: 只打印进度，不训练的最小步数（避免把 0 步的配置跑成死循环）。
+MIN_STAGE_STEPS = 1
 
 
 # --------------------------------------------------------------------------- #
@@ -67,19 +70,20 @@ from robotdog.training import (  # noqa: E402
 
 
 class ProgressCallback(BaseCallback):
-    """有新回合结束时（且距上次打印至少 ``log_interval`` 次更新）打印一行进度。"""
+    """有新回合结束时（且距上次打印至少 ``log_every`` 次更新）打印一行进度。"""
 
-    def __init__(self, *, log_interval: int = 20, verbose: int = 1) -> None:
+    def __init__(self, *, log_every: int = 20, window: int = 50,
+                 verbose: int = 1) -> None:
         super().__init__(verbose)
-        self.log_interval = max(1, int(log_interval))
-        self.stats = EpisodeStats(window=50)
+        self.log_every = max(1, int(log_every))
+        self.stats = EpisodeStats(window=window)
         self._last_episodes = 0
         self._last_print = 0
 
     def _on_step(self) -> bool:
         self.stats.add_infos(self.locals.get("infos", []))
         new_episode = self.stats.n_total != self._last_episodes
-        due = self.n_calls - self._last_print >= self.log_interval
+        due = self.n_calls - self._last_print >= self.log_every
         if due and new_episode:
             self._last_episodes = self.stats.n_total
             self._last_print = self.n_calls
@@ -106,8 +110,6 @@ class CheckpointCallback(BaseCallback):
         self.directory.mkdir(parents=True, exist_ok=True)
         base = self.directory / f"{self.stage}_{self.num_timesteps}_steps"
         self.model.save(str(base))
-        from robotdog.training import save_vecnormalize
-
         save_vecnormalize(self.model, base)
         return True
 
@@ -118,83 +120,76 @@ class CheckpointCallback(BaseCallback):
 
 
 class Trainer:
-    """实现 :class:`robotdog.curriculum.StageTrainer` 协议。"""
+    """实现 :class:`robotdog.curriculum.StageTrainer` 协议。
 
-    def __init__(self, cfg: EnvConfig, rundir: RunDir, args: argparse.Namespace) -> None:
+    所有超参来自 ``config.yaml``，阶段特有的步数与学习率来自 :class:`StageSpec`。
+    """
+
+    def __init__(self, cfg: EnvConfig, rundir: RunDir, *, run: dict[str, Any],
+                 ppo: dict[str, Any], n_envs: int) -> None:
         self.cfg = cfg
         self.rundir = rundir
-        self.args = args
+        self.run = run
+        self.ppo = ppo
+        self.n_envs = n_envs
         self.last_stats = EpisodeStats(window=200)
-        self.last_venv = None
 
-    # ---- 每个阶段一个独立的向量环境（地形烘焙在编译后的 MJCF 里） ----------
+    # ---- 每个阶段一个独立的向量环境（地形烘焙在编译后的 MJCF 里）----------
     def make_env(self, stage: StageSpec, *, warm_start: str | None = None):
         return make_vec_env(
             stage.spec,
-            n_envs=self.args.n_envs,
+            n_envs=self.n_envs,
             cfg=self.cfg,
-            seed=self.args.seed,
-            norm_reward=bool(self.args.norm_reward),
+            seed=int(self.run["seed"]),
+            norm_reward=bool(self.ppo.get("norm_reward", True)),
         )
 
     def train_stage(self, stage: StageSpec, venv, *, warm_start: str | None = None,
                     tensorboard_log: str | Path | None = None, **_: Any):
+        arch = tuple(self.ppo.get("net_arch", (512, 256)))
         model = build_ppo(
             venv,
-            seed=self.args.seed,
+            seed=int(self.run["seed"]),
             learning_rate=stage.learning_rate,
-            n_steps=self.args.n_steps,
-            batch_size=self.args.batch_size,
-            n_epochs=self.args.n_epochs,
-            target_kl=self.args.target_kl,
-            log_std_init=self.args.log_std_init,
-            net_arch=tuple(self.args.net_arch),
+            n_steps=int(self.ppo.get("n_steps", 256)),
+            batch_size=int(self.ppo.get("batch_size", 512)),
+            n_epochs=int(self.ppo.get("n_epochs", 5)),
+            gamma=float(self.ppo.get("gamma", 0.99)),
+            gae_lambda=float(self.ppo.get("gae_lambda", 0.95)),
+            clip_range=float(self.ppo.get("clip_range", 0.2)),
+            ent_coef=float(self.ppo.get("ent_coef", 0.002)),
+            vf_coef=float(self.ppo.get("vf_coef", 0.5)),
+            max_grad_norm=float(self.ppo.get("max_grad_norm", 1.0)),
+            target_kl=self.ppo.get("target_kl", 0.03),
+            log_std_init=float(self.ppo.get("log_std_init", -2.0)),
+            net_arch=arch,
             tensorboard_log=tensorboard_log,
-            device=self.args.device,
+            device=str(self.ppo.get("device", "cpu")),
         )
         if warm_start:
             model.set_parameters(str(warm_start))
             print(f"    [warm-start] 从 {Path(warm_start).name} 继承权重", flush=True)
 
-        callbacks = [ProgressCallback(log_interval=self.args.log_interval)]
-        if self.args.save_every > 0:
+        callbacks = [ProgressCallback(log_every=int(self.run["log_every"]))]
+        every = int(self.run["save_every"])
+        if every > 0:
             callbacks.append(
                 CheckpointCallback(self.rundir.checkpoints / stage.name, stage.name,
-                                   every=self.args.save_every)
+                                   every=every)
             )
         t0 = time.time()
         model.learn(total_timesteps=stage.timesteps, callback=callbacks,
                     reset_num_timesteps=True)
         sps = stage.timesteps / max(1e-6, time.time() - t0)
 
-        # 阶段产物：checkpoints/<阶段>_final.{zip,pkl}
+        # 阶段产物：checkpoints/<阶段>_final.{zip,pkl,env.json}
         target = self.rundir.checkpoints / f"{stage.name}_final"
         self.rundir.save_model(model, target, venv)
+        save_env_json(target, self.cfg, step_height=stage.step_height,
+                      stage=stage.name)
         self.last_stats = callbacks[0].stats
-        self.last_venv = venv
         print(f"    训练完成 {stage.timesteps:,} 步  {sps:.0f} 步/秒", flush=True)
         return model, self.last_stats
-
-
-# --------------------------------------------------------------------------- #
-# 配置装配
-# --------------------------------------------------------------------------- #
-
-
-def build_config(args: argparse.Namespace) -> EnvConfig:
-    cfg = EnvConfig()
-    cfg.episode_length_s = args.episode_length_s
-    cfg.action_scale = args.action_scale
-    cfg.command_vx = args.command_vx
-    cfg.terminate_contact_steps = args.terminate_contact_steps
-    cfg.obs.base_lin_vel_body = bool(args.obs_base_lin_vel_body)
-    cfg.obs.base_height = bool(args.obs_base_height)
-    cfg.obs.gait_phase = bool(args.obs_gait_phase)
-    cfg.obs.step_height = bool(args.obs_step_height)
-    if args.gait_prior:
-        cfg.gait_prior = True
-        cfg.gait = load_gait(args.gait_file)
-    return cfg
 
 
 # --------------------------------------------------------------------------- #
@@ -202,148 +197,18 @@ def build_config(args: argparse.Namespace) -> EnvConfig:
 # --------------------------------------------------------------------------- #
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None):
+    import argparse
+
     ap = argparse.ArgumentParser(
-        description="按固定课程训练盲走楼梯策略",
+        description="按 config.yaml 的固定课程训练盲走楼梯策略",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--run-name", default="course1")
-    ap.add_argument("--total-timesteps", type=int, default=None,
-                    help="全部阶段的总步数；不给则用每级默认预算")
-    ap.add_argument("--from-stage", default=None,
-                    help="从课程的某一级开始（跳过之前的级）")
-    ap.add_argument("--resume", default=None, help="从某个 .zip 权重继续训练")
-    ap.add_argument("--n-envs", type=int, default=8)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--device", default="cpu")
-
-    # PPO
-    ap.add_argument("--net-arch", type=int, nargs=2, default=list(DEFAULT_NET_ARCH))
-    ap.add_argument("--n-steps", type=int, default=256)
-    ap.add_argument("--batch-size", type=int, default=512)
-    ap.add_argument("--n-epochs", type=int, default=5)
-    ap.add_argument("--target-kl", type=float, default=0.03)
-    ap.add_argument("--log-std-init", type=float, default=-2.0)
-    ap.add_argument("--norm-reward", action=argparse.BooleanOptionalAction,
-                    default=True,
-                    help="奖励归一化；从零训练时它是最强的杠杆，"
-                         "但 warm-start 一个未归一化的权重时应当关掉")
-
-    # 地形与步态
-    ap.add_argument("--tread", type=float, default=0.50)
-    ap.add_argument("--n-up", type=int, default=8)
-    ap.add_argument("--gait-prior", action=argparse.BooleanOptionalAction,
-                    default=True, help="在 trot 开环先验之上学习残差")
-    ap.add_argument("--gait-file", default=str(paths.ARTIFACTS_DIR / "trot_stairs.json"))
-
-    # 环境
-    ap.add_argument("--episode-length-s", type=float, default=20.0)
-    ap.add_argument("--action-scale", type=float, default=0.30)
-    ap.add_argument("--command-vx", type=float, default=0.55)
-    ap.add_argument("--terminate-contact-steps", type=int, default=10)
-    ap.add_argument("--obs-base-lin-vel-body", action=argparse.BooleanOptionalAction,
-                    default=True)
-    ap.add_argument("--obs-base-height", action=argparse.BooleanOptionalAction,
-                    default=False)
-    ap.add_argument("--obs-gait-phase", action=argparse.BooleanOptionalAction,
-                    default=False)
-    ap.add_argument("--obs-step-height", action=argparse.BooleanOptionalAction,
-                    default=True)
-
-    # 日志与存档
-    ap.add_argument("--log-interval", type=int, default=20)
-    ap.add_argument("--save-every", type=int, default=50000)
+    ap.add_argument("--run-name", default=None,
+                    help="输出目录名；默认用 config.yaml 的 run.name")
+    ap.add_argument("--config", default=str(DEFAULT_CONFIG_PATH),
+                    help="配置文件路径")
     return ap.parse_args(argv)
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    cfg = build_config(args)
-    stages = default_curriculum(
-        tread=args.tread, n_up=args.n_up, total_timesteps=args.total_timesteps
-    )
-    if args.from_stage:
-        names = [s.name for s in stages]
-        if args.from_stage not in names:
-            raise SystemExit(f"--from-stage 必须是 {names} 之一")
-        stages = stages[names.index(args.from_stage):]
-
-    rundir = RunDir(args.run_name)
-    print(f"[运行] {rundir.root}")
-    print(f"[观测] 每帧 {cfg.obs.frame_size} 维 × history {cfg.obs.history_len} "
-          f"= {cfg.obs.size} 维")
-    print(f"[动作] 残差模式, action_scale={cfg.action_scale} rad, "
-          f"步态先验={'开' if cfg.gait_prior else '关'}")
-    if cfg.gait_prior:
-        print(f"[步态] {cfg.gait.summary()}")
-    print(f"[奖励] forward_vel={cfg.reward.forward_vel} "
-          f"foot_lift={cfg.reward.foot_lift} success={cfg.reward.success} "
-          f"termination={cfg.reward.termination}")
-    print(f"[PPO] 网络={list(args.net_arch)} n_steps={args.n_steps} "
-          f"batch={args.batch_size} epochs={args.n_epochs} "
-          f"target_kl={args.target_kl} log_std_init={args.log_std_init}")
-    print()
-    print(format_curriculum(stages))
-    print()
-
-    trainer = Trainer(cfg, rundir, args)
-    results = []
-    warm = args.resume
-    t_start = time.time()
-    for i, stage in enumerate(stages, start=1):
-        print(f"[课程] >>> 第 {i}/{len(stages)} 级 '{stage.name}' ({stage.label}) "
-              f"{stage.summary()}", flush=True)
-        venv = trainer.make_env(stage, warm_start=warm)
-        t0 = time.time()
-        try:
-            model, stats = trainer.train_stage(
-                stage, venv, warm_start=warm,
-                tensorboard_log=str(rundir.tensorboard),
-            )
-        finally:
-            venv.close()
-        wall = time.time() - t0
-        path = rundir.checkpoints / f"{stage.name}_final.zip"
-
-        results.append(_result(stage, stats, wall, path, cfg))
-        warm = str(path)
-        print(f"[课程] <<< '{stage.name}' 成功率={stats.success_rate:.1%} "
-              f"摔倒率={stats.fall_rate:.1%} 均回报={stats.mean_return:.1f} "
-              f"用时={format_duration(wall)}", flush=True)
-
-    # 末级权重另存为 model_final，方便 play 直接找
-    if results and Path(results[-1].model_path).is_file():
-        import shutil
-
-        shutil.copy2(results[-1].model_path, Path(str(rundir.final_model) + ".zip"))
-        norm = Path(results[-1].model_path).with_name(
-            Path(results[-1].model_path).stem + "_vecnormalize.pkl"
-        )
-        if norm.is_file():
-            shutil.copy2(norm, Path(str(rundir.final_model) + "_vecnormalize.pkl"))
-
-    final_model = results[-1].model_path if results else ""
-    payload: dict[str, Any] = {
-        "env_config": asdict(cfg),
-        "obs_config": asdict(cfg.obs),
-        "reward_config": asdict(cfg.reward),
-        "final_model": final_model,
-        "wall_seconds": round(time.time() - t_start, 1),
-    }
-    summary = rundir.write_summary(payload)
-    write_summary(summary, stages, results, payload)
-
-    print()
-    print(format_curriculum(stages, results))
-    print(f"\n产物: {rundir.root}")
-    print(f"  模型: {rundir.root / 'model_final'}.zip")
-    print(f"  汇总: {summary}")
-    print("\n下一步:")
-    print(f"  .venv\\Scripts\\python.exe scripts\\play.py --run {args.run_name} "
-          f"--mode eval --episodes 100")
-    print(f"  .venv\\Scripts\\python.exe scripts\\play.py --run {args.run_name} "
-          f"--mode gif")
-    return 0
 
 
 def _result(stage: StageSpec, stats: EpisodeStats, wall: float, path: Path,
@@ -364,6 +229,106 @@ def _result(stage: StageSpec, stats: EpisodeStats, wall: float, path: Path,
         episodes=int(stats.n_total),
         obs_size=int(cfg.obs.size),
     )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    console.setup_utf8_console()
+    args = parse_args(argv)
+    raw = load_config(args.config)
+
+    run = config_to_run(raw)
+    ppo = config_to_ppo(raw)
+    cfg = config_to_env(raw)
+    stages = config_to_stages(raw)
+    name = args.run_name or str(run["name"])
+    n_envs = cfg_n_envs(raw)
+
+    for stage in stages:
+        if stage.timesteps < MIN_STAGE_STEPS:
+            raise SystemExit(f"阶段 {stage.name} 的预算太小：{stage.timesteps}")
+
+    rundir = RunDir(name)
+    if rundir.root.exists():
+        raise SystemExit(f"输出目录已存在：{rundir.root}\n换个 --run-name，或先删掉它")
+    rundir.ensure()
+
+    print(f"[配置] {Path(args.config)}")
+    print(f"[运行] {rundir.root}  (seed={run['seed']}, n_envs={n_envs})")
+    print(f"[观测] 每帧 {cfg.obs.frame_size} 维 × history {cfg.obs.history_len} "
+          f"= {cfg.obs.size} 维")
+    print(f"[动作] 残差模式, action_scale={cfg.action_scale} rad, "
+          f"步态先验={'开' if cfg.gait_prior else '关'}")
+    if cfg.gait_prior:
+        print(f"[步态] {cfg.gait.summary()}")
+    print(f"[奖励] forward_vel={cfg.reward.forward_vel} "
+          f"foot_lift={cfg.reward.foot_lift} success={cfg.reward.success} "
+          f"termination={cfg.reward.termination}")
+    print(f"[PPO] 网络={list(ppo.get('net_arch', (512, 256)))} "
+          f"n_steps={ppo.get('n_steps')} batch={ppo.get('batch_size')} "
+          f"epochs={ppo.get('n_epochs')} target_kl={ppo.get('target_kl')} "
+          f"log_std_init={ppo.get('log_std_init')} "
+          f"norm_reward={ppo.get('norm_reward')}")
+    print()
+    print(format_curriculum(stages))
+    print(flush=True)
+
+    trainer = Trainer(cfg, rundir, run=run, ppo=ppo, n_envs=n_envs)
+    results = []
+    warm: str | None = None
+    t_start = time.time()
+    for i, stage in enumerate(stages, start=1):
+        print(f"[课程] >>> 第 {i}/{len(stages)} 级 '{stage.name}' ({stage.label}) "
+              f"{stage.summary()}", flush=True)
+        venv = trainer.make_env(stage, warm_start=warm)
+        t0 = time.time()
+        try:
+            _model, stats = trainer.train_stage(
+                stage, venv, warm_start=warm,
+                tensorboard_log=str(rundir.tensorboard),
+            )
+        finally:
+            venv.close()
+        wall = time.time() - t0
+        path = rundir.checkpoints / f"{stage.name}_final.zip"
+
+        results.append(_result(stage, stats, wall, path, cfg))
+        warm = str(path)
+        print(f"[课程] <<< '{stage.name}' 成功率={stats.success_rate:.1%} "
+              f"摔倒率={stats.fall_rate:.1%} 均回报={stats.mean_return:.1f} "
+              f"用时={format_duration(wall)}", flush=True)
+
+    # 末级权重另存为 model_final，方便 play 直接找（连同它的归一化统计与地形记录）
+    if results and Path(results[-1].model_path).is_file():
+        last = Path(results[-1].model_path)
+        copies = [
+            (last, Path(str(rundir.final_model) + ".zip")),
+            (last.with_name(last.stem + "_vecnormalize.pkl"), rundir.vecnormalize),
+            (env_json_path(last), env_json_path(rundir.final_model)),
+        ]
+        for src, dst in copies:
+            if src.is_file():
+                shutil.copy2(src, dst)
+
+    final_model = results[-1].model_path if results else ""
+    payload: dict[str, Any] = {
+        "env_config": asdict(cfg),
+        "obs_config": asdict(cfg.obs),
+        "reward_config": asdict(cfg.reward),
+        "final_model": final_model,
+        "wall_seconds": round(time.time() - t_start, 1),
+    }
+    summary = rundir.write_summary(payload)
+    write_summary(summary, stages, results, payload)
+
+    print()
+    print(format_curriculum(stages, results))
+    print(f"\n产物: {rundir.root}")
+    print(f"  模型: {rundir.root / 'model_final'}.zip")
+    print(f"  汇总: {summary}")
+    print("\n下一步:")
+    print(f"  .venv\\Scripts\\python.exe scripts\\play.py --run {name} --mode eval")
+    print(f"  .venv\\Scripts\\python.exe scripts\\play.py --run {name} --mode gif")
+    return 0
 
 
 if __name__ == "__main__":

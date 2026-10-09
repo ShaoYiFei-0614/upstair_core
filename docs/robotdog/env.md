@@ -133,8 +133,7 @@ x 的**阶梯函数**），**不是** `_height_reference()`：
 `lift_target = max(foot_lift_target, foot_lift_step_ratio * stair.step_height)`。
 
 * 理由：`foot_lift_target=0.08` 是**目标下限**而不是目标本身。脚下参照面口径下，脚掌必须
-  **越过**台阶高度才能跨过去（`experience.md` §6.1），写死 0.08 让 8 cm 台阶上目标完全饱和
-  （`experience.md` §2.3）。
+  **越过**台阶高度才能跨过去，写死 0.08 让 8 cm 台阶上目标完全饱和（`experience.md` §2.3）。
 * 5 cm 时 `max(0.08, 1.4×0.05=0.07) = 0.08`，与原来的常数目标**逐位相同**，
   所以已经学会的 easy 段不会回退（源码注释也在说这件事）。
 * **否决方案**：直接把 `foot_lift_target` 调大。19 cm 会要求 0.266 m 的抬脚高度，超出腿的

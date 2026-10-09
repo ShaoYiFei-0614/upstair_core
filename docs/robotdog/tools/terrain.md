@@ -74,7 +74,7 @@ size = ((self.top_landing + ov) / 2.0, hy, top / 2.0)
 
 **被否决的方案**：
 
-* 让 crest 从 `up_end_x - tread` 起算（等价于手工改 `up_end_x`）—— 否决：`up_end_x` 是**成功判据**与解析剖面共用的量（`env.py:424, 431`），改它会同时移动终点线，把一个接触问题变成任务定义问题。
+* 让 crest 从 `up_end_x - tread` 起算（等价于手工改 `up_end_x`）—— 否决：`up_end_x` 是**成功判据**与解析剖面共用的量（`env.py:302-307` 的 `_success_reached()`），改它会同时移动终点线，把一个接触问题变成任务定义问题。
 * 给 crest 加一点 z 偏移（例如 `+1e-4`）以消除共面 —— 否决：制造一个肉眼不可见但物理上真实的台阶，脚会被这个伪台阶绊住；而且解析剖面与射线高度会对不上。
 * 用 `margin` / `gap` 之类的接触参数（`solref`、`margin`）绕开 —— 否决：那是全局接触参数，会改变**所有**接触（含脚-地面），副作用远超问题本身。
 * 干脆不要顶层平台（`top_landing = 0`）—— 否决：那样楼梯顶部就是 0.40 m 悬崖，成功判据永远无法满足（见 §3.5 对 `top_landing` 的解释）。
@@ -127,7 +127,9 @@ return max(0.0, self.crest_height - (j + 1) * self.step_height)
 
 **它是阶跃的**（在 `start_x + i*tread` 处跳变，在 `up_end_x + top_landing` 处从 crest 直接掉到 0），这有两层后果，都必须知道：
 
-1. **奖励侧的 `foot_clearance` 建立在它之上**。`robotdog/env.py:529` 的 `foot_clearance` 属性、`:543` 的 `np.array([self.stair.height_at(float(xi)) for xi in arr])` —— 也就是「每只脚相对它**脚下那个 x** 的地形高」这个量，参照面就是 `height_at`。脚跨过立面的一瞬间参照面跳一整级，抬脚高度（clearance）会**逐帧翻转**。同类问题在 `env.py:932, 944, 959`（支撑面参照 / 终止判据的高度参照）也会出现 —— 这正是 `experience.md` §1.4、§3.3 记录的「幽灵摔倒」与「`base_height` 参照面也是阶跃的」两个坑。本模块**只是把事实提供出去**，改参照口径是环境层的事（`terminate_height_ref="support"`）。
+1. **奖励侧的抬脚高度建立在它之上**。`robotdog/env.py:367` 的 `foot_clearance` 属性走
+   `:376` 的 `_terrain_height()`、`:381` 的 `np.array([self.stair.height_at(float(xi)) for xi in arr])`
+   —— 也就是「每只脚相对它**脚下那个 x** 的地形高」这个量，参照面就是 `height_at`。脚跨过立面的一瞬间参照面跳一整级，抬脚高度（clearance）会**逐帧翻转**。同类问题在 `env.py:603`、`:615`（`_support_height()` / `_support_height_mean()` 的支撑面参照）与 `:306`（成功判据）也会出现 —— 这正是 `experience.md` §1.4、§3.3 记录的「幽灵摔倒」与「`base_height` 参照面也是阶跃的」两个坑。本模块**只是把事实提供出去**，改参照口径是环境层的事（`terminate_height_ref="support"`）。
 2. **它和几何是同一份真值**。`step_blocks()` 与 `height_at()` 必须永远同步 —— 这也是 §3.3 那个「并集不变」的修法为何重要的原因：改几何而不改剖面（或反之）会让奖励说的高度与实际地形不同。
 
 **被否决的方案**：从 MuJoCo 射线实时查高度（`raycast_heights`）作为奖励参照 —— 否决：(a) 每次调用要做 4 次射线，而 `foot_clearance` 在**每一步**都要算；(b) 射线会被机器人自己的腿挡住（`geomgroup=None`），得到「脚踩在自己小腿上」的高度；(c) 解析式是**精确**的，射线是近似的（浮点 + 面元）。
@@ -186,7 +188,7 @@ RuntimeError: MJCF compile failed; dumped to <...>\.generated\failed_scene.xml
 
 字段上方的注释写得很明确：`Must be > 0 for the terrain to be succeedable at all: StairSpec.height_at returns 0 past up_end_x + top_landing, and the success test requires the base to be past up_end_x *and* sitting at crest height. With the old default of 0.0 a bare StairSpec() was a 0.40 m cliff at the crest, so Go2StairsEnv() could never report a success.`
 
-即：成功判据是「base 越过 `up_end_x` **且**脚下地形高 ≈ `crest_height`」（`robotdog/env.py:429-432`）。而 `height_at` 在 `up_end_x + top_landing` 之后返回 0。若 `top_landing = 0.0`，越过 `up_end_x` 的瞬间地形高度就是 0 —— 那里是一个 0.40 m 悬崖，`Go2StairsEnv()` 永远报不出成功。
+即：成功判据是「base 越过 `up_end_x` **且**脚下地形高 ≈ `crest_height`」（`robotdog/env.py:302-307` 的 `_success_reached()`）。而 `height_at` 在 `up_end_x + top_landing` 之后返回 0。若 `top_landing = 0.0`，越过 `up_end_x` 的瞬间地形高度就是 0 —— 那里是一个 0.40 m 悬崖，`Go2StairsEnv()` 永远报不出成功。
 
 **被否决的方案**：保持 `0.0` 并在成功判据里放宽「高度必须等于 crest」—— 否决：那会在狗**掉下悬崖**的那一刻宣布成功（它确实越过了 `up_end_x`），把成功判据变成失败判据。
 
@@ -362,9 +364,11 @@ StairSpec(step_height, tread, ..., name_prefix)
 高度剖面的消费者（环境层，全部走 `env.stair.height_at`）：
 
 ```
-env.py:484   terrain_height            = self.stair.height_at(float(self.base_pos[0]))
-env.py:529   foot_clearance (property)  →  env.py:543  [self.stair.height_at(float(xi)) for xi in arr]
-env.py:932, 944, 959  支撑面/判定用的每足地形高  [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
+env.py:358   terrain_height_under_base  = self.stair.height_at(float(self.base_pos[0]))
+env.py:367   foot_clearance (property)  →  env.py:376 _terrain_height() → :381 [self.stair.height_at(float(xi)) for xi in arr]
+env.py:603   _support_height()          = min(每足地形高)      [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
+env.py:615   _support_height_mean()     = mean(每足地形高)
+env.py:306   成功判据                   = self.terrain_height_under_base >= self.stair.crest_height - 1e-9
 ```
 
 随机化链（`reset()` 时）：
@@ -454,21 +458,19 @@ pyramid : 平地 → n_up 级上升 → 平的 crest → n_down 级下降 → �
 
 | 位置 | 使用的符号 | 依赖方向为什么是这样 |
 | --- | --- | --- |
-| `robotdog/go2_model.py:42` | `TERRAIN_GEOM_GROUP` | 生成地面 plane 时也要打同一个 group（`default_floor_geom`），否则测距看不到地面 |
-| `robotdog/go2_model.py:334` | `build_terrain_xml(self.stair)` | 拼场景字符串需要地形片段；**编译**在 `go2_model.py` 里做，本模块只产字符串 |
-| `robotdog/env.py:43` | `StairSpec, build_terrain_xml` | 环境层持有 spec 并驱动编译 |
-| `robotdog/env.py:277/369` | `StairSpec()` 默认值、`set_stair` | 课程切阶段时换 spec 并重编译 |
-| `robotdog/env.py:424/431/432` | `up_end_x`, `crest_height` | 出生点与**成功判据** |
-| `robotdog/env.py:484/543/932/944/959` | `height_at` | 地形高、`foot_clearance`、支撑面参照（见 §3.5） |
-| `robotdog/curriculum.py:27` | `StairSpec, demo_stairs_spec, flat_spec` | 课程各阶段**配置**由构造器拼出（`:143` 平地、`:153/163/173` 三档台阶） |
-| `robotdog/evaluate.py:29` | `StairSpec, TerrainRandomization, demo_stairs_spec, flat_spec` | 评估集：训练用档 + 未见过档（`:59-75`）+ 随机档（`:87`，⚠ 见 §9） |
-| `robotdog/render.py:32` | `StairSpec` | 渲染 HUD 要显示 `tread` / `crest_height`（`:263`） |
-| `scripts/train.py:643` | `stage.spec.crest_height` | 课程进度打印 |
-| `scripts/render_checkpoint.py:64, 466, 574`、`scripts/eval.py:147` | `StairSpec, flat_spec` | 脚本层用工具层构造地形 |
+| `robotdog/go2_model.py:42` | `TERRAIN_GEOM_GROUP` | 生成地面 plane 时也要打同一个 group（`default_floor_geom`，`:239/250`） |
+| `robotdog/env.py:48` | `StairSpec, build_terrain_xml` | 环境层持有 spec 并驱动编译（`_build_model()` 在 `:250` 调 `build_terrain_xml(self.stair)`） |
+| `robotdog/env.py:358/381/603/615` | `height_at` | 地形高、`foot_clearance`、支撑面参照（见 §3.5） |
+| `robotdog/env.py:306` | `crest_height` | 出生点与**成功判据**（`terrain_height_under_base >= crest_height - 1e-9`） |
+| `robotdog/curriculum.py:23` | `StairSpec, demo_stairs_spec, flat_spec` | 参考课程表由构造器拼出（`default_curriculum()` 里 `:94` 平地、`:126` 五档台阶） |
+| `robotdog/config.py:35/205` | `demo_stairs_spec, flat_spec` | `config_to_stages()` 按 `config.yaml` 造阶段表 —— **当前真正的课程构造路径**（见 `docs/robotdog/config.md`） |
+| `robotdog/policy.py:18/301` | `StairSpec, demo_stairs_spec, flat_spec` | `stair_from_height()` 由高度造地形，服务 `play.py` |
+| `robotdog/training.py:40` | `StairSpec` | 建环境/向量环境时透传 spec |
+| `scripts/play.py:315` | `stair.crest_height` | 评估/渲染的头部信息打印 |
 
 **为什么方向是「环境层 ← 工具层」而不是反过来**：本模块只认识「参数 → 几何/高度」，不需要知道谁在用它 —— 它给 `env.py` 提供 `height_at`，但从不 `import env`。这样奖励口径、终止口径、评估口径**共用同一个高度真值**，而三者的**用法**差异留在环境层（例如 `terminate_height_ref="support"` 是 `env.py` 的选择，不是 `height_at` 的选择）。
 
-**与 `robotdog/tools/touch.py` 的关系**：`touch.py` 的 `geomgroup` 掩码之所以能工作，完全依赖本模块把**所有**地形几何（含地面）打进 `TERRAIN_GEOM_GROUP`；`touch.py:53` 直接用 `from robotdog.tools.terrain import TERRAIN_GEOM_GROUP` 构造掩码。这是工具层**内部**唯一一条依赖（`touch → terrain`），也是 `robotdog/tools/__init__.py` 里导入顺序天然正确的原因。
+**曾经的 `robotdog/tools/touch.py` 依赖**：历史上 `touch.py` 的前向测距靠 `from robotdog.tools.terrain import TERRAIN_GEOM_GROUP`（`touch.py:53`）构造「只对地形生效」的射线掩码，那是工具层**内部**唯一一条依赖。触觉/测距整套逻辑已随「盲走楼梯」重构删除，现在工具层内部**没有任何跨模块依赖**，`TERRAIN_GEOM_GROUP` 的唯一消费者是 `robotdog/go2_model.py:42`（给地面 plane 打同一组，物理上不再需要它，但保留可以让地形与地面在渲染器里同组可见）。
 
 **文档路径说明**：本模块的规范导入路径是 `robotdog.tools.terrain`（文件在 `robotdog/tools/terrain.py`）。`experience.md` §1.1 与 §1.2 写作 `terrain.py`，指的是同一个文件；仓里**没有**顶层 `robotdog/terrain.py`。
 
@@ -478,7 +480,7 @@ pyramid : 平地 → n_up 级上升 → 平的 crest → n_down 级下降 → �
 * geomgroup 默认隐藏导致「爬空气」，见 `experience.md` §1.2。
 * 零高度台阶无法编译，见 `experience.md` §1.3。
 * 阶跃的 `height_at` 造成幽灵摔倒，以及 `base_height` 参照面同样阶跃，见 `experience.md` §1.4、§3.3。
-* 与台阶高相关的奖励目标写死（抬升目标）以及参照面口径问题，见 `experience.md` §2.3、§6.1。
+* 与台阶高相关的奖励目标写死（抬升目标）以及参照面口径问题，见 `experience.md` §2.3、§3.3，以及能力边界 §6。
 * 课程各阶段的台阶高度/踏面/级数与毕业阈值，见 `train.md` §1（本文档不重复其结论）。
 
 ## 9. 已知限制与坑
@@ -488,9 +490,11 @@ pyramid : 平地 → n_up 级上升 → 平的 crest → n_down 级下降 → �
   （并附带 `Element name 'stair_up0', id 0, line 2`）；经 `go2_model.py:428` 包装后调用方看到
   `RuntimeError: MJCF compile failed; dumped to <...>\.generated\failed_scene.xml`。
   平地必须用 `flat_spec()` / `flat_spec(n_up=0, n_down=0, ...)`（`experience.md` §1.3）。
-* **`TerrainRandomization` 上没有 `sample_spec` 方法**，它是模块级函数。`robotdog/evaluate.py:87` 写成 `spec = rand.sample_spec(rng)`，实测会抛
-  `AttributeError: 'TerrainRandomization' object has no attribute 'sample_spec'`。
-  正确写法是 `sample_spec(rng, rand)`。触发路径：`robotdog/evaluate.py:100-101` 只在 `only == "random"` 或 `--n-random > 0` 时传非零数量 → `scripts/eval.py:308` 的 `all_terrains(include_random=..., ...)`；默认 `only="all"` 传 0，`range(0)` 不会执行到这行，所以默认评估路径不会炸。
+* **`TerrainRandomization` / `sample_spec` 在当前仓库里没有使用者**。历史上
+  `robotdog/evaluate.py:87` 把它写成了方法调用 `spec = rand.sample_spec(rng)`，那是一处
+  **必炸**的缺陷（`AttributeError: 'TerrainRandomization' object has no attribute
+  'sample_spec'`；正确写法是模块级 `sample_spec(rng, rand)`）。`evaluate.py` 已随重构
+  删除，这个调用点不存在了；但**随机化本身也没有回归覆盖**，改它之前请先手写一遍调用。
 * **随机化只产生金字塔**：`sample_spec` 里 `n_down = n_up`（源码 docstring `pyramid: up then down`），无法采样「只上不下」的随机楼梯。
 * **`height_at` 是阶跃的**：在 `start_x + i*tread` 与 `up_end_x + top_landing` 处跳变。任何把单点 `height_at(base_x)` 当参照面的量都会在跨越立面时**跳一整级**，逐帧翻转（`experience.md` §1.4、§3.3）。
 * **`height_at` 与几何必须同步**：`step_blocks()` 用 `CREST_SEAM_OVERLAP` 扩展 crest/top 块，但 `height_at` **不读**这个常量 —— 正确性依赖于「两个实心块的并集不变」。若有人把这个常量改成 > 1（回伸过多、block 越过前一级顶面）或让 crest 高度与最后一级踏面不等，剖面与几何就会分叉。
@@ -499,7 +503,7 @@ pyramid : 平地 → n_up 级上升 → 平的 crest → n_down 级下降 → �
 * **`step_blocks()` 的下降段有零高度守门，上升段没有**：`if top <= 1e-9: continue` 只作用于 `_down{j}`；`n_up > 0` 且 `step_height = 0` 时仍会生成非法 block（见上）。
 * **`to_xml()` 返回的串不带换行前缀**，而 `build_terrain_xml()` 会加一个 `"\n"`。直接调用 `to_xml()` 拼进场景时若忘记补换行，生成的 MJCF 会把 `<geom>` 与前一个标签挤在同一行（MuJoCo 仍能解析，但转储文件没法读）。
 * **`build_terrain_xml()` 对平地返回空串**：调用方不能用它判断「地形是否就绪」，只能判断「是否生成了 geom」。
-* **`StairSpec` 是可变 dataclass**（非 `frozen`），可以就地改字段；共享实例被改动会让报告里的 spec 与实际几何不一致（`experience.md`/`env.py:1198` 会把 `crest_height` 打进 info）。随机化刻意用 `replace()` 避免这一点。
+* **`StairSpec` 是可变 dataclass**（非 `frozen`），可以就地改字段；共享实例被改动会让报告里的 spec 与实际几何不一致（`experience.md`/`env.py:795` 会把 `crest_height` 打进 info）。随机化刻意用 `replace()` 避免这一点。
 * **`width` 必须为正**：`width <= 0` 会让 `hy = width/2 <= 0`，同样触发 `size must be positive` 编译失败。
 * **`n_down * step_height > crest_height` 时下降段不会到地面**：多出的级被 `top <= 1e-9` 守门跳过，`height_at` 也在 `j >= n_down` 处返回 0，二者一致 —— 但这意味着「下降段级数」可以被静默截断，不报错。
 

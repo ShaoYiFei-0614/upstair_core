@@ -9,7 +9,8 @@
 
 ### 1.1 固定六级课程
 
-`robotdog/curriculum.py` 的 `default_curriculum()` 返回恰好六级（`STAGE_HEIGHTS_CM`）：
+`config.yaml` 的 `curriculum` 段（经 `robotdog/config.py:config_to_stages()` 展开）
+返回恰好六级（模板与 `robotdog/curriculum.py:STAGE_HEIGHTS_CM` 一致）：
 
 | 阶段 | 台阶 | 踏面 | 级数 | 预算 | 学习率 |
 | --- | --- | --- | --- | --- | --- |
@@ -28,7 +29,7 @@
 
 ```
 scripts/train.py
-  curriculum.default_curriculum() → [StageSpec × 6]
+  config_to_stages(raw) → [StageSpec × 6]
   for stage in stages:
       venv   = make_vec_env(stage.spec, n_envs, cfg, seed)   # 地形换成这一级
       model  = build_ppo(venv, learning_rate=stage.learning_rate, ...)
@@ -38,7 +39,7 @@ scripts/train.py
       RunDir.save_model(model, f"checkpoints/{stage.name}_final", venv)
 ```
 
-* **逐级 warm-start**：每一级在上一级的权重上继续练。`--resume <zip>` 可以从任意权重接。
+* **逐级 warm-start**：每一级在上一级的权重上继续练（`PPO.set_parameters`）。
 * **换地形只能在阶段边界**。`set_stair` 会重编译 MJCF（约 250 ms/子环境），
   在 rollout 中间换会让当次观测与状态不一致，所以切阶段一定发生在 `learn()` 返回之后。
 * PPO 的更新粒度 = `n_steps 256 × n_envs 8 = 2048` 步。**每一级至少有 48 次以上更新**，
@@ -47,10 +48,10 @@ scripts/train.py
 
 ### 1.3 回调
 
-* `ProgressCallback`：**只在有新回合结束、且距上次打印 ≥ `--log-interval` 次更新时**打印
+* `ProgressCallback`：**只在有新回合结束、且距上次打印 ≥ `run.log_every` 次更新时**打印
   一行 `EpisodeStats.format_line()`。早期版本按 `n_calls % log_interval` 无条件打印，
   日志刷屏且看不到回合统计。
-* `CheckpointCallback`：每 `--save-every` 步存
+* `CheckpointCallback`：每 `run.save_every` 步存
   `checkpoints/<阶段>/<阶段>_<步数>_steps.zip` + 同名 `_vecnormalize.pkl`。
 
 ### 1.4 向量环境
@@ -92,16 +93,21 @@ flat      平地        0.0c   50c   0     0.00m  100000   1.5e-4  100.0%   0.0%
 ```
 runs/<名字>/
   checkpoints/<阶段>_final.zip                  每级结束的权重
+  checkpoints/<阶段>_final_vecnormalize.pkl     与它成对的观测统计
+  checkpoints/<阶段>_final_env.json             该权重训练时的地形（台阶高）+ 完整配置
   checkpoints/<阶段>/<阶段>_<步数>_steps.zip     周期检查点
-  model_final.zip                              最后一级的交付权重
+  model_final.zip                              最后一级的交付权重（三件套之一）
   model_final_vecnormalize.pkl                 与它成对的观测/奖励归一化统计
+  model_final_env.json                         地形记录（play 默认按它选楼梯）
   summary.json                                 课程定义 + 每级结果 + 全部配置
   tensorboard/
 ```
 
+`<阶段>_final_env.json` 是**每个 checkpoint 各一份**的，因为每一级的地形都不一样：
+只有最后一级是 15 cm，`checkpoints/stair9_final.zip` 是 9 cm。
 `summary.json` 的键：`stages`（六级定义）、`results`（每级实测）、`env_config`、
 `obs_config`、`reward_config`、`total_timesteps`、`wall_seconds`、`final_model`。
-**`play.py` 就是靠它恢复配置的**，所以搬动权重时不要漏掉它。
+**`play.py` 靠 env.json 与它恢复配置**，所以搬动权重时不要漏掉这两类文件。
 
 ---
 
@@ -109,16 +115,17 @@ runs/<名字>/
 
 ### 3.1 冒烟验证：流水线是通的
 
-`--total-timesteps 12000 --n-envs 2`（每级约 2,000 步）跑完六级，45 秒：
+用一份每级 2,000 步的配置（`.tmp/smoke_config.yaml`，`curriculum.timesteps: 2000`、
+`env.n_envs: 2`、`ppo.net_arch: [64, 64]`）跑完六级，约 35 秒：
 
 | 阶段 | 步数 | 采样成功率 | 摔倒率 | 均回报 |
 | --- | --- | --- | --- | --- |
-| flat | 888 | 100.0% | 0.0% | 332.33 |
-| stair3 | 2,222 | 46.2% | 53.8% | 505.89 |
-| stair6 | 2,222 | 0.0% | 66.7% | 127.08 |
-| stair9 | 2,222 | 0.0% | 50.0% | 291.29 |
-| stair12 | 2,222 | 0.0% | 33.3% | -150.24 |
-| stair15 | 2,224 | 0.0% | 0.0% | -556.24 |
+| flat | 2,000 | 100.0% | 0.0% | 330.87 |
+| stair3 | 2,000 | 50.0% | 40.0% | 525.34 |
+| stair6 | 2,000 | 0.0% | 80.0% | 236.25 |
+| stair9 | 2,000 | 0.0% | 0.0% | 101.56 |
+| stair12 | 2,000 | 0.0% | 0.0% | 35.75 |
+| stair15 | 2,000 | 0.0% | 0.0% | -39.04 |
 
 ⇒ 流水线、回调、存档、`summary.json`、`play.py` 两种模式全部验证通过。
 **这些数字只证明管道通，不证明训练有效** —— 每级只有约 1~8 次 PPO 更新。

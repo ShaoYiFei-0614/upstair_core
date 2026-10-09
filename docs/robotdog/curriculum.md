@@ -211,8 +211,10 @@ def format_seconds(seconds: float) -> str: ...
 
 ```
 scripts/train.py
-  Curriculum.default(total_timesteps=…)
-      └─ default_curriculum() → [StageSpec × 6]
+  config_to_stages(raw)                      # config.yaml 的 curriculum 段
+      └─ flat_spec / demo_stairs_spec → [StageSpec × 6]
+         （Curriculum.default() / default_curriculum() 是库内等价的旧入口，
+            当前 CLI 不再调用它，见 §9）
   Curriculum.run(Trainer(), resume_from=…, summary_path=…, meta={env_config, obs_config, reward_config})
       for stage in stages:
           venv   = trainer.make_env(stage, warm_start=…)      # 重编译 MJCF
@@ -248,7 +250,7 @@ VecMonitor 把 info["episode"] = {"r": …, "l": …} 挂在回合结束那一�
 | 默认总预算 | `1,350,000` 步 | `100k + 5 × 250k` |
 | 学习率表 | `[1.5e-4, 1.5e-4, 1.2e-4, 1.0e-4, 8e-5, 6e-5]` | 索引与 `STAGE_HEIGHTS_CM` 对齐 |
 | `EpisodeStats.window` | `50` | 滑动窗口长度 |
-| 阶段名 | `flat`、`stair3`、`stair6`、`stair9`、`stair12`、`stair15` | `--from-stage stair6` 用的就是这些名字 |
+| 阶段名 | `flat`、`stair3`、`stair6`、`stair9`、`stair12`、`stair15` | 也是 `checkpoints/<名字>_final.zip` 的文件名；由 `config_to_stages()` 按高度推导 |
 
 实测 `default_curriculum()` 展开：
 
@@ -293,8 +295,15 @@ robotdog/curriculum.py  ────►  scripts/train.py  (实现 StageTrainer�
 
 ## 9. 已知限制与坑
 
-* **`Curriculum.run()` 没有断点续训**。`--resume` 只影响**第一级**的 warm start；
-  如果第三级跑到一半进程被杀，只能 `--from-stage stair9 --resume <第二级权重>` 手工接。
+* **`Curriculum.run()` 没有断点续训**。进程在第三级中途被杀，就只能从**该级之前的
+  checkpoint 手工重建**（当前 CLI 没有 `--resume` / `--from-stage` 一类入口，
+  课程表与预算是 `config.yaml` 的 `curriculum` 段一次性给死的）。
+  要把「从某个权重接着练」加回来，得在 `scripts/train.py` 里新接一条路径。
+* **`default_curriculum()` / `Curriculum.default()` 现在没有调用方**。课程的构造权已经
+  交给 `robotdog/config.py:config_to_stages()`（读 `config.yaml` 的 `curriculum` 段，
+  见 `docs/robotdog/config.md` §3.4）。这两个入口保留在库里，是因为它们自带
+  「1:2.5 权重分配 + 学习率表」这套**参考实现**，配置侧可以选择调用它们或自建
+  `StageSpec`。改课程默认值时，两处都要看。
 * **阶段切换期间没有验证**。每级结束后只报训练期的滑动窗口统计（采样动作口径），
   不是确定性评估；要确定性成功率请用 `scripts/play.py --mode eval`。
 * `default_curriculum` 的 `tread` / `n_up` 会**同时**作用于平地与所有台阶阶段，

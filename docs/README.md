@@ -1,14 +1,15 @@
 # `docs/` —— 模块设计文档
 
 本目录为 `robotdog/` 下的**每一个 `.py`** 提供一份设计文档，**目录结构与
-`robotdog/` 一一对应**：`robotdog/` 下共 11 个 `.py`（7 个在顶层，4 个在
-`tools/`），因此本目录共 11 份模块文档 + 本索引。
+`robotdog/` 一一对应**：`robotdog/` 下共 12 个 `.py`（8 个在顶层，4 个在
+`tools/`），因此本目录共 12 份模块文档 + 本索引。
 
 ```
 docs/
   README.md                 本索引 + 文档规范（就是你正在读的这份）
   robotdog/
     __init__.md             包入口
+    config.md               ★ config.yaml → EnvConfig / 课程阶段表
     env.md                  ★ 核心环境（盲走：无触觉、无测距）
     gait.md                 trot 步态先验
     go2_model.md            Go2 MJCF 组装与场景编译

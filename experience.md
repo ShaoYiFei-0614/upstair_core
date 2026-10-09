@@ -342,7 +342,78 @@ group 2/3。
 
 ---
 
-## 7. 已知但**故意不改**的注释
+## 7. 配置化：把超参从命令行搬进 `config.yaml` 之后踩到的坑
+
+用户要求「不要让过多参数可调，相机和 GIF 渲染参数完全可以固定；PPO 等关键超参用
+`config.yaml` 配置，不要用 CLI 输入」。改完之后的四个坑：
+
+### 7.1 ⭐ 重建模型必须用**训练时那一套网络结构**
+
+`load_policy()` 原本按默认 `DEFAULT_NET_ARCH = (512, 256)` 建网再
+`set_parameters(checkpoint)`。只要训练时用的不是默认结构（比如配置里写
+`ppo.net_arch: [64, 64]`），加载时必炸：
+
+```
+RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy:
+    size mismatch for mlp_extractor.policy_net.0.weight: copying a param with shape
+    torch.Size([64, 460]) from checkpoint, the shape in current model is
+    torch.Size([512, 460]).
+    size mismatch for action_net.weight: copying a param with shape torch.Size([12, 64])
+    from checkpoint, the shape in current model is torch.Size([12, 256]).
+```
+
+修法：新增 `robotdog/policy.py:policy_arch(model_path)`，从 SB3 `.zip` 的 `data` 条目里读
+`policy_kwargs.net_arch`（**是普通 JSON** `{"pi": [...], "vf": [...]}`，不需要解
+`":serialized:"` 的 base64 pickle），`load_policy` 用它建网：
+`arch = policy_arch(model_path) or DEFAULT_NET_ARCH`。
+
+这是「配置化」放大出来的问题：结构以前写死在两个地方，恰好一致；现在配置能改它，
+两处就必须真的对齐。
+
+### 7.2 `RunDir.__init__` 里 eager `mkdir` 会让「目录已存在」的保护永远为真
+
+`train.py` 想拦住「重复用同一个 `--run-name` 覆盖上次结果」：
+
+```python
+rundir = RunDir(name)
+if rundir.root.exists():
+    raise SystemExit(f"输出目录已存在：{rundir.root}")
+```
+
+但 `RunDir.__init__` 自己就把 `root/checkpoints/tensorboard/artifacts` 建好了 ⇒
+**第一次运行就报「输出目录已存在」**，且退出时留下四个空目录（第二次运行照样报）。
+修法：`__init__` 只算路径不建目录，新增 `ensure()` 供调用方在检查之后显式创建；
+`save_model` / `write_summary` / `CheckpointCallback` 自己 `mkdir(parents=True)`。
+
+### 7.3 推理时只建 1 个环境 ⇒ SB3 的 mini-batch 警告
+
+`batch_size=512` 与 `n_steps × n_envs` 不整除时 SB3 在 `PPO.__init__` 里 warn：
+
+```
+UserWarning: You have specified a mini-batch size of 512, but because the
+RolloutBuffer is of size `n_steps * n_envs = 256`, after every 0 untruncated
+mini-batches, there will be a truncated mini-batch of size 256
+```
+
+训练时是 8 环境（2048，整除）；**推理时 `load_policy` 只建 1 个环境**（256，不整除），
+于是每次 `play.py` 都刷一条。对只做 `predict` 的场景这条警告没有意义，在 `build_ppo`
+里用 `warnings.catch_warnings()` + `filterwarnings("ignore", message=".*mini-batch size.*")`
+压掉。
+
+### 7.4 地形默认值必须**每个 checkpoint 各记一份**
+
+`play.py` 原本在「没显式给 `--stage-height-cm`」时用 3 cm 默认楼梯。但训练产物里每条
+`checkpoints/<阶段>_final.zip` 是在**不同台阶**上训出来的（只有最后一级是 15 cm），
+用错地形评估等于在测一个它没学过的高度。
+
+修法：训练时每个阶段写一份 `<模型>_env.json`（`policy.save_env_json`），里面
+`report.step_height` 记下该权重的地形；`play.py` 用
+`step_height_from_model()` 读它，并打印「地形来自权重自带记录」。找不到时（老权重）
+才退回默认值 —— 这一点写进了 `README.md` §5 的已知限制。
+
+---
+
+## 8. 已知但**故意不改**的注释
 
 * `robotdog/go2_model.py` 的注释说 `HOME_JOINT_ANGLES` 来自 `go2.xml` 的
   `<keyframe name="home">`。vendored XML 实际是

@@ -89,6 +89,39 @@ JSON 往返会把元组变成 list。`EnvConfig.kp` / `kd` 和 `GaitParams` 里�
 `ValueError: Error: size 2 must be positive in geom`。平地必须走
 `flat_spec(n_up=0, n_down=0, ...)`（见 `experience.md` §1.3）。
 
+### 3.6 重建策略必须读**权重自带**的网络结构，而不是默认值
+
+`load_policy()` 要先把 PPO 建出来再 `set_parameters()`。如果按仓里默认的
+`DEFAULT_NET_ARCH = (512, 256)` 建网，去加载一个用 `ppo.net_arch: [64, 64]` 训出来的
+权重，会在装载 state_dict 时炸：
+
+```
+RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy:
+    size mismatch for mlp_extractor.policy_net.0.weight: copying a param with shape
+    torch.Size([64, 460]) from checkpoint, the shape in current model is
+    torch.Size([512, 460]).
+    size mismatch for action_net.weight: copying a param with shape torch.Size([12, 64])
+    from checkpoint, the shape in current model is torch.Size([12, 256]).
+```
+
+所以 `policy_arch()` 从 `.zip` 的 `data` 条目里把 `policy_kwargs.net_arch` 读出来，
+`load_policy()` 用 `arch = policy_arch(model_path) or DEFAULT_NET_ARCH`。
+**这条是「超参搬进 `config.yaml`」之后才暴露的**：结构以前写死在两处、恰好一致，
+现在配置能改它，两处就必须真的对齐（见 `experience.md` §7.1）。
+
+### 3.7 每个 checkpoint 各记一份地形，而不是只记整条课程
+
+`summary.json` 记的是**整条课程**的配置（最后一级 15 cm），而每个
+`checkpoints/<阶段>_final.zip` 是在**各自的台阶**上训出来的。用最后一级的地形去评估
+中间 checkpoint，等于在测一个它没学过的高度。
+
+所以 `train.py` 每级额外写一份 `<模型>_env.json`（`save_env_json()`），report 段里带
+`step_height` / `stage`；`play.py` 用 `step_height_from_model()` 优先读它。
+**被否决的方案**：把 `step_height` 塞进 `summary.json` —— 那是一份**每次运行只有一份**
+的文件，无法表达「每级不同」；也否决了「按 `--stage` 参数猜」——中间 checkpoint
+搬出 `runs/` 之后就没有阶段信息了。老权重没有 `_env.json` 时返回 `None`，
+`play.py` 退回默认 3 cm（见 `README.md` §5）。
+
 ## 4. 公开 API
 
 ```python
@@ -108,12 +141,18 @@ class ObsNorm:
 
 def env_config_from_summary(summary_path: str | Path) -> EnvConfig: ...
 def observation_dim(model_path: str | Path) -> int | None: ...
+def policy_arch(model_path: str | Path) -> tuple[int, ...] | None: ...
 def env_config_for_model(model_path: str | Path) -> EnvConfig: ...
+def env_json_path(model_path: str | Path) -> Path: ...
+def save_env_json(model_path: str | Path, cfg: EnvConfig, *,
+                  step_height: float | None = None, stage: str = "") -> Path: ...
+def step_height_from_model(model_path: str | Path) -> float | None: ...
 def stair_from_height(height_cm: float | None, *, tread: float = 0.50,
                       n_up: int = 8) -> StairSpec | None: ...
 
 __all__ = ["ObsNorm", "Policy", "env_config_for_model", "env_config_from_summary",
-           "observation_dim", "stair_from_height"]
+           "env_json_path", "observation_dim", "policy_arch", "save_env_json",
+           "stair_from_height", "step_height_from_model"]
 ```
 
 语义与异常：
@@ -126,7 +165,18 @@ __all__ = ["ObsNorm", "Policy", "env_config_for_model", "env_config_from_summary
   三段；未知键被忽略（`_rebuild` 只保留 dataclass 有的字段），所以旧 `summary.json`
   里的废弃字段不会让它崩。`gait` 段用 `GaitParams.from_dict` 重建。
 * `observation_dim(model_path)` — **从不抛异常**，任何问题都返回 `None`。
+* `policy_arch(model_path)` — **从不抛异常**，返回 `(隐藏层宽度…)` 或 `None`。
+  读的是 `data` 里的 `policy_kwargs.net_arch`（普通 JSON `{"pi": [...], "vf": [...]}`，
+  `tuple` 或 `list` 都接受）；`net_arch` 只有一个 int 时返回 `(w,)`，非法值返回 `None`。
 * `env_config_for_model(model_path)` — 三条路径都失败时抛 `SystemExit`（带中文提示）。
+* `env_json_path(model_path)` — `Path("<stem>_env.json")`，与
+  `_vecnormalize.pkl` 同一命名规矩；**不检查文件是否存在**。
+* `save_env_json(model_path, cfg, *, step_height=None, stage="")` — 写
+  `{"env_config":…, "obs_config":…, "reward_config":…, "report": {"step_height":…,
+  "stage":…}}`（`json.dumps(indent=2, ensure_ascii=False)`），返回写入路径；
+  父目录不存在时自己 `mkdir(parents=True, exist_ok=True)`。
+* `step_height_from_model(model_path)` — 读 `report.step_height`（**单位 m**）；
+  文件不存在、JSON 坏、字段缺失或不可转 `float` 时一律 `None`（**从不抛异常**）。
 * `stair_from_height(height_cm, *, tread, n_up)` — `None` → `None`（沿用配置里的地形）；
   `<= 0` → `flat_spec(n_up=0, n_down=0, step_height=0.0, tread=tread)`；否则
   `demo_stairs_spec(step_height=height_cm/100, tread=tread, n_up=n_up, top_landing=1.20)`。
@@ -139,12 +189,19 @@ play.py
       _resolve_model(run)            → 找到 .zip
       _resolve_norm(.zip)            → 找到同名 *_vecnormalize.pkl
       env_config_for_model(.zip) ──┐
+      step_height_from_model(.zip) → play 的默认地形
                                    │
 env_config_for_model ──┬── summary.json 存在 → env_config_from_summary()
                        ├── <stem>_env.json 存在 → env_config_from_summary()
                        └── observation_dim() → _obs_config_for_dim() → EnvConfig(obs=…)
 
+train.py（每级存完权重之后）
+  policy.save_env_json(<阶段>_final.zip, cfg, step_height=…, stage=…)
+       → <阶段>_final_env.json（"report": {"step_height", "stage"}）
+  末级三件套 shutil.copy2 → model_final{.zip,_vecnormalize.pkl,_env.json}
+
 training.load_policy(model_path, cfg, stair)
+      → policy_arch(.zip) or DEFAULT_NET_ARCH   # 网络结构必须与训练时一致
       → 建 1 环境 DummyVecEnv（cfg 来自上面那条链）
       → PPO.load / set_parameters
       → ObsNorm.from_path(norm_path)      # 读裸 pickle 后立刻 del
@@ -153,6 +210,11 @@ training.load_policy(model_path, cfg, stair)
 play.Runner.predict(obs)
       → ObsNorm.normalize(obs) → PPO.predict(x, deterministic=True)
 ```
+
+`_zip_data()` 是 `observation_dim()` 与 `policy_arch()` 共用的底座：从 `.zip` 里取出
+`data` 条目（`.npz`），失败返回 `None`；`_deserialize()` 则负责把 SB3 存进去的值还原
+（含 `":serialized:"` 前缀的 base64 pickle，但 `net_arch` **不需要**走这条路 —— 它是
+普通 JSON）。
 
 ## 6. 关键常量与默认值
 
@@ -163,6 +225,7 @@ play.Runner.predict(obs)
 | `_TUPLE_FIELDS` | `frozenset({"kp", "kd", "gravity", "friction"})` | JSON 往返后要转回元组的字段 |
 | `_obs_config_for_dim` 的 `history_len` | `10` | 观测块枚举时的固定历史长度 |
 | `_obs_config_for_dim` 的枚举顺序 | `("base_lin_vel_body", "base_height", "gait_phase", "step_height")` | `product((False, True), repeat=4)`；`base_lin_vel_body` 默认开 ⇒ 最简配置先命中 |
+| `save_env_json` 的 report 键 | `{"step_height", "stage"}` | `step_height` 单位 **m**，`stage` 是阶段名（如 `stair15`） |
 | `stair_from_height` 的 `tread` / `n_up` | `0.50` / `8` | 与课程一致 |
 | `stair_from_height` 的 `top_landing` | 硬编码 `1.20` | 与 `demo_stairs_spec` 的课程默认一致 |
 | `EnvConfig()` 默认观测 | `frame_size=46`、`size=460` | 反推失败时的兜底值 |
@@ -183,6 +246,10 @@ robotdog/env.py (EnvConfig/ObsConfig/RewardConfig) ──►  robotdog/policy.py
   只读 `env` 的**配置类**、而完全不需要实例化环境的模块 —— 这是刻意的：`.zip` 的
   观测维度探测必须在**没有环境**的情况下也能跑。
 * **向上**被 `training.load_policy()` 与 `scripts/play.py` 使用。
+* **与 `robotdog/config.py` 的分工**：`config.py` 管**「怎么训」**（`config.yaml` →
+  `EnvConfig` / 阶段表，见 `docs/robotdog/config.md`），本模块管**「训完之后怎么读回去」**
+  （`.zip` → 网络结构 / 观测维度 / 地形记录）。两者都产出 `EnvConfig`，但方向相反，
+  且**不互相 import**。
 * **为什么 `env_config_from_model` 住在这里而不是 `training.py`**：`training.py` 要
   import `stable_baselines3`（重），而「读 `summary.json`」不需要 SB3。分开之后，
   只想读配置的调用方不必拖进 torch。
@@ -193,8 +260,11 @@ robotdog/env.py (EnvConfig/ObsConfig/RewardConfig) ──►  robotdog/policy.py
   递归 / 不可调用），`ObsNorm` 就是这三条的直接产物。
 * `experience.md` §5.3 —— 打开观测归一化却没跟上权重 ⇒ 5 cm 上成功率从 100% 掉到 0%。
 * `experience.md` §1.3 —— 零高度台阶无法编译，所以平地走 `flat_spec`。
+* `experience.md` §7.1 —— 按默认结构重建模型会 `size mismatch`，`policy_arch()` 的由来。
+* `experience.md` §7.4 —— 为什么地形记录必须**每个 checkpoint 各一份**。
 * `README.md` §3.2 —— 观测块的维度表（42 基础块 + 3/1/2/1 四个开关）。
 * `README.md` §4.1 —— `*_vecnormalize.pkl` 必须与 `.zip` 成对。
+* `README.md` §4.4 —— 超参全在 `config.yaml`（`ppo.net_arch` 就是 `policy_arch()` 要读的那个键）。
 
 ## 9. 已知限制与坑
 
@@ -202,8 +272,13 @@ robotdog/env.py (EnvConfig/ObsConfig/RewardConfig) ──►  robotdog/policy.py
   不同组合（例如再加一个 1 维开关），反推结果可能不是训练时用的那个；此时应当把
   权重放回它的 `runs/<名字>/` 目录（有 `summary.json`）。
 * `observation_dim()` 只读 `data` 条目。SB3 改掉这个内部布局就会返回 `None`（静默）。
-* `_config_from_env_json()` **只有 `training.py` 会写 `<stem>_env.json` 时才有用**；
-  当前 `train.py` 不写这个文件，所以这条路径实际是空的，保留是为了兼容搬动过的权重。
+* **`policy_arch()` 也是静默降级**：读不到 `net_arch` 就返回 `None`，`load_policy()`
+  会退回 `DEFAULT_NET_ARCH = (512, 256)`。一个非默认结构、又没有 `policy_kwargs` 的
+  老权重会重新撞上 `size mismatch` —— 这时唯一的线索是 traceback 里的两个形状。
+* **`<模型>_env.json` 只在训练时写**（`train.py` 每级一次 + 末级复制一份）。手工搬动
+  过的老权重没有它，`step_height_from_model()` 返回 `None`，`play.py` 会用默认 3 cm；
+  **评估结果会偏低，别把这种偏低当成策略退化**。
+* `step_height_from_model()` 返回的是**训练时**的地形，不是「这个权重能爬的最高台阶」。
 * `stair_from_height()` 的 `top_landing=1.20` 是硬编码的，不接受参数；要别的平台长度
   就直接用 `tools.terrain` 的函数。
 * `Policy` 是 `Protocol`，**不提供任何实现**；实现分别在 `training.load_policy()`
@@ -212,11 +287,16 @@ robotdog/env.py (EnvConfig/ObsConfig/RewardConfig) ──►  robotdog/policy.py
 ## 10. 示例用法
 
 ```python
-from robotdog.policy import ObsNorm, env_config_for_model, stair_from_height
+from robotdog.policy import (ObsNorm, env_config_for_model, policy_arch,
+                            step_height_from_model, stair_from_height)
 
-# 恢复训练时的配置（优先 summary.json，其次按观测维度反推）
+# 恢复训练时的配置（优先 summary.json，其次 <stem>_env.json，再按观测维度反推）
 cfg = env_config_for_model("runs/walk1/model_final.zip")
 print(cfg.obs.frame_size, cfg.obs.size)          # 46 460
+
+# 重建模型要用的结构，以及这份权重当时是在多高的台阶上训的
+print(policy_arch("runs/walk1/model_final.zip"))         # (512, 256)
+print(step_height_from_model("runs/walk1/model_final.zip"))  # 0.15（m）
 
 # 归一化统计
 norm = ObsNorm.from_path("runs/walk1/model_final_vecnormalize.pkl")

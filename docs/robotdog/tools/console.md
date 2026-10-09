@@ -63,7 +63,7 @@ if reconfigure is None:
 
 `robotdog/__init__.py:7` 导入它、`:11` 调用它。理由：编码必须在**任何输出发生之前**生效，而 `robotdog/__init__.py` 是「整个进程里第一段 robotdog 代码」的确定位置。放在 `robotdog/tools/__init__.py`（会在父包初始化期间先执行）会变成「谁先 import 谁决定」，而且让「导入一个路径常量」这种纯数据操作产生进程级副作用。
 
-**被否决的方案**：在 `console.py` 模块层直接调用自己 —— 否决，因为那样连 `from robotdog.tools.console import setup_utf8_console` 都会改进程 I/O，而这个函数**需要**能被显式调用（`tools/ab_pair.py:46,52` 正是这么用的），显式与隐式两条路径会叠加。
+**被否决的方案**：在 `console.py` 模块层直接调用自己 —— 否决，因为那样连 `from robotdog.tools.console import setup_utf8_console` 都会改进程 I/O，而这个函数**需要**能被显式调用（`scripts/train.py:235` / `scripts/play.py:433` 正是这么用的），显式与隐式两条路径会叠加。
 
 ## 4. 公开 API
 
@@ -108,8 +108,8 @@ def setup_utf8_console() -> None:
 
 ```
 import robotdog
-  → robotdog/__init__.py:7  from robotdog.tools.console import setup_utf8_console
-  → robotdog/__init__.py:11 setup_utf8_console()
+  → robotdog/__init__.py:9  from robotdog.tools.console import setup_utf8_console
+  → robotdog/__init__.py:10 setup_utf8_console()
       → for stream_name in ("stdout", "stderr")
           → getattr(sys, stream_name, None)          # 得到 TextIOWrapper 或 None
           → getattr(stream, "reconfigure", None)     # 得到绑定方法或 None
@@ -118,18 +118,18 @@ import robotdog
           → except (ValueError, OSError): pass
 ```
 
-从 `tool` 侧显式调用（`tools/ab_pair.py`）：
+从脚本侧显式调用（`scripts/train.py:54` 精确导入模块、`scripts/train.py:235` 在 `main()` 的第一行调用；`scripts/play.py:48` / `scripts/play.py:433` 同构）：
 
 ```
-tools/ab_pair.py:46  from robotdog.tools.console import setup_utf8_console
-tools/ab_pair.py:52  setup_utf8_console()
+scripts/train.py:54   from robotdog.tools import console  # noqa: E402
+scripts/train.py:235  console.setup_utf8_console()        # main() 的第一条语句
 ```
 
-从脚本侧依赖父包副作用（`scripts/render_checkpoint.py:46`、`scripts/eval.py:32`）：
+从脚本侧依赖父包副作用（任何 `import robotdog.*` 都会先执行 `robotdog/__init__.py`）：
 
 ```
 import robotdog   # noqa: F401  (installs the UTF-8 console wrapper)
-  → robotdog/__init__.py:11 setup_utf8_console()
+  → robotdog/__init__.py:10 setup_utf8_console()
 ```
 
 本模块内部无进一步调用链（只调 stdlib 的 `getattr` 与流的 `reconfigure`）。
@@ -152,10 +152,10 @@ import robotdog   # noqa: F401  (installs the UTF-8 console wrapper)
 
 | 位置 | 用法 | 方向理由 |
 | --- | --- | --- |
-| `robotdog/__init__.py:7, 11` | 导入 + 立即调用 | 包装层是最早的 robotdog 代码，天然是「输出前修好编码」的唯一位置 |
-| `tools/ab_pair.py:46, 52` | 显式导入并调用 | 它是独立工具，可能不经 `import robotdog` 启动，所以自己兜一次（幂等） |
-| `scripts/render_checkpoint.py:46` | `import robotdog  # noqa: F401  (installs the UTF-8 console wrapper)` | 靠父包副作用，不再重复调用 |
-| `scripts/eval.py:32` | 同上 | 同上 |
+| `robotdog/__init__.py:9, 10` | 导入 + 立即调用 | 包装层是最早的 robotdog 代码，天然是「输出前修好编码」的唯一位置 |
+| `scripts/train.py:54, 235` | 显式导入模块并在 `main()` 首行调用 | 独立脚本可能不经 `import robotdog` 启动，所以自己兜一次（幂等） |
+| `scripts/play.py:48, 433` | 同上 | 同上 |
+| 任何 `import robotdog.*` | 靠父包副作用，不再重复调用 | 父包在第 10 行已经修好了编码 |
 
 **为什么方向是「工具层被所有人依赖」**：编码修复是最底层的横切关注点，它不需要任何项目知识，因此可以放在依赖图的最底端被所有层调用；反过来它绝不 import 任何项目模块，否则就从最底端变成环的一环。
 

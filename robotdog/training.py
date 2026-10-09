@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,7 +35,7 @@ from stable_baselines3.common.vec_env import (
 )
 
 from robotdog.env import EnvConfig, Go2StairsEnv
-from robotdog.policy import ObsNorm, env_config_for_model
+from robotdog.policy import ObsNorm, env_config_for_model, policy_arch
 from robotdog.tools.paths import RUNS_DIR
 from robotdog.tools.terrain import StairSpec
 
@@ -132,8 +133,15 @@ def build_ppo(
     std = 1.0，即残差每一步都把关节目标顶满 ±``action_scale``，对站立的四足来说就是
     纯噪声。但也不能设得过小——如果残差恒为 0，策略就退化成「纯开环步态」，永远学不会
     爬楼梯（旧课程里出现过 ``mean|a| = 0.011``、``|a| < 0.05`` 占 99.9% 的退化）。
+
+    ``batch_size`` 与 ``n_steps * n_envs`` 不整除时 SB3 会 warn。训练时 8 环境
+    （2048）整除，但**推理时只建 1 个环境**（256）就会触发；那条警告对只做
+    ``predict`` 的场景没有意义，这里直接压掉。
     """
-    return PPO(
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*mini-batch size.*",
+                                category=UserWarning)
+        return PPO(
         "MlpPolicy",
         venv,
         n_steps=n_steps,
@@ -156,7 +164,7 @@ def build_ppo(
         device=device,
         seed=seed,
         verbose=verbose,
-    )
+        )
 
 
 def load_ppo(path: str | Path, venv: VecEnv, *, device: str = "cpu") -> PPO:
@@ -189,8 +197,11 @@ def load_policy(
     if not model_path.is_file() and model_path.with_suffix(".zip").is_file():
         model_path = model_path.with_suffix(".zip")
     cfg = cfg or env_config_for_model(model_path)
+    # 网络结构必须用**训练时那一套**：按默认 (512, 256) 建网再 set_parameters，
+    # 用别的结构训出来的权重会 size mismatch（见 policy_arch 的 docstring）。
+    arch = policy_arch(model_path) or DEFAULT_NET_ARCH
     venv = make_vec_env(stair, n_envs=1, cfg=cfg, seed=0, norm_reward=norm_reward)
-    model = build_ppo(venv, seed=0, device=device)
+    model = build_ppo(venv, seed=0, device=device, net_arch=arch)
     model.set_parameters(str(model_path))
 
     cand = model_path.with_name(model_path.stem + "_vecnormalize.pkl")
@@ -261,8 +272,15 @@ class RunDir:
         self.checkpoints = self.root / "checkpoints"
         self.tensorboard = self.root / "tensorboard"
         self.artifacts = self.root / "artifacts"
+        # 目录**不在这里创建**：调用方需要先判断 runs/<name> 是否已经存在（避免把
+        # 上次的 run 覆盖掉），而 eager mkdir 会让「刚构造出来就已经存在」永远成立。
+        # 各写入点自己 mkdir(parents=True)，见 save_model / write_summary / CheckpointCallback。
+
+    def ensure(self) -> Path:
+        """建好 ``runs/<name>/`` 及其子目录，返回根路径。"""
         for d in (self.root, self.checkpoints, self.tensorboard, self.artifacts):
             d.mkdir(parents=True, exist_ok=True)
+        return self.root
 
     def __repr__(self) -> str:  # pragma: no cover - 只为日志好看
         return f"RunDir({self.root})"
@@ -293,6 +311,7 @@ class RunDir:
         return Path(str(base) + ".zip"), save_vecnormalize(model, base)
 
     def write_summary(self, payload: dict[str, Any]) -> Path:
+        self.root.mkdir(parents=True, exist_ok=True)
         self.summary.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )

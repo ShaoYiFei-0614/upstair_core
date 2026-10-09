@@ -1,25 +1,22 @@
 """播放 / 评估训练结果。
 
-两种模式：
+两种模式（渲染参数固定，不再由命令行暴露）：
 
-* ``--mode gif``  —— 连续跑 10 个回合，每个回合渲染成帧并叠加 HUD，最后编码
-  成一个 GIF（``output/gifs/<名字>.gif``）。
-* ``--mode eval`` —— 跑 100 个回合，只统计成功率 / 摔倒率 / 超时率 / 平均前进。
+* ``--mode gif``  —— 连续跑 ``play.episodes_gif`` 个回合（默认 10），逐帧渲染并叠加
+  HUD，最后编码成一个 GIF，落在 ``output/gifs/<名字>.gif``。
+* ``--mode eval`` —— 跑 ``play.episodes_eval`` 个回合（默认 100），只统计成功率 /
+  摔倒率 / 超时率 / 平均前进。
 
 用法::
 
-    # 渲染训练结果
+    .venv\\Scripts\\python.exe scripts\\play.py --run course1 --mode eval
     .venv\\Scripts\\python.exe scripts\\play.py --run course1 --mode gif
 
-    # 评估 100 回合
-    .venv\\Scripts\\python.exe scripts\\play.py --run course1 --mode eval --episodes 100
+``--run`` 可以是运行名、运行目录，或者直接的 ``.zip`` 路径。同名目录下的
+``*_vecnormalize.pkl`` 会被自动加载；没有它时按原始观测推理（会提示）。
+想换楼梯高度或相机，改 ``config.yaml`` 的 ``play:`` 段，不加命令行参数。
 
-    # 换一条临时楼梯（不依赖训练时的地形）
-    .venv\\Scripts\\python.exe scripts\\play.py --run course1 --stage-height-cm 9 --mode gif
-
-``--run`` 也可以直接给一个 .zip 路径。同名目录下的 ``*_vecnormalize.pkl`` 会被
-自动加载；没有它时按原始观测推理（会提示）。评估至少跑 40 回合，10 回合能给出
-±15 个百分点的错觉。
+评估至少跑 40 回合，10 回合能给出 ±15 个百分点的错觉。
 """
 
 from __future__ import annotations
@@ -36,16 +33,35 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from robotdog.curriculum import default_curriculum  # noqa: E402
+from robotdog.config import (  # noqa: E402
+    DEFAULT_CONFIG_PATH,
+    config_to_play,
+    load_config,
+)
 from robotdog.env import EnvConfig, Go2StairsEnv  # noqa: E402
-from robotdog.policy import ObsNorm, env_config_for_model, stair_from_height  # noqa: E402
-from robotdog.tools import paths  # noqa: E402
-from stable_baselines3.common.vec_env import VecEnv  # noqa: E402
-
+from robotdog.policy import (  # noqa: E402
+    ObsNorm,
+    env_config_for_model,
+    stair_from_height,
+    step_height_from_model,
+)
+from robotdog.tools import console, paths  # noqa: E402
 from robotdog.training import load_policy  # noqa: E402
+from stable_baselines3.common.vec_env import VecEnv  # noqa: E402
 
 #: 渲染时的每帧步数：50 Hz 控制下每 2 步取一帧 = 25 fps。
 FRAME_STRIDE = 2
+
+#: 各模式用的相机（固定，不暴露到命令行）。
+CAMERA_GIF = "track"
+CAMERA_EVAL = "side"
+
+#: 字体候选（HUD 用），按顺序取第一个存在的。
+_FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -73,7 +89,7 @@ def _resolve_model(run: str) -> Path:
     root = raw if raw.is_dir() else paths.RUNS_DIR / run
     if not root.is_dir():
         raise SystemExit(f"找不到运行目录：{root}")
-    for name in ("artifacts/best_stage.zip", "model_final.zip", "model_best.zip"):
+    for name in ("model_final.zip", "artifacts/best_stage.zip", "model_best.zip"):
         cand = root / name
         if cand.is_file():
             return cand
@@ -102,11 +118,6 @@ def resolve_target(run: str) -> PlayTarget:
     )
 
 
-def _stair_for(stage_height_cm: float | None):
-    """决定播放用哪条楼梯：显式给了就用它，否则沿用配置里的默认地形。"""
-    return stair_from_height(stage_height_cm)
-
-
 # --------------------------------------------------------------------------- #
 # 策略适配
 # --------------------------------------------------------------------------- #
@@ -130,13 +141,13 @@ class Runner:
         return action
 
 
-def open_runner(target: PlayTarget, *, device: str = "cpu") -> tuple[Runner, Go2StairsEnv, "VecEnv"]:
+def open_runner(target: PlayTarget, *, stair, device: str = "cpu"
+                ) -> tuple[Runner, Go2StairsEnv, "VecEnv"]:
     """加载权重并建好环境。
 
     返回 ``(Runner, 环境, 向量环境)``。向量环境必须一起返回并保活：``PPO`` 持有它，
     归一化统计也存在它上面。
     """
-    stair = _stair_for(None)
     model, norm = load_policy(
         target.model_path, cfg=target.cfg, stair=stair, device=device
     )
@@ -149,12 +160,6 @@ def open_runner(target: PlayTarget, *, device: str = "cpu") -> tuple[Runner, Go2
 # --------------------------------------------------------------------------- #
 # GIF 写出（Pillow）
 # --------------------------------------------------------------------------- #
-
-_FONT_CANDIDATES = (
-    r"C:\Windows\Fonts\msyh.ttc",
-    r"C:\Windows\Fonts\simhei.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-)
 
 
 def _load_font(size: int):
@@ -200,9 +205,13 @@ def draw_hud(frame: np.ndarray, lines: Sequence[str]) -> np.ndarray:
     return np.asarray(img)
 
 
-def write_gif(path: Path, frames: Sequence[np.ndarray], *, fps: int = 25,
-              scale: int = 1) -> Path:
-    """把 RGB 帧编码成 GIF，全片共用一套调色板。"""
+def write_gif(path: Path, frames: Sequence[np.ndarray], *, fps: int,
+              scale: int) -> Path:
+    """把 RGB 帧编码成 GIF，全片共用一套调色板。
+
+    先取若干帧拼成缩略 mosaic 求全局调色板，再逐帧用它量化。逐帧各自
+    ``quantize()`` 会让同一只狗在不同帧里换颜色（GIF 只有 256 色，必须共用）。
+    """
     if not frames:
         raise ValueError("没有帧可以写入 GIF")
     from PIL import Image
@@ -283,9 +292,7 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
         obs, _r, terminated, truncated, info = env.step(policy.predict(obs))
         step += 1
         if capture and step % FRAME_STRIDE == 0:
-            out.frames.append(
-                env.render(camera, width=width, height=height).copy()
-            )
+            out.frames.append(env.render(camera, width=width, height=height).copy())
 
     dt = step * env.cfg.control_dt
     out.steps = step
@@ -316,9 +323,12 @@ def hud_for(out: EpisodeOutcome, total: int, stair, *, frame_index: int,
 
 
 def mode_gif(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
-             name: str, camera: str, width: int, height: int, fps: int,
-             scale: int) -> int:
+             name: str, play: dict[str, Any]) -> int:
     """模式 1：连续渲染 ``episodes`` 个回合，合成一个 GIF。"""
+    camera = str(play["camera"])
+    width, height = int(play["width"]), int(play["height"])
+    fps, scale = int(play["fps"]), int(play["scale"])
+
     frames: list[np.ndarray] = []
     outcomes: list[EpisodeOutcome] = []
     for ep in range(episodes):
@@ -331,8 +341,7 @@ def mode_gif(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
                                                   frame_index=i + 1,
                                                   frame_total=total)))
         print(f"  回合 {ep + 1:>2}/{episodes}  {out.status}  "
-              f"{out.steps:>4} 步  前进 {out.distance:+.2f}m  "
-              f"帧 {total}")
+              f"{out.steps:>4} 步  前进 {out.distance:+.2f}m  帧 {total}", flush=True)
 
     gif = paths.OUTPUT_GIFS_DIR / f"{name}.gif"
     write_gif(gif, frames, fps=fps, scale=scale)
@@ -344,17 +353,18 @@ def mode_gif(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
 
 
 def mode_eval(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
-              report: Path | None, model_path: Path | None = None) -> int:
+              model_path: Path | None = None) -> int:
     """模式 2：跑 ``episodes`` 个回合，只统计成功率。"""
     outcomes: list[EpisodeOutcome] = []
     t0 = time.time()
     for ep in range(episodes):
         out = run_episode(env, policy, episode=ep, seed=seed + ep, capture=False,
-                          camera="side", width=0, height=0)
+                          camera=CAMERA_EVAL, width=0, height=0)
         outcomes.append(out)
         if (ep + 1) % 10 == 0 or ep + 1 == episodes:
             ok = sum(o.success for o in outcomes)
-            print(f"  {ep + 1:>3}/{episodes}  成功率 {100.0 * ok / (ep + 1):5.1f}%")
+            print(f"  {ep + 1:>3}/{episodes}  成功率 {100.0 * ok / (ep + 1):5.1f}%",
+                  flush=True)
 
     n = len(outcomes)
     succ = sum(o.success for o in outcomes)
@@ -382,11 +392,6 @@ def mode_eval(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
           f"平均爬升 {payload['mean_height_gain']:.2f}m   "
           f"平均速度 {payload['mean_speed']:.2f}m/s   "
           f"平均步数 {payload['mean_steps']:.0f}")
-    if report is not None:
-        report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
-                          encoding="utf-8")
-        print(f"报告: {report}")
     return 0
 
 
@@ -395,73 +400,64 @@ def mode_eval(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
 # --------------------------------------------------------------------------- #
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None):
     ap = argparse.ArgumentParser(
-        description="播放训练结果：渲染 GIF 或统计成功率",
+        description="播放训练结果：渲染 GIF 或统计成功率（参数在 config.yaml）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--run", required=True, help="运行名 / 运行目录 / .zip 路径")
     ap.add_argument("--mode", choices=("gif", "eval"), default="gif")
-    ap.add_argument("--episodes", type=int, default=None,
-                    help="gif 默认 10，eval 默认 100")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--stage-height-cm", type=float, default=None,
-                    help="覆盖楼梯高度（0 = 平地）；不给就用配置里的默认台阶")
-    ap.add_argument("--stage", default=None,
-                    help="用课程里某一级的台阶高度，例如 flat / 3 / 6 / 9 / 12 / 15")
-    ap.add_argument("--name", default=None, help="GIF 文件名，默认 <模型名>")
-    ap.add_argument("--camera", default="track",
-                    help="side / track / chase / front / top")
-    ap.add_argument("--width", type=int, default=960)
-    ap.add_argument("--height", type=int, default=540)
-    ap.add_argument("--fps", type=int, default=25)
-    ap.add_argument("--scale", type=int, default=2, help="GIF 编码前的整数缩小倍数")
-    ap.add_argument("--report", default=None, help="eval 模式的 JSON 报告路径")
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--config", default=str(DEFAULT_CONFIG_PATH),
+                    help="配置文件路径（渲染参数从这里读）")
     return ap.parse_args(argv)
 
 
-def _stage_height(args: argparse.Namespace) -> float | None:
-    if args.stage_height_cm is not None:
-        return args.stage_height_cm
-    if args.stage is None:
-        return None
-    for spec in default_curriculum():
-        if args.stage == spec.name:
-            return spec.step_height * 100.0
-    raise SystemExit(f"课程里没有名为 {args.stage!r} 的阶段")
+def _default_height_cm(play: dict[str, Any], target: PlayTarget) -> float | None:
+    """播放用哪条楼梯。
+
+    优先 ``config.yaml`` 的 ``play.stage_height_cm``（显式覆盖）；否则读权重旁
+    ``<模型>_env.json`` 里记的该 checkpoint 训练时的台阶高（**每个 checkpoint 的
+    地形都不一样**，只有最后一级是 15 cm）；再没有就退回 :func:`stair_from_height`
+    的默认（3 cm）。
+    """
+    if play.get("stage_height_cm") is not None:
+        return float(play["stage_height_cm"])
+    height = step_height_from_model(target.model_path)
+    if height is not None:
+        print(f"地形来自权重自带记录: 台阶 {height * 100:.1f}cm")
+        return height * 100.0
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    console.setup_utf8_console()
     args = parse_args(argv)
+    play = config_to_play(load_config(args.config))
     target = resolve_target(args.run)
     print(f"模型: {target.model_path}")
     print(f"归一化: {target.norm_path or '（无）'}")
 
-    height_cm = _stage_height(args)
-    stair = _stair_for(height_cm)
-    policy, env, _venv = open_runner(target, device=args.device)
-    if stair is not None:
-        # 显式指定了台阶高度，换掉编译期烘焙的地形（重编译一次 MJCF）。
-        env = Go2StairsEnv(stair=stair, cfg=target.cfg, seed=args.seed)
-    print(f"地形: 台阶 {env.stair.step_height * 100:.1f}cm × {env.stair.n_up} 级"
-          f"  踏面 {env.stair.tread * 100:.0f}cm")
-    print(f"观测: {env.observation_space.shape}  动作: {env.action_space.shape}")
-
-    episodes = args.episodes if args.episodes is not None else (
-        10 if args.mode == "gif" else 100
-    )
+    stair = stair_from_height(_default_height_cm(play, target))
+    policy, env, _venv = open_runner(target, stair=stair, device=str(play.get("device", "cpu")))
     try:
+        print(f"地形: 台阶 {env.stair.step_height * 100:.1f}cm × {env.stair.n_up} 级"
+              f"  踏面 {env.stair.tread * 100:.0f}cm")
+        print(f"观测: {env.observation_space.shape}  动作: {env.action_space.shape}")
+
         if args.mode == "gif":
             return mode_gif(
-                env, policy, episodes=episodes, seed=args.seed,
-                name=args.name or target.label, camera=args.camera,
-                width=args.width, height=args.height, fps=args.fps,
-                scale=args.scale,
+                env, policy,
+                episodes=int(play["episodes_gif"]),
+                seed=int(play["seed"]),
+                name=target.label,
+                play=play,
             )
-        report = Path(args.report) if args.report else None
-        return mode_eval(env, policy, episodes=episodes, seed=args.seed,
-                         report=report, model_path=target.model_path)
+        return mode_eval(
+            env, policy,
+            episodes=int(play["episodes_eval"]),
+            seed=int(play["seed"]),
+            model_path=target.model_path,
+        )
     finally:
         env.close()
 

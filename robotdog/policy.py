@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -99,8 +99,8 @@ def env_config_from_summary(summary_path: str | Path) -> EnvConfig:
     return EnvConfig(**{k: v for k, v in env_kw.items() if k in known})
 
 
-def observation_dim(model_path: str | Path) -> int | None:
-    """从 SB3 的 ``.zip`` 里读出保存的观测维度（不解包、不加载模型）。
+def _zip_data(model_path: str | Path) -> Any:
+    """读 SB3 ``.zip`` 的 ``data`` 条目并解成对象（失败返回 ``None``）。
 
     SB3 2.9 把 ``data`` 存成 JSON，并用自定义编码器把对象写进
     ``":serialized:"`` 的 base64 pickle；SB3 < 2.0 直接 pickle 整个 ``data``。
@@ -108,6 +108,38 @@ def observation_dim(model_path: str | Path) -> int | None:
     import base64
     import pickle
     import zipfile
+
+    try:
+        with zipfile.ZipFile(model_path) as zf:
+            raw = zf.read("data")
+    except Exception:  # noqa: BLE001 - 探测函数
+        return None
+    if raw[:1] == b"{":
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        return pickle.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _deserialize(value: Any) -> Any:
+    """把 SB3 的 ``":serialized:"`` 字段解回对象；普通值原样返回。"""
+    import base64
+    import pickle
+
+    if isinstance(value, dict) and ":serialized:" in value:
+        try:
+            return pickle.loads(base64.b64decode(value[":serialized:"]))
+        except Exception:  # noqa: BLE001
+            return None
+    return value
+
+
+def observation_dim(model_path: str | Path) -> int | None:
+    """从 SB3 的 ``.zip`` 里读出保存的观测维度（不解包、不加载模型）。"""
 
     def _shape(obj: Any) -> int | None:
         shape = getattr(obj, "shape", None)
@@ -118,23 +150,41 @@ def observation_dim(model_path: str | Path) -> int | None:
         except (TypeError, IndexError, ValueError):
             return None
 
-    try:
-        with zipfile.ZipFile(model_path) as zf:
-            raw = zf.read("data")
-    except Exception:  # noqa: BLE001 - 探测函数
+    data = _zip_data(model_path)
+    if data is None:
         return None
-    if raw[:1] == b"{":
-        try:
-            space = json.loads(raw.decode("utf-8")).get("observation_space")
-            if isinstance(space, dict) and ":serialized:" in space:
-                space = pickle.loads(base64.b64decode(space[":serialized:"]))
-            return _shape(space)
-        except Exception:  # noqa: BLE001
-            return None
     try:
-        return _shape(pickle.loads(raw).get("observation_space"))
+        return _shape(_deserialize(data.get("observation_space")))
     except Exception:  # noqa: BLE001
         return None
+
+
+def policy_arch(model_path: str | Path) -> tuple[int, ...] | None:
+    """从 checkpoint 里读出策略网络的隐藏层宽度，例如 ``(512, 256)``。
+
+    重建模型时必须用**训练时那一套**结构：``load_policy`` 若按默认架构
+    ``(512, 256)`` 建网再 ``set_parameters``，一个用 ``(64, 64)`` 训出来的权重会
+    直接 ``RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy: size
+    mismatch for mlp_extractor.policy_net.0.weight: copying a param with shape
+    torch.Size([64, 460]) ... the shape in current model is torch.Size([512, 460])``。
+    ``policy_kwargs.net_arch`` 是普通 JSON（``{"pi": [...], "vf": [...]}``），不需要
+    解 pickle。
+    """
+    data = _zip_data(model_path)
+    if not isinstance(data, dict):
+        return None
+    kwargs = _deserialize(data.get("policy_kwargs"))
+    if not isinstance(kwargs, dict):
+        return None
+    arch = kwargs.get("net_arch")
+    if isinstance(arch, dict):
+        arch = arch.get("pi") or arch.get("vf")
+    if isinstance(arch, (list, tuple)) and arch:
+        try:
+            return tuple(int(w) for w in arch)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def env_config_for_model(model_path: str | Path) -> EnvConfig:
@@ -179,6 +229,50 @@ def _config_from_env_json(model_path: Path) -> EnvConfig | None:
     return env_config_from_summary(cand)
 
 
+def env_json_path(model_path: str | Path) -> Path:
+    """``<模型>_env.json`` 的路径（与 ``<模型>_vecnormalize.pkl`` 同规矩）。"""
+    model_path = Path(model_path)
+    return model_path.with_name(model_path.stem + "_env.json")
+
+
+def save_env_json(model_path: str | Path, cfg: EnvConfig, *,
+                  step_height: float | None = None,
+                  stage: str = "") -> Path:
+    """把 ``cfg`` 写进 ``<模型>_env.json``，并在 report 段记下该权重的地形。
+
+    **为什么需要它**：``summary.json`` 记的是**整条课程**的配置，而每个
+    checkpoint 是在不同的台阶上训出来的。play 想默认用对地形，就必须知道这个
+    权重当时的台阶高——只靠「最后一级」是错的（中间 checkpoint 全都会用错地形）。
+    """
+    payload = {
+        "env_config": asdict(cfg),
+        "obs_config": asdict(cfg.obs),
+        "reward_config": asdict(cfg.reward),
+        "report": {"step_height": step_height, "stage": stage},
+    }
+    target = env_json_path(model_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                      encoding="utf-8")
+    return target
+
+
+def step_height_from_model(model_path: str | Path) -> float | None:
+    """读 ``<模型>_env.json`` 的 ``report.step_height``（单位 m）；没有则 ``None``。"""
+    cand = env_json_path(model_path)
+    if not cand.is_file():
+        return None
+    try:
+        report = json.loads(cand.read_text(encoding="utf-8")).get("report") or {}
+    except Exception:  # noqa: BLE001 - 探测函数
+        return None
+    value = report.get("step_height")
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
     """反推是哪几个观测块拼出了 ``total`` 维。
 
@@ -220,6 +314,10 @@ __all__ = [
     "Policy",
     "env_config_for_model",
     "env_config_from_summary",
+    "env_json_path",
     "observation_dim",
+    "policy_arch",
+    "save_env_json",
     "stair_from_height",
+    "step_height_from_model",
 ]
