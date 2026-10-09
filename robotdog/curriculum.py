@@ -1,23 +1,15 @@
-"""第六步: 课程学习 (curriculum learning) + 训练回调。
+"""第 6 步: 课程学习 (curriculum learning) + 训练回调。
 
-用户规格 (m00001):
-    先平地训练 -> 3~8 cm 台阶 -> 8~15 cm -> 15~22 cm
-    每阶段成功率高就升难度。
+用户规格 (m00001): 先平地训练 -> 3~8 cm 台阶 -> 8~15 cm -> 15~22 cm, 每阶段
+成功率高就升难度。
 
-设计
-----
-* 每个阶段是一个 :class:`StageSpec`, 持有该阶段的地形 (:class:`~robotdog.terrain.StairSpec`)
-  和"毕业条件"(目标成功率 + 最少回合数 + 时间步预算)。
-* 训练在阶段之间**串行**: 一个阶段用 ``model.learn()`` 训到毕业或预算耗尽,
-  ``CurriculumCallback`` 通过让 ``_on_step`` 返回 ``False`` 提前结束 ``learn()``,
-  然后由 :func:`robotdog.curriculum.stage_iterator` 切换到下一阶段。
-  阶段切换**不在 rollout 中间发生** —— 换地形要重新编译 MJCF 模型, 中途换会让
-  当次 rollout 的第一个 transition 观测/状态不一致。这是刻意的设计选择。
-* 成功判据来自环境 info 的 ``is_success`` (见 ``Go2StairsEnv._success_reached``)。
-
-为什么不用 multiprocessing: 本沙箱禁止 Windows 命名管道, ``SubprocVecEnv`` 一律
-``PermissionError: [WinError 5]``, 只能用 ``DummyVecEnv`` (单进程)。实测线程池也
-无加速 (``mj_step`` 不释放 GIL)。
+* 每个阶段是一个 :class:`StageSpec`, 持有该阶段的地形和"毕业条件"(目标成功率 +
+  最少回合数 + 时间步预算)。
+* 阶段之间**串行**: 一个阶段 ``model.learn()`` 训到毕业或预算耗尽,
+  ``CurriculumCallback`` 通过 ``_on_step`` 返回 ``False`` 提前结束, 再由
+  :func:`stage_iterator` 切换。切换**不在 rollout 中间发生** —— 换地形要重编译
+  MJCF, 中途换会让当次 rollout 的观测/状态不一致。
+* 成功判据来自 info 的 ``is_success`` (见 ``Go2StairsEnv._success_reached``)。
 """
 
 from __future__ import annotations
@@ -41,23 +33,17 @@ from robotdog.terrain import StairSpec, demo_stairs_spec, flat_spec
 
 def deterministic_success(model, spec: StairSpec, cfg: Any = None, *,
                           n_episodes: int = 10, seed: int = 12345) -> float | None:
-    """Roll out the **deterministic** policy on ``spec``; return the success rate.
+    """在 ``spec`` 上跑**确定性**策略, 返回成功率。
 
-    ``EpisodeStats.success_rate`` is counted over the rollouts ``learn()``
-    produces, and those use *sampled* actions: PPO adds a learned ``log_std``
-    (~0.137) to all 12 action dimensions on every step.  That number therefore
-    measures "how often does the exploration noise survive the staircase", not
-    "can the policy climb it", and it under-reports the delivered policy by a
-    large factor.
+    ``EpisodeStats.success_rate`` 统计的是 ``learn()`` 产出的 rollout, 而那些用
+    **采样**动作 (PPO 每步给 12 个动作维度加 ``log_std`` ≈ 0.137)。那个数字衡量的是
+    「探索噪声能不能活过楼梯」, 不是「策略能不能爬上去」, 会大幅低估交付策略。
 
-    Measured on ``course15``: the curriculum closed ``medium3`` (7.8 cm x 8) at
-    **10%**, while that same checkpoint scored **33%** deterministically over 15
-    episodes -- the entire gap was action noise.  Without this second number the
-    curriculum treats a stage that is nearly solved as an unconquerable wall and
-    spends its whole budget on it (and the log then misleads whoever reads it).
+    实测 (``course15``): 课程以 **10%** 关掉了 ``medium3`` (7.8 cm × 8), 而同一个
+    checkpoint 确定性跑 15 回合是 **33%** —— 差距全来自动作噪声。没有这个第二数字,
+    课程会把一个几乎解决的阶段当成翻不过去的墙, 把整个预算耗在上面。
 
-    Returns ``None`` when the measurement cannot be taken (no environment class,
-    mismatched observation space, ...) so a failed measurement never breaks a run.
+    测不出来时返回 ``None``, 使测量失败永远不会打断训练。
     """
     # `get_env()` lives on a real SB3 learner; the unit tests drive `_on_step()`
     # with a hand-rolled stub that has no such method, so this too must be
@@ -196,30 +182,15 @@ def default_curriculum(step_heights: Sequence[float] = (0.05, 0.12, 0.19),
 
 def mixed_stage_specs(spec: StairSpec, n_envs: int, lo_cm: float,
                       hi_cm: float) -> list[StairSpec]:
-    """One spec per sub-env, with the step height spread over ``[lo, hi]``.
+    """每个子环境一个 spec, 台阶高度在 ``[lo, hi]`` 上铺开。
 
-    WHY THIS EXISTS (measured): running the ladder 8.0 -> 8.5 -> 9.0 -> 9.5 ->
-    10.0 cm one rung at a time makes each rung the *only* terrain the PPO
-    gradient ever sees, and the policy catastrophically forgets the rungs it
-    already passed.  With ``runs/course19`` (20 deterministic episodes per
-    checkpoint x per height, SEED0=21000):
+    **为什么需要它 (实测)**: 把 8.0 -> 8.5 -> 9.0 -> 9.5 -> 10.0 cm 一级一级地爬,
+    会让每一级成为 PPO 梯度唯一见到的地形, 策略**灾难性遗忘**已越过的台阶;
+    每一级只在它训练的高度上最好, 且全都比 course18 在 7.5~8.0 cm 上更差。让一个
+    阶段内各子环境处于不同高度, 能把整条带都放进每个梯度批次, 消除遗忘。
 
-        checkpoint       7.5    8.0    8.5    9.0    9.5   10.0
-        course18 m5      85%    75%    15%     0%     0%     0%
-        course19 m3      35%    65%    55%    65%    30%    15%
-        course19 m4      15%    30%    15%    40%    45%    15%
-        course19 m5      30%    40%    45%    35%    30%    20%
-
-    Every ``course19`` rung is best only at the height it trained on, and all of
-    them are *worse* than ``course18`` at 7.5-8.0 cm.  Training all sub-envs on
-    different heights inside one stage puts the whole band into every PPO
-    gradient batch, which is what removes the forgetting.
-
-    Per-episode randomization is deliberately **not** used: ``set_stair``
-    rebuilds the MJCF model (~250 ms per sub-env, see
-    ``default_curriculum``'s note), so recompiling on every ``reset`` would cost
-    more wall-clock than the training itself.  The heights are spread linearly
-    and the *middle* is included, so the batch is not dominated by the extremes.
+    **刻意不用**每回合随机化: ``set_stair`` 每次重编译 MJCF (~250 ms/子环境), 每个
+    ``reset`` 都重编译会比训练本身更耗时。高度线性铺开且含中点, 避免批次被两端主导。
     """
     n_envs = max(1, int(n_envs))
     lo = min(float(lo_cm), float(hi_cm)) / 100.0
@@ -236,32 +207,21 @@ def mixed_stage_specs(spec: StairSpec, n_envs: int, lo_cm: float,
 def mixed_grid_specs(spec: StairSpec, n_envs: int, *,
                      heights_cm: tuple[float, float],
                      treads: tuple[float, float]) -> list[StairSpec]:
-    """One spec per sub-env, spread over a **height x tread** grid.
+    """每个子环境一个 spec, 铺在**台阶高 × 踏面**网格上。
 
-    Extends :func:`mixed_stage_specs` to the second difficulty axis.  Measured
-    reason for the tread axis (``.tmp/step2b_probe.py``, ``course21`` final, 20
-    deterministic episodes per cell, ascending flight held at 4.0 m by scaling
-    ``n_up`` so the 20 s cap cannot confound the result):
+    把 :func:`mixed_stage_specs` 扩展到第二个难度轴。踏面轴的实测依据
+    (``course21`` final, 每格 20 个确定性回合; 通过缩放 ``n_up`` 把上升段固定在
+    4.0 m, 免得 20 s 上限混淆结果): 踏面 35 cm -> 0%, 50 cm -> 55%, 65 cm -> 0%,
+    80 cm -> 0% (10.0 cm 台阶)。
 
-        tread   n_up   10.0cm   10.5cm   11.0cm
-        35cm     11      0%       0%       0%
-        50cm      8     55%      15%       0%
-        65cm      6      0%       0%       0%
-        80cm      5      5%       0%       0%
+    ⇒ 更长的踏面**不会**多给机器人调整时间: 65/80 cm 崩到 0%, 35 cm 也崩。策略是围绕
+    训练时的 50 cm 调好的, 残差步态与它相位锁定, 所以**改变**踏面是让起跨失步而不是
+    给它余量。结论不是「用更长踏面」, 而是「别让策略依赖某一种踏面」: 让各子环境用不同
+    踏面, 逼迫起跨对任意到达相位都成立 —— 这正是高立面起跨所缺的性质。
 
-    Longer treads do **not** buy the robot more time to adjust per level: 65 cm
-    and 80 cm collapse to 0 %, and 35 cm collapses too.  The policy is tuned to
-    the 50 cm tread it trained on and the residual gait is phase-locked to it,
-    so *changing* the tread desynchronises the mount instead of giving it room.
-    The lesson is not "use longer treads" but "do not let the policy depend on
-    one tread": training each sub-env on a different tread forces the mount to
-    work for any arrival phase, which is the property the tall-riser mount is
-    missing.
-
-    The two axes are crossed as a grid: the height axis is spread over the full
-    range and the tread axis gets two sub-envs (see the note above), so 8
-    sub-envs become 4 heights x 2 treads.  ``n_envs == 1`` takes the top-right
-    corner (tallest, longest), matching :func:`mixed_stage_specs`.
+    两轴交叉成网格: 高度轴铺满全范围, 踏面轴占两个子环境 (理由同上), 于是 8 个子环境
+    = 4 高度 × 2 踏面。``n_envs == 1`` 取右上角 (最高最长), 与
+    :func:`mixed_stage_specs` 一致。
     """
     n_envs = max(1, int(n_envs))
     h_lo, h_hi = sorted(float(v) for v in heights_cm)
@@ -305,38 +265,26 @@ def expand_stage(stage: StageSpec, n_levels: int = 4, *,
                  min_step_height: float = 0.02,
                  start_step_height: float | None = None,
                  n_up_start: int | None = None) -> list[StageSpec]:
-    """Split one stair stage into a ladder of *rising step heights*.
+    """把一个台阶阶段拆成**上升**的阶梯 (每级一个台阶高)。
 
-    The spec asks for bands (3~8 / 8~15 / 15~22 cm) and for the difficulty to
-    rise "when each stage's success rate is high".  A single 5 cm staircase is
-    a hard first rung: the flat-tuned prior lifts its lowest foot only ~20 mm,
-    so a 50 mm riser is a wall.  Splitting the band into levels gives the
-    policy terrain it can actually clear first, and only then raises the riser.
+    规格要的是区间 (3~8 / 8~15 / 15~22 cm) 且「成功率高就升难度」。直接上 5 cm 是很
+    硬的第一级: 平地调好的先验只把最低足抬 ~20 mm, 所以 50 mm 立面就是墙。拆成多级
+    先给策略能清掉的地形, 再抬立面。
 
-    ``start_fraction`` skips the very lowest rung unless it is still above
-    ``min_step_height``; heights are spread linearly from
-    ``stage.spec.step_height * start_fraction`` up to the full height.  The
-    last level is exactly ``stage.spec``, so the final rung keeps the original
-    contract.  ``max_timesteps`` is divided evenly except that the last level
-    gets any remainder.
+    ``start_fraction`` 跳过最低那一级 (除非仍高于 ``min_step_height``); 高度从
+    ``stage.spec.step_height * start_fraction`` 线性铺到满高, 最后一级**恰好**是
+    ``stage.spec`` 以保持原合同。``max_timesteps`` 均分, 余数给最后一级。
 
-    ``start_step_height`` (absolute, metres) overrides ``start_fraction`` for
-    the first rung.  That override matters because the open-loop stairs trot is
-    **not monotone** in step height -- measured with ``bench_gait_prior.py``:
-    2 cm -> 40% success, 3 cm -> 40%, **4 cm -> 100%**, 5 cm -> 20%, 6 cm ->
-    0%.  The fixed 183 ms gait period resonates with the 50 cm tread at ~4 cm,
-    so a ladder that starts at 2 cm would begin *below* the prior's own
-    competence and waste its first rung.
+    ``start_step_height`` (绝对米数) 覆盖第一级的 ``start_fraction``。这个覆盖有实际
+    意义, 因为开环楼梯小跑对台阶高**不单调**: 2 cm -> 40%, 3 cm -> 40%, **4 cm ->
+    100%**, 5 cm -> 20%, 6 cm -> 0%。固定 183 ms 的步态周期在 ~4 cm 处与 50 cm 踏面
+    共振, 所以从 2 cm 起步的阶梯会从**先验自身能力之下**开始, 白费第一级。
 
-    ``n_up_start`` adds a second, independent difficulty axis: the *number* of
-    risers, ramped linearly from ``n_up_start`` up to ``stage.spec.n_up``.  This
-    matters because the terminal success bonus is all-or-nothing over the whole
-    staircase -- with 8 risers and a per-riser survival of 0.85 the success rate
-    is already down to 0.27, which is exactly the plateau the first four training
-    runs hit (measured 25% for the open-loop prior, 25~32% for PPO after 75k
-    steps).  Starting at 2 risers turns the same per-riser competence into a
-    ~72% success rate, so the policy gets a dense stream of +20 terminal rewards
-    instead of a rare one.
+    ``n_up_start`` 加上第二个独立难度轴: 立面的**数量**, 从 ``n_up_start`` 线性升到
+    ``stage.spec.n_up``。这很关键, 因为终止成功奖励对整段楼梯是全有全无的 —— 8 级、每级
+    存活 0.85 时成功率已经掉到 0.27, 正是前四次训练撞到的平台 (先验 25%, PPO 75k 步后
+    25~32%)。从 2 级起步把同样的每级能力变成 ~72% 成功率, 于是策略能拿到密集的 +20
+    终止奖励, 而不是稀有的那一个。
     """
     n_levels = max(1, int(n_levels))
     if n_levels == 1 or stage.spec.n_up == 0:
@@ -375,17 +323,14 @@ def expand_stage(stage: StageSpec, n_levels: int = 4, *,
 
 def expand_curriculum(stages: Sequence[StageSpec], n_levels: int = 4,
                       **kw) -> list[StageSpec]:
-    """Apply :func:`expand_stage` to every stair stage (flat passes through).
+    """对每个台阶阶段套用 :func:`expand_stage` (平地原样通过)。
 
-    When ``start_step_height`` is given it only pins the *first* stair stage's
-    bottom rung; each later stair stage starts from the previous stage's full
-    height instead of repeating it.  Without that, ``--stage easy,medium
-    --sub-start-cm 4`` would expand medium as 4/6.7/9.3/12 cm and waste its
-    first budget block re-learning a rung easy had already solved.
+    给了 ``start_step_height`` 时它只钉住**第一个**台阶阶段的最低一级; 之后的台阶阶段
+    从上一阶段的满高起步, 而不是重复它。否则 ``--stage easy,medium --sub-start-cm 4``
+    会把 medium 展开成 4/6.7/9.3/12 cm, 白费第一块预算去重学 easy 已经解决的级。
 
-    ``n_up_start`` behaves the same way: only the first stair stage ramps the
-    riser *count*; by the time the second stair stage starts the policy has
-    already seen a full-length staircase.
+    ``n_up_start`` 同理: 只有第一个台阶阶段做立面**数量**的爬坡, 到第二个台阶阶段时策略
+    已经见过完整长度的楼梯了。
     """
     out: list[StageSpec] = []
     start = kw.get("start_step_height")

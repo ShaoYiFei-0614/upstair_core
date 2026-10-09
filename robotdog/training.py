@@ -1,26 +1,13 @@
-"""第七步: 训练基础设施 (PPO + 向量化环境 + 检查点)。
+"""第 7 步: 训练基础设施 (PPO + 向量化环境 + 检查点)。
 
-## 重要约束: 本机只能单进程训练
-沙箱禁止 Windows 命名管道, 因此 ``SubprocVecEnv`` / ``multiprocessing`` /
-``ProcessPoolExecutor`` 全部报 ``PermissionError: [WinError 5] 拒绝访问。``
-用户要求的"并行环境数 8 个"只能实现为 **``DummyVecEnv(8)``**: 同一个进程里
-顺序推进 8 个环境 (逻辑上仍是 8 个并行环境, 但不是真并行)。
+**单进程约束**: 沙箱禁止 Windows 命名管道, ``SubprocVecEnv`` /
+``multiprocessing`` 会报 ``PermissionError: [WinError 5]``, 所以"并行环境数 8"
+只能实现为 ``DummyVecEnv(8)`` —— 同一进程里顺序推进 8 个环境。实测约 560
+向量步/秒 (100 万步 ≈ 30 分钟), 不要试图改用线程池 (``mj_step`` 不释放 GIL)。
 
-实测 (``archive/scripts/probe_throughput.py``, 日志 ``archive/logs/probe_throughput.log``):
-
-    单环境裸吞吐        平地 3060 steps/s   5cm 楼梯 2518 steps/s
-    8 环境顺序 (Dummy)  1172 steps/s
-    8 环境 8 线程        1040 steps/s   <- 无加速, mj_step 不释放 GIL
-    PPO + DummyVecEnv(8) 端到端 560 steps/s
-    100 万步 ≈ 30 分钟, 300 万步 ≈ 1.5 小时
-
-结论: 用 ``DummyVecEnv``, 不要试图用线程池。
-
-## 为什么用 VecNormalize
-观测里有关节速度 (±20 rad/s) 和关节角 (±3 rad), 量纲差异大。PPO 用单一 Adam
-学习率同时学所有输入尺度, 未归一化时收敛明显更慢。这里用
-``norm_obs=True, clip_obs=10.0``, 但 ``norm_reward=False`` —— 奖励归一化会让
-课程切换地形后的奖励尺度漂移, 反而有害。
+**观测归一化**: 关节速度 (±20 rad/s) 与关节角 (±3 rad) 量纲差异大, 用
+``norm_obs=True, clip_obs=10.0``。奖励归一化默认关闭, 理由见
+:func:`make_vec_env`。
 """
 
 from __future__ import annotations
@@ -73,34 +60,24 @@ def make_vec_env(
 ) -> VecEnv:
     """DummyVecEnv(n_envs) -> VecMonitor -> VecNormalize.
 
-    ``DummyVecEnv`` is not a fallback here, it is the only option: this sandbox
-    forbids the named pipes that Windows multiprocessing needs.
+    ``norm_reward`` 默认关闭: 课程会在阶段间切换地形, 在 5 cm 上学到的奖励
+    尺度到 11 cm 就漂移了。它被保留为旋钮, 是因为侧向惩罚主导了每步奖励
+    (``straight_line`` 一项占 72.7%, 而 ``forward_vel`` 只贡献 +0.356), 挣扎中
+    的策略回报接近 -6000, critic 拟合不动; 归一化能恢复一个可用的 critic 目标。
 
-    ``norm_reward`` stays **off** by default because the curriculum switches
-    terrain between stages, and a reward scale learned on 5 cm stairs drifts
-    once the agent reaches 11 cm (see the module docstring).
-
-    It is exposed as a lever because the lateral penalties dominate the
-    per-step reward (``straight_line`` alone measured 72.7 % of it, while
-    ``forward_vel`` contributed only +0.356), so a struggling policy's return
-    sits near -6000 and the critic cannot fit it. Normalising the reward
-    restores a usable critic target.
-
-    How much that buys is *small on this task* and was measured directly on
-    3 cm stairs, 8 envs, 150 k steps, comparing the two arms through their own
-    normalisers (``.tmp/norm_ab.py``):
+    但**增益很小**, 是在 3 cm 台阶、8 环境、150k 步上用两个 arm 各自的
+    归一化器直接量到的 (``.tmp/norm_ab.py``):
 
     ==========  ==============  ==============  ==============
-    arm         success rate    ``mean|a|``     11 cm
+    arm         成功率          ``mean|a|``     11 cm
     ==========  ==============  ==============  ==============
-    off         0.474           0.070 -> 0.063  no success
-    on          0.539           0.080 -> 0.083  no success
+    off         0.474           0.070 -> 0.063  无成功
+    on          0.539           0.080 -> 0.083  无成功
     ==========  ==============  ==============  ==============
 
-    So treat it as a mild stabiliser, not a fix. An earlier draft of this
-    docstring claimed it tripled the residual growth and cut the 11 cm fall
-    rate from 0.88 to 0.12; those numbers came from a probe that was later
-    found to report wrong episodes and have been withdrawn.
+    所以它是温和的稳定器而非解药。本 docstring 的早期草稿声称它让残差增长
+    三倍、把 11 cm 摔倒率从 0.88 降到 0.12 —— 那些数字来自一个后来被判定
+    报错回合的探针, 已撤回。
     """
     if n_envs < 1:
         raise ValueError("n_envs must be >= 1")
@@ -133,14 +110,11 @@ def set_terrain(venv: VecEnv, stair: StairSpec) -> None:
 
 
 def set_terrain_per_env(venv: VecEnv, specs: Sequence[StairSpec]) -> None:
-    """Give each sub-env its **own** terrain, then reset once.
+    """给每个子环境**各自**一个地形, 然后统一 reset 一次。
 
-    Used by ``--mixed-heights``: training all sub-envs on different step heights
-    inside a single stage keeps the whole band in every PPO gradient batch, which
-    is what stops the curriculum from catastrophically forgetting the rungs it
-    already cleared (see ``robotdog.curriculum.mixed_stage_specs`` for the
-    measured table).  Wall-clock is the same as ``set_terrain`` -- each sub-env
-    recompiles exactly one model either way.
+    ``--mixed-heights`` 用它: 一个阶段内让各子环境处于不同台阶高度, 使整条
+    能力带都出现在每个 PPO 梯度批次里, 从而避免灾难性遗忘已经爬过的台阶。
+    耗时与 :func:`set_terrain` 相同 —— 每个子环境都只重编译一个模型。
     """
     n = int(venv.num_envs)
     if len(specs) != n:
@@ -236,15 +210,9 @@ def find_run_dir(start: str | Path, *, max_up: int = 4) -> Path | None:
 def _model_observation_dim(model_path: str | Path) -> int | None:
     """从 SB3 的 ``.zip`` 里读出保存的观测维度（不解包、不加载模型）。
 
-    SB3 2.9 把 ``data`` 存成 **JSON**（不是 pickle），并且用自定义编码器把
-    每个对象写成 ``{":type": "...", ":serialized": "<base64 pickle>"}``::
-
-        >>> json.loads(raw)["observation_space"]
-        {':type:': "<class 'gymnasium.spaces.box.Box'>",
-         ':serialized:': 'gAWVnhQAAAAAAACMFGd5...'}
-
-    所以这里要 JSON → base64 → pickle 三步。旧版本 SB3（<2.0）直接 pickle
-    整个 ``data``，因此保留一条退路。
+    SB3 2.9 把 ``data`` 存成 JSON, 且用自定义编码器把每个对象写成
+    ``{":type": ..., ":serialized": "<base64 pickle>"}``, 所以要
+    JSON → base64 → pickle 三步; SB3 < 2.0 直接 pickle 整个 ``data``, 保留退路。
     """
     import base64
     import json
@@ -315,18 +283,11 @@ def _obs_config_candidates(total: int, history_len: int = 10) -> list[ObsConfig]
 def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
     """反推是哪几个可选观测块拼出了 ``total`` 维。
 
-    ``ObsConfig.frame_size = 42 + base_lin_vel(0/3) + base_lin_vel_body(0/3)
-    + base_height(0/1) + foot_height(0/4) + gait_phase(0/2) + touch(0/9)
-    + stair_probe(0/3) + stair_probe_full(0/2, 需 stair_probe) + drift(0/2)``,
-    观测总维度 = ``frame_size * history_len``。
-
-    **注意**: 各块维度不互质（``base_lin_vel`` / ``base_lin_vel_body`` /
-    ``stair_probe`` 都是 3，``gait_phase`` 与 ``drift`` 都是 2），所以**存在维度
-    完全相同的不同组合**（例如只开 ``gait_phase`` 与只开 ``drift`` 都是
-    44×10=440）。本函数返回枚举顺序里的第一个，而枚举顺序被刻意排成「新标志
-    最后开」，所以老维度总是反推回老配置；需要知道是否有歧义时用
-    :func:`_obs_config_candidates`。首选路径始终是 run 目录里的
-    ``summary.json``，那里是精确记录。
+    各块维度不互质 (``base_lin_vel``/``base_lin_vel_body``/``stair_probe`` 都是
+    3, ``gait_phase``/``drift`` 都是 2), 所以存在维度相同的不同组合。本函数返回
+    枚举顺序里的第一个, 而枚举顺序被刻意排成「新标志最后开」, 使老维度总是反推回
+    老配置; 要判断是否有歧义用 :func:`_obs_config_candidates`。首选路径始终是 run
+    目录里的 ``summary.json`` (精确记录)。
     """
     cands = _obs_config_candidates(total, history_len)
     return cands[0] if cands else None
@@ -335,18 +296,11 @@ def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
 def env_config_for_model(model_path: str | Path) -> EnvConfig:
     """给一个 ``.zip`` 模型, 恢复出它能加载的 :class:`EnvConfig`。
 
-    两条路径:
-    1. 从模型所在 run 目录的 ``summary.json`` 精确恢复（首选）;
-    2. 若没有 summary.json（例如训练还在进行中, 或只保留了 checkpoint）,
-       从 ``.zip`` 里保存的观测维度**反推**是哪几个可选观测块。
-       这条路恢复不了 ``--cfg`` 覆盖过的超参, 会打一行提示。
-
-    为什么必须有这个函数: ``train.py`` 支持 ``--obs-foot-height`` /
-    ``--obs-base-height``, 训练出来的模型有 **490 维**观测, 而
-    ``EnvConfig()`` 默认是 **420 维**。用默认配置搭环境再去 ``PPO.load`` 会直接抛::
-
-        ValueError: Observation spaces do not match:
-        Box(-inf, inf, (490,), float32) != Box(-inf, inf, (420,), float32)
+    首选 run 目录里的 ``summary.json``（精确）; 没有时从 ``.zip`` 里保存的观测
+    维度**反推**是哪几个可选观测块 (这条路恢复不了 ``--cfg`` 覆盖过的超参, 会打
+    一行提示)。必须有它是因为 ``EnvConfig()`` 默认 420 维, 而带
+    ``--obs-foot-height`` 训练的模型是 490 维, 直接用默认配置 ``PPO.load`` 会抛
+    ``ValueError: Observation spaces do not match``。
     """
     run_dir = find_run_dir(model_path)
     if run_dir is not None:
@@ -520,17 +474,12 @@ def _find_vecnormalize(venv: Any) -> VecNormalize | None:
 def restore_vecnormalize(venv: VecEnv, path: str | Path) -> bool:
     """把 :meth:`RunDir.save_model` 写出的观测统计还原进 ``venv``。
 
-    ``PPO.load`` 只还原网络权重; 观测归一化 (``VecNormalize``) 的 running
-    mean/var 是被单独存成一个 ``<模型>_vecnormalize.pkl`` 的。续训时如果不
-    还原它, 策略就会拿到按 ``mean=0/var=1`` 归一化 (再 clip 到
-    ``clip_obs`` 的正负 10) 的输入, 而它训练时看到的是真统计 —— 等于换了
-    一套输入坐标系, 恢复出来的策略前若干步基本是废的。
+    ``PPO.load`` 只还原网络权重; ``VecNormalize`` 的 running mean/var 是单独存成
+    ``<模型>_vecnormalize.pkl`` 的。不还原它, 策略就会拿到按 ``mean=0/var=1``
+    归一化的输入, 而它训练时看到的是真统计 —— 等于换了一套输入坐标系。
 
-    ``VecNormalize.load`` 是 ``@staticmethod``, 而且要求传入**未包装**的
-    ``VecEnv`` (它会新建一个包装器)。这里不想把已经建好的包装链再套一层,
-    所以加载完只把统计量拷回现有的包装器。
-
-    返回是否成功还原。
+    ``VecNormalize.load`` 要求传入**未包装**的 ``VecEnv`` (它会新建包装器), 这里
+    不想再套一层, 所以加载完只把统计量拷回现有包装器。返回是否成功。
     """
     p = Path(path)
     if not p.exists():

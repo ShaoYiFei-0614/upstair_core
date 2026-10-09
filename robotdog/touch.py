@@ -5,7 +5,7 @@ Why this module exists
 The original specification (§四) said "do not use contact-sensor data", so the
 observation carried no touch information at all and the only two contact *facts*
 in the environment were the boolean masks in ``env._foot_contact_mask`` (used by
-the ``air_time`` shaping) and ``env._body_contact`` (used by ``body_collision``
+the ``air_time`` shaping) and ``env._contact_flags`` (used by ``body_collision``
 and the termination test).  Contact **forces** were never read.
 
 That is enough to *punish* a collision but it cannot say "a riser is right in

@@ -1,11 +1,13 @@
-"""第九步 CLI: 在**没见过的楼梯**上评估策略, 保存最好策略, 导出 ONNX / TorchScript。
+"""第 9 步 CLI: 在**没见过的楼梯**上评估策略, 保存最好策略, 导出 ONNX / TorchScript。
 
-用法示例
---------
-    # 评估一个训练好的 run (默认: 训练地形 + 9 个没见过的地形 + 6 个随机地形)
+用法
+----
+::
+
+    # 默认: 训练地形 + 9 个没见过的地形 + 6 个随机地形
     .venv\\Scripts\\python.exe scripts\\eval.py --run runs\\go2_xxx --episodes 20
 
-    # 只评估没见过的地形, 每个 30 回合
+    # 只评估没见过的地形, 每个 30 回合 (⚠ 评估至少 40 回合, 10 回合能给出 ±15 pt 错觉)
     ... scripts\\eval.py --run runs\\go2_xxx --only unseen --episodes 30
 
     # 顺带导出 ONNX 与 TorchScript 并逐样本核对数值
@@ -132,20 +134,15 @@ def resolve_model_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 
 def load_policy(model_path: Path, vn_path: Path, device: str = "cpu",
                 cfg: EnvConfig | None = None):
-    """Load PPO + its VecNormalize into a 1-env vectorized env.
+    """把 PPO 与其 VecNormalize 装进一个 1 环境向量环境。
 
-    The model needs *some* env to be constructed; a 1-env DummyVecEnv with the
-    default terrain is enough, and we keep the VecNormalize so that
-    ``model.predict`` receives normalised observations exactly as in training.
+    模型构造需要**某个**环境; 一个默认地形的 1 环境 DummyVecEnv 就够, 并保留
+    VecNormalize 使 ``model.predict`` 拿到的归一化观测与训练时一致。
 
-    ``cfg`` must be the **training-time** EnvConfig (use
-    :func:`robotdog.training.env_config_from_run`).  A model trained with
-    ``--obs-foot-height --obs-base-height`` has a 490-dim observation space,
-    while ``EnvConfig()`` defaults to 420 — loading such a model against the
-    default config raises::
-
-        ValueError: Observation spaces do not match:
-        Box(-inf, inf, (490,), float32) != Box(-inf, inf, (420,), float32)
+    ``cfg`` 必须是**训练时**的 EnvConfig (用
+    :func:`robotdog.training.env_config_from_run`)。带
+    ``--obs-foot-height --obs-base-height`` 训练的模型是 490 维, 而 ``EnvConfig()``
+    默认 420 维, 用默认配置加载会抛 ``ValueError: Observation spaces do not match``。
     """
     from robotdog.terrain import flat_spec
 

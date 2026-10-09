@@ -1,39 +1,25 @@
-"""第七步: 训练脚本 —— 课程学习 + PPO + 检查点。
+"""第 7 步: 训练脚本 —— 课程学习 + PPO + 检查点。
 
 用法
 ----
-# 完整课程 (平地 -> 5cm -> 12cm -> 19cm), 8 个 CPU 环境
-.venv\\Scripts\\python.exe scripts\\train.py --run-name go2_curriculum --n-envs 8
+::
 
-# 只训平地
-.venv\\Scripts\\python.exe scripts\\train.py --stage flat --run-name go2_flat
+    # 完整课程 (平地 -> 5cm -> 12cm -> 19cm), 8 个 CPU 环境
+    .venv\\Scripts\\python.exe scripts\\train.py --run-name go2_curriculum --n-envs 8
 
-# 冒烟测试 (几十秒, 验证流水线能跑通)
-.venv\\Scripts\\python.exe scripts\\train.py --smoke --run-name smoke
+    # 只训平地 / 只训某一阶段
+    .venv\\Scripts\\python.exe scripts\\train.py --stage flat --run-name go2_flat
 
-# 从检查点继续
-.venv\\Scripts\\python.exe scripts\\train.py --resume runs\\go2_curriculum\\model_final --stage medium
+    # 冒烟测试 (几十秒, 验证流水线能跑通)
+    .venv\\Scripts\\python.exe scripts\\train.py --smoke --run-name smoke
 
-# 打开域随机化 (第八步)
-.venv\\Scripts\\python.exe scripts\\train.py --randomize --randomize-from easy
+    # 从检查点继续 (注意: --resume 会静默忽略 --net-arch/--learning-rate/--target-kl)
+    .venv\\Scripts\\python.exe scripts\\train.py --resume runs\\go2_curriculum\\model_final --stage medium
 
-# 残差 RL: 在搜索到的开环 trot 先验上学习 (推荐的训练方式, 理由见 robotdog/gait.py)
-.venv\\Scripts\\python.exe scripts\\train.py --gait-prior --run-name go2_gait --n-envs 8
+    # 残差 RL: 在搜索到的开环 trot 先验上学习 (推荐的训练方式, 理由见 robotdog/gait.py)
+    .venv\\Scripts\\python.exe scripts\\train.py --gait-prior --run-name go2_gait --n-envs 8
 
-怎么验证
---------
-1. 脚本会打印每个阶段的成功率/摔倒率/步数, 并在结束时打印汇总表。
-2. ``runs/<名字>/summary.json`` 有机器可读的每阶段结果。
-3. ``runs/<名字>/model_final.zip`` + ``vecnormalize.pkl`` 是最终策略。
-4. ``runs/<名字>/checkpoints/`` 里是定期检查点。
-5. tensorboard: ``.venv\\Scripts\\python.exe -m tensorboard.main --logdir runs\\<名字>\\tensorboard``
-6. 用 ``scripts\\eval.py`` 在**没见过的**楼梯上评估 (第九步)。
-
-注意 (沙箱限制)
----------------
-本机禁止 Windows 命名管道, ``SubprocVecEnv`` 会报 ``PermissionError: [WinError 5]``。
-所以 ``--n-envs 8`` 实际是 ``DummyVecEnv(8)``: 单进程里顺序推进 8 个环境。
-实测端到端 ≈ 560 steps/s (8 环境 + PPO), 100 万步 ≈ 30 分钟。
+验证与产物见 ``train.md``; ``--help`` 列出全部开关 (含 ``--cfg KEY=VALUE`` 覆盖)。
 """
 
 from __future__ import annotations
@@ -192,20 +178,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "它看不见的量打分，只能靠关节速度和 10 帧历史反推，这是"
                         "『走不直怎么也修不好』的结构性原因。世界系版本 (base_lin_vel)"
                         "会随机身 yaw 改变含义，不适合做前进命令跟踪。")
-    p.add_argument("--obs-foot-lift-gap", action=argparse.BooleanOptionalAction,
-                   default=False, dest="obs_foot_lift_gap",
-                   help="观测里附加 4 维『每只脚**上一轮摆动**离越过台阶还差多少』"
-                        "（按 lift_goal 归一化, clip 到 [0,1], 0=已经抬够）。用"
-                        "**摆动峰值**结算，所以支撑相也携带『这只脚上一轮尝试的"
-                        "结果』。")
-    p.add_argument("--obs-foot-lift-deficit", action=argparse.BooleanOptionalAction,
-                   default=False, dest="obs_foot_lift_deficit",
-                   help="观测里附加 4 维『每只脚**此刻**还要再抬高多少才能越过它"
-                        "将踩上去的那一级』（按 lift_goal 归一化, clip 到 [0,1]）。"
-                        "参照面是**落脚面**（脚当前位置与落脚区间内最高的踏面），"
-                        "见 --cfg reward.foot_placement_reach。与上一条的分工是"
-                        "『当下 / 回顾』：只有 gap 时策略要等落地才知道失败原因，"
-                        "只有 deficit 时支撑相读到的是与刚做过的动作无关的数。")
     # --- 奖励归一化 -------------------------------------------------- #
     p.add_argument("--norm-reward", action=argparse.BooleanOptionalAction,
                    default=False, dest="norm_reward",
@@ -348,15 +320,13 @@ def _quote_arg(a: str) -> str:
 
 
 def reproduce_command(argv: list[str] | None) -> str:
-    """The exact command line that produced this run.
+    """产出这个 run 的**准确**命令行。
 
-    This used to be hand-curated from five arguments (``--run-name``,
-    ``--n-envs``, ``--seed``, ``--stage``), which meant the ``reproduce`` field
-    of ``summary.json`` looked authoritative but silently dropped every flag
-    that actually shapes the model -- ``--stage-top-cm``, ``--mixed-heights``,
-    ``--resume``, the ``--obs-*`` switches, ``--gait-prior`` and all ``--cfg``
-    overrides.  Re-running it produced a *different* robot.  Echo the real argv
-    instead, so the recorded command is honest by construction.
+    早先这里是人工挑选五个参数 (``--run-name``/``--n-envs``/``--seed``/``--stage``),
+    于是 ``summary.json`` 的 ``reproduce`` 字段看着权威, 却静默丢掉了所有真正塑造模型
+    的开关 (``--stage-top-cm``, ``--mixed-heights``, ``--resume``, ``--obs-*``,
+    ``--gait-prior`` 以及全部 ``--cfg`` 覆盖), 照着重跑会得到**另一个**机器人。
+    直接回显真实 argv, 记录就天然诚实。
     """
     args = list(sys.argv[1:] if argv is None else argv)
     return " ".join([sys.executable, "scripts/train.py"]
@@ -404,8 +374,6 @@ def main(argv=None) -> int:
     cfg.obs.stair_probe = bool(args.obs_stair_probe)
     cfg.obs.drift = bool(args.obs_drift)
     cfg.obs.base_lin_vel_body = bool(args.obs_base_lin_vel_body)
-    cfg.obs.foot_lift_gap = bool(args.obs_foot_lift_gap)
-    cfg.obs.foot_lift_deficit = bool(args.obs_foot_lift_deficit)
     cfg.terminate_contact = str(args.terminate_contact)
     if cfg.obs.foot_height or cfg.obs.base_height:
         print(f"[观测] 已扩展: base_height={cfg.obs.base_height} "

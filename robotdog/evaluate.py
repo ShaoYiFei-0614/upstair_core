@@ -1,19 +1,17 @@
-"""第九步: 策略评估与导出 (ONNX / TorchScript)。
+"""第 9 步: 策略评估与导出 (ONNX / TorchScript)。
 
-## 评估内容 (用户规格)
-"测试没见过的楼梯。看成功率、速度、姿态、摔倒次数。保存最好策略, 导出 ONNX 或
-TorchScript。"
+用户规格: "测试没见过的楼梯。看成功率、速度、姿态、摔倒次数。保存最好策略, 导出
+ONNX 或 TorchScript。"
 
-* **没见过的楼梯**: :func:`unseen_terrains` 生成的台阶高度/踏面宽度都不在训练
-  课程里出现过 (训练用 5 / 12 / 19 cm 台阶 + 50 cm 踏面)。
+* **没见过的楼梯**: :func:`unseen_terrains` 的台阶高/踏面宽都不在课程里出现过
+  (训练用 5/12/19 cm 台阶 + 50 cm 踏面)。
 * **成功率 / 速度 / 姿态 / 摔倒次数**: 见 :class:`TerrainResult`。
 * **导出**: :func:`export_onnx` / :func:`export_torchscript`。
 
-## 为什么导出时要内嵌观测归一化
-训练用了 ``VecNormalize(norm_obs=True)``, 策略实际吃的是
-``clip((obs - mean)/sqrt(var + eps), -clip_obs, clip_obs)``。
-如果导出裸策略, 部署方必须自己复现这套统计量, 很容易搞错。所以导出时把归一化
-**折叠进模型**: ONNX/TorchScript 接受**原始 420 维观测**, 内部自己做归一化。
+**导出时内嵌观测归一化**: 训练用了 ``VecNormalize(norm_obs=True)``, 策略实际吃
+``clip((obs - mean)/sqrt(var + eps), ±clip_obs)``。导出裸策略会让部署方必须自己
+复现这套统计量, 很容易搞错, 所以把归一化**折叠进模型**: ONNX/TorchScript 接受
+**原始 420 维观测**, 内部自己做归一化。
 """
 
 from __future__ import annotations
@@ -52,12 +50,10 @@ def trained_terrains() -> list[tuple[str, StairSpec]]:
 
 
 def unseen_terrains() -> list[tuple[str, StairSpec]]:
-    """Step heights and tread widths deliberately off the training grid.
+    """台阶高与踏面宽都刻意偏离训练网格的地形。
 
-    Includes both **interpolation** (7 cm sits between the 5 and 12 cm stages)
-    and **extrapolation** (23 cm is above the hardest training stage), plus
-    tread widths other than the trained 50 cm, plus a pyramid (up then down)
-    which the curriculum never trained at all.
+    同时包含**内插** (7 cm 落在 5 与 12 cm 阶段之间) 与**外推** (23 cm 高于最难的
+    训练阶段), 以及非 50 cm 的踏面、和课程从未训练过的金字塔 (先上后下)。
     """
     out: list[tuple[str, StairSpec]] = [
         ("unseen_h07_t50", demo_stairs_spec(step_height=0.07, tread=0.50, n_up=8,
@@ -114,11 +110,10 @@ def all_terrains(include_random: int = 0, seed: int = 12345,
 
 @dataclass
 class TerrainResult:
-    """Per-terrain evaluation metrics.
+    """单个地形的评估指标。
 
-    ``success_rate`` / ``fall_rate`` / ``timeout_rate`` are the user's
-    "成功率 / 摔倒次数"; ``mean_forward_speed`` and the posture fields are
-    "速度 / 姿态".
+    ``success_rate`` / ``fall_rate`` / ``timeout_rate`` 对应用户要的「成功率 /
+    摔倒次数」; ``mean_forward_speed`` 与姿态各项对应「速度 / 姿态」。
     """
 
     terrain: str
@@ -354,7 +349,7 @@ def evaluate_all(
 
 
 def summarize(results: Sequence[TerrainResult]) -> dict[str, Any]:
-    """Group-wise aggregate, keyed by the terrain-name prefix before ``_``."""
+    """按组聚合, 组名取地形名 ``_`` 之前的词缀。"""
     groups: dict[str, list[TerrainResult]] = {}
     for r in results:
         key = r.terrain.split("_")[0]
@@ -415,11 +410,8 @@ def format_table(results: Sequence[TerrainResult]) -> str:
 
 
 def straightness_line(r: TerrainResult) -> str:
-    """One-line straightness verdict for a single terrain result.
-
-    The thresholds are deliberately coarse: the thing being measured is "does
-    the robot hold its lane", not a millimetre-accurate path tracker.
-    """
+    """单个地形的"是否走直线"一行判语。阈值刻意粗糙: 要衡量的是"机器人有没有守住
+    自己的车道", 不是毫米级路径跟踪。"""
     y = r.mean_abs_y
     head = r.mean_abs_heading_deg
     if y <= 0.10 and head <= 5.0:
@@ -465,7 +457,7 @@ def termination_breakdown(results: Sequence[TerrainResult]) -> dict[str, int]:
 
 
 def _vecnormalize_stats(model) -> tuple[np.ndarray | None, np.ndarray | None, float]:
-    """Pull ``(mean, var, clip_obs)`` out of the model's VecNormalize, if any."""
+    """若模型带 VecNormalize, 取出 ``(mean, var, clip_obs)``。"""
     getter = getattr(model, "get_vec_normalize_env", None)
     venv = getter() if callable(getter) else None
     if venv is None or getattr(venv, "obs_rms", None) is None:
@@ -478,10 +470,10 @@ def _vecnormalize_stats(model) -> tuple[np.ndarray | None, np.ndarray | None, fl
 
 
 def build_inference_module(model, *, epsilon: float = 1e-8):
-    """A ``torch.nn.Module`` mapping **raw** observation -> clipped action.
+    """把**原始**观测映射到裁剪后动作的 ``torch.nn.Module``。
 
-    Bakes in VecNormalize's running statistics so the exported artifact is
-    self-contained: feed it the same 420-dim observation the env produces.
+    把 VecNormalize 的 running statistics 烘进去, 导出件自包含: 喂它环境产出的
+    同一个 420 维观测即可。
     """
     import torch
     import torch.nn as nn
@@ -584,10 +576,9 @@ def check_onnx(path: str | Path) -> dict[str, Any]:
 
 def verify_onnx_numeric(path: str | Path, module, obs_dim: int,
                         *, n_samples: int = 8, tol: float = 1e-4) -> dict[str, Any]:
-    """Run onnxruntime on random observations and compare with PyTorch.
+    """用 onnxruntime 跑随机观测并与 PyTorch 比对。
 
-    This is the real proof that the exported file computes the same function;
-    ``onnx.checker`` alone only proves the graph is well-formed.
+    这才是"导出文件算的是同一个函数"的真正证明; ``onnx.checker`` 只证明图是合法的。
     """
     import torch
     result: dict[str, Any] = {"available": False}
@@ -620,15 +611,12 @@ def verify_onnx_numeric(path: str | Path, module, obs_dim: int,
 
 
 def _ascii_scratch_dir() -> Path:
-    """A writable **pure-ASCII** directory, needed to appease libtorch.
+    """一个可写的**纯 ASCII** 目录 —— 为安抚 libtorch。
 
-    ``torch.jit.save`` is implemented in C++ and takes its destination as a
-    ``const char*``; on Windows that is decoded through the ANSI code page
-    (GBK/936 here), so a UTF-8 path such as ``D:\\项目\\...`` turns into
-    mojibake and libtorch reports ``Parent directory ... does not exist`` even
-    though it plainly does.  This is the *same* root cause as the MuJoCo
-    ``meshdir`` asset-loading failure documented in
-    :mod:`robotdog.go2_model`.
+    ``torch.jit.save`` 是 C++ 实现, 目标路径按 ``const char*`` 处理; Windows 上会用
+    ANSI 代码页 (这里是 GBK/936) 解码, 于是 ``D:\\项目\\...`` 这类 UTF-8 路径变成乱码,
+    libtorch 报 ``Parent directory ... does not exist``, 尽管目录明明存在。这与
+    :mod:`robotdog.go2_model` 里记录的 MuJoCo ``meshdir`` 资产加载失败是同一个根因。
     """
     import os
     import tempfile
@@ -661,7 +649,7 @@ def _ascii_scratch_dir() -> Path:
 
 
 def _write_via_ascii_path(payload_writer, target: Path) -> None:
-    """Run ``payload_writer(ascii_path)`` then copy the bytes to ``target``."""
+    """先跑 ``payload_writer(ascii_path)``, 再把字节拷到 ``target``。"""
     import os
 
     scratch = _ascii_scratch_dir() / f"dsh_export_{os.getpid()}.tmp"
@@ -677,11 +665,10 @@ def _write_via_ascii_path(payload_writer, target: Path) -> None:
 
 
 def load_torchscript(path: str | Path, *, device: str = "cpu"):
-    """Load a TorchScript module, working around libtorch's ASCII-only paths.
+    """加载 TorchScript 模块, 绕过 libtorch 只认 ASCII 路径的问题。
 
-    ``torch.jit.load`` is C++ too, so on this machine a ``.pt`` sitting under
-    ``D:\\项目\\...`` cannot be opened directly.  We stage a temporary copy in a
-    pure-ASCII directory, load it, and delete the copy.
+    ``torch.jit.load`` 同样是 C++, 所以 ``D:\\项目\\...`` 下的 ``.pt`` 无法直接打开;
+    这里先在纯 ASCII 目录放一份临时拷贝, 加载完再删掉。
     """
     import os
     import uuid

@@ -1,40 +1,35 @@
 """把 checkpoint 回放成 GIF —— 「训练效果」的肉眼版证据。
 
-`scripts/eval.py` 给出的是数字（成功率/速度/姿态），这个脚本给出的是画面：
-加载一个 checkpoint，让它在指定楼梯上跑几个回合，把每帧离屏渲染出来，
-叠上 HUD 文字，编码成动画 GIF，全部写到 ``output/``。
+``scripts/eval.py`` 给的是数字 (成功率/速度/姿态), 这个脚本给的是画面: 加载一个
+checkpoint, 在指定楼梯上跑几个回合, 每帧离屏渲染、叠 HUD 文字、编码成动画 GIF。
 
-用法示例
---------
+用法
+----
 ::
 
-    # ① 课程每一档各出一段 GIF（最直观地看到「越训越强」）
+    # 课程每一档各出一段 GIF (最直观地看到「越训越强」)
     .venv\\Scripts\\python.exe scripts\\render_checkpoint.py --run course8 --all-stages --episodes 3
 
-    # ② 只看某一档，换追尾视角、前半速
-    .venv\\Scripts\\python.exe scripts\\render_checkpoint.py --run course8 --stage easy3 --n-up 5 --camera chase
+    # 只看某一档, 换追尾视角
+    ... scripts\\render_checkpoint.py --run course8 --stage easy3 --n-up 5 --camera chase
 
-    # ③ 最终模型在**没见过**的楼梯上（第九步的泛化性）
-    .venv\\Scripts\\python.exe scripts\\render_checkpoint.py --run course8 --unseen --episodes 2
+    # 最终模型在**没见过**的楼梯上 (泛化性)
+    ... scripts\\render_checkpoint.py --run course8 --unseen --episodes 2
 
-    # ④ 平地行走 / 指定台阶
-    .venv\\Scripts\\python.exe scripts\\render_checkpoint.py --run course8 --flat
-    .venv\\Scripts\\python.exe scripts\\render_checkpoint.py --run course8 --step-height-cm 6 --n-up 8
-
-    # ⑤ 只要 GIF（第二十五步起 ``output`` 的交付件只有 GIF 一种）
-    .venv\\Scripts\\python.exe scripts\\render_checkpoint.py --run course8 --all-stages --no-strip --no-report
+    # 平地 / 指定台阶高
+    ... scripts\\render_checkpoint.py --run course8 --step-height-cm 6 --n-up 8
 
 产物
 ----
 ::
 
-    output/gifs/<名字>.gif            动画（默认半尺寸，可直接贴进 README）——唯一交付件
-    output/stills/<名字>_strip.png     12 帧横向拼图（静态预览；--no-strip 不写）
-    output/frames/<名字>/f0000.png …   逐帧 PNG（只在 --save-frames 时写）
-    output/reports/render_<名字>.json  每回合的步数/前进距离/成功与否（--no-report 不写）
+    output/gifs/<名字>.gif            动画 (默认半尺寸) —— **唯一交付件**
+    output/stills/<名字>_strip.png     12 帧横向拼图 (--no-strip 不写)
+    output/frames/<名字>/f0000.png …   逐帧 PNG (只在 --save-frames 时写)
+    output/reports/render_<名字>.json  每回合的步数/前进/成功与否 (--no-report 不写)
 
-后面三个都是**中间产物**：`output/` 的交付物只有 `gifs/`，所以这些目录只在真的写
-东西时才被创建；批量重渲交付 GIF 时建议直接加 `--no-strip --no-report`。
+后三个都是中间产物, 只在真的写东西时才创建; 批量重渲交付 GIF 建议加
+``--no-strip --no-report``。
 """
 
 from __future__ import annotations
