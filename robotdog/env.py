@@ -210,10 +210,15 @@ class Go2StairsEnv(gym.Env):
             self._scene_option = None
 
     def set_stair(self, stair: StairSpec) -> None:
-        """替换地形（课程学习会用到）。会重新编译模型。
+        """替换地形。会重新编译模型。
 
         调用方之后必须调用 ``reset()``：重新编译会替换底层的
         ``MjModel``/``MjData``，所以旧状态没有意义。
+
+        **当前没有任何调用点**（本轮清理时删掉了唯一调用者
+        ``training.set_terrain()``）：课程的每一级都是新建一个环境
+        （``make_vec_env``），不是复用同一个环境换地形。保留它是因为
+        「换地形」本身是真需求，而且文档把它当公开 API 记录。
         """
         self.stair = stair
         self._build_model()

@@ -18,7 +18,7 @@ this module.」，现译文为「本模块中没有任何触觉传感器、没�
 
 * 观测拼装：固定 42 维单帧（`ObsConfig.base_frame_size`）+ `history_len` 帧历史栈，
   四个可选块由布尔开关按声明顺序追加（`_obs_frame` / `_observation`）。
-* 奖励计算：**公式不在这里**，整块搬到了 `robotdog/reward.py`；本模块只留一个三行转发方法 `_compute_reward`（`robotdog/env.py:344`）。
+* 奖励计算：**公式不在这里**，整块搬到了 `robotdog/reward.py`；本模块只留一个三行转发方法 `_compute_reward`（`robotdog/env.py:349`）。
 * 终止/成功判据：摔倒（高度 / 倾角）、**躯干连续接触**致命性、超时截断、
   终点粘性标记（`_reached_top`）。
 * 控制回路：残差关节目标合成、PD 律、
@@ -47,7 +47,7 @@ this module.」，现译文为「本模块中没有任何触觉传感器、没�
 ### 3.1 残差 RL 的两个尺度必须分开
 
 `target = home_angles + gait_gain * gait.radians(phase) + action_scale * action`
-（`_target_from_action`，`robotdog/env.py:539`）。
+（`_target_from_action`，`robotdog/env.py:544`）。
 
 `EnvConfig.action_scale`（默认 `0.30`）是**策略权限**，`GaitParams.action_scale`（默认
 `default_trot()` = `0.90`）是**先验幅度**。两者刻意不共用：
@@ -61,7 +61,7 @@ this module.」，现译文为「本模块中没有任何触觉传感器、没�
   故意忽略先验）。它从未被任何一次训练或被参数搜索用过，已随本轮清理连同
   `EnvConfig.action_mode` 字段一起删除；现在只有残差一条路径。
 * `gait_prior` 默认 `False`，所以「无先验」这条路径仍然可用；`_gait_action()`
-  （`robotdog/env.py:529-537`）在关闭或 `gait_gain == 0.0` 时返回 `zeros(12)`，
+  （`robotdog/env.py:534-542`）在关闭或 `gait_gain == 0.0` 时返回 `zeros(12)`，
   使 `_target_from_action()` 对「无先验」和「`GaitParams.static()`」是**同一条代码路径**。
 * 先验**只能在构造时定**：`set_gait_prior()`（在线切换先验的旧 API，docstring 曾自称
   "used by the CLI"，但那个 CLI 开关早已删除）已在死代码清理中删除。要换先验就换
@@ -102,7 +102,7 @@ base_frame_size: int = 42
 
 `qpos[0:3]` 世界位置、`qpos[3:7]` 四元数 `(w,x,y,z)`、`qvel[0:3]` 世界线速度、
 **`qvel[3:6]` 是机身（local）角速度** —— 这正是真实 IMU 陀螺的输出，所以
-`base_ang_vel_body`（`robotdog/env.py:274-276`）直接返回它，不做任何旋转变换
+`base_ang_vel_body`（`robotdog/env.py:279-281`）直接返回它，不做任何旋转变换
 （docstring：「陀螺读数。qvel[3:6] 已经在机体系下。」）。
 
 * **否决方案**：把角速度转到世界系再用，或从四元数数值微分。前者随 yaw 改变含义，
@@ -119,7 +119,7 @@ base_frame_size: int = 42
 * 修法：加**线性**伴项 `forward_progress * clip(vx, -0.5, 1.5)`，它在 `vx=0` 处**恰好为 0**，
   梯度永不消失；再配合把 `alive` 压在 `0.15`，站桩不再划算（`experience.md` §2.2）。
 * 注意 `forward_vel_sigma` 在源码里**没有被平方**：分母就是 `rc.forward_vel_sigma` 本身
-  （`robotdog/env.py:363`），所以这个参数不是标准差的单位。
+  （`robotdog/env.py:368`），所以这个参数不是标准差的单位。
 * **否决方案**：只调小 `forward_vel_sigma`。σ→0 让高斯变成尖峰，远离指令处梯度全为 0；
   而且 `vx=0` 的正基座只被削小、不会消失。
 
@@ -162,7 +162,7 @@ x 的**阶梯函数**），**不是** `_height_reference()`：
 
 ### 3.8 终止：`terminate_contact_steps=10` 的躯干接触消抖 + 腿接触只罚不死
 
-`_contact_fatal()`（`robotdog/env.py:418-430`）**只**对躯干接触计数：
+`_contact_fatal()`（`robotdog/env.py:423-435`）**只**对躯干接触计数：
 
 ```python
 self._trunk_contact_streak = self._trunk_contact_streak + 1 if trunk_contact else 0
@@ -179,11 +179,11 @@ return self._trunk_contact_streak >= self._effective_contact_steps()
   机器人还没碰到台阶就被「腿刮一下」判死了，试错被彻底杀掉（`experience.md` §2.4）。
 * streak 计数器在 `_contact_fatal()` 内推进而不是在 `step()` 里，这样「一次 `_terminated()`
   == 一个控制步」对直接驱动 `_terminated` 的回归测试也成立。
-* `_contact_flags()`（`robotdog/env.py:379-393`）对空集合显式提前返回 `(False, False)`。
+* `_contact_flags()`（`robotdog/env.py:384-398`）对空集合显式提前返回 `(False, False)`。
 
 ### 3.9 `terminate_height_ref`：默认 `"support"`，不是历史上的 `"base"`
 
-`_fall_reference_height()`（`robotdog/env.py:455-467`）的三个分支：
+`_fall_reference_height()`（`robotdog/env.py:460-472`）的三个分支：
 
 | 取值 | 参照面 |
 | --- | --- |
@@ -264,7 +264,7 @@ class ObsConfig:
 ### 4.2 `RewardConfig`（24 个字段）—— 定义在 `robotdog/reward.py`
 
 **整块奖励数学已经搬到 `robotdog/reward.py`**，本模块只剩一个三行转发方法
-`_compute_reward`（`robotdog/env.py:344`）。完整的字段表、逐项公式、数据流与踩坑
+`_compute_reward`（`robotdog/env.py:349`）。完整的字段表、逐项公式、数据流与踩坑
 见 [`reward.md`](reward.md)；这里只记与本模块的接缝。
 
 `EnvConfig.reward` 的默认工厂在 `robotdog/env.py:126`，而 `RewardConfig` 本身由
@@ -273,7 +273,7 @@ class ObsConfig:
 
 `_compute_reward(action, trunk_contact, foot_contact=None, leg_contact=False,
 terminated=False)` 返回 `(逐步奖励 + 终止奖励, terms)`，其中 `terms` 恰好 **15 个键**
-= 14 个逐步成形项 + `"terminal"`。转发方法在 `robotdog/env.py:344`：
+= 14 个逐步成形项 + `"terminal"`。转发方法在 `robotdog/env.py:349`：
 
 ```python
 base, terms, terminal = compute_reward(self, action, trunk_contact, foot_contact,
@@ -323,7 +323,7 @@ class EnvConfig:
   `np.tile(cfg.kp, 4)` / `np.tile(cfg.kd, 4)` 展开成 12 维。选型依据（实测关节惯量、
   自然频率与阻尼比）见 `README.md` §3.4。
 * **只有一个动作映射**：`target = home + gait_gain * gait.radians(t) + action_scale *
-  action`（`robotdog/env.py:539`）。历史上有一个 `action_mode: "absolute"` 分支
+  action`（`robotdog/env.py:544`）。历史上有一个 `action_mode: "absolute"` 分支
   （`target = lo + (a+1)/2*(hi-lo)`），它从未被训练或被搜索用过，已随本次清理删除。
 * `command_vy` / `command_yaw_rate` **也已删除**：奖励里从来没有横向速度项或 yaw rate
   项，`EnvConfig` 里也没有任何读者。改 `config.yaml` 写这两个键现在会报错并列出字段名。
@@ -432,7 +432,7 @@ class Go2StairsEnv(gym.Env):
 
 * `_terrain_height(x)`：接受标量或数组；**平地阶段（`n_up == 0 and n_down == 0`）直接返回
   `np.zeros_like`**，不走 `stair.height_at()`。
-* `_compute_reward(...)` 是 `robotdog.reward.compute_reward` 的转发（`robotdog/env.py:344`）：
+* `_compute_reward(...)` 是 `robotdog.reward.compute_reward` 的转发（`robotdog/env.py:349`）：
   它调 `compute_reward(self, ...)`，把返回的 `terminal` 写进 `terms["terminal"]`，再返回
   `(base + terminal, terms)`，因此 `reward == sum(terms.values())` 恒成立。
   `foot_contact=None` 时下游会自己调 `_foot_contact_mask()`；`leg_contact=False` 时
@@ -444,7 +444,7 @@ class Go2StairsEnv(gym.Env):
   不参与致命判定）。
 * `_target_from_action(action)`：只有一条路径
   `home_angles + _gait_action() + action_scale * action`，用
-  `np.clip(target, act_low, act_high)` 收尾（`robotdog/env.py:539`）。
+  `np.clip(target, act_low, act_high)` 收尾（`robotdog/env.py:544`）。
 * `_projected_gravity()` 已**删除**（死代码清理）：它定义了 `R^T @ (0,0,-1)` 的展开式，
   却没有任何调用点，观测里也没有重力块。**如果你需要一个「机体系下的重力方向」观测块，
   这段实现只在 HEAD 里能找到**，当前工作区没有。
@@ -463,6 +463,81 @@ class Go2StairsEnv(gym.Env):
   `base_pos[2]`，`terrain_height` 报的是**躯干**下的 `terrain_height_under_base`
   （不是终止用的参照面）；
 * `is_success = bool(_reached_top)`；`fallen = bool(terminated) and not self._reached_top`。
+
+### 4.5 每个成员是干什么的、谁在调它
+
+`Go2StairsEnv` 共 **37 个成员**（不含 dunder）。按「谁读它」分成三类，调用点行号都是实测值
+（`.tmp/env_member_use.py` / `.tmp/env_internal_calls.py`）。
+
+**① 只读属性（13 个，各 2~3 行）—— 把 `data` 翻成人话**
+
+| 成员 | 定义 | 返回什么 | 谁在用 |
+| --- | --- | --- | --- |
+| `base_pos` | `:253` | `qpos[0:3]`，机身世界系位置 | `reward.py:176`（高度项）、`play.py:280/295-298`（前进距离） |
+| `base_rpy` | `:257` | `quat_to_rpy(qpos[3:7])`，roll/pitch/yaw | `reward.py:104`（姿态项）、`env.py:475`（终止判据） |
+| `base_quat` | `:261` | `qpos[3:7]`，四元数 `(w,x,y,z)` | 只被 `base_lin_vel_body` 用（`env.py:275`） |
+| `base_lin_vel_world` | `:265` | `qvel[0:3]`，**世界**系线速度 | `reward.py:105`（前进速度项）、`env.py:614`（`info["forward_vel"]`） |
+| `base_lin_vel_body` | `:269` | `R(q)^T @ qvel[0:3]`，机体系线速度 | **观测块**（`env.py:332`，`config.yaml` 已开） |
+| `base_ang_vel_body` | `:279` | `qvel[3:6]`，陀螺读数 | **观测块**（`env.py:328`，恒开） |
+| `joint_pos` | `:284` | `qpos[qpos_joint_adr]`，12 个关节角 | **观测块**（`env.py:325`）、`reward.py:183`（关节限位） |
+| `joint_vel` | `:288` | `qvel[qvel_joint_adr]`，12 个关节速度 | **观测块**（`env.py:326`）、`reward.py:178`（关节速度惩罚） |
+| `foot_pos` | `:292` | `(4,3)` 四个足端**球心**的世界位置 | `reward.py:129`（足端速度门控）、`env.py:186/312/443/453/520/606` |
+| `terrain_height_under_base` | `:297` | `stair.height_at(base_pos[0])`，**躯干**下方地形高 | `reward.py:176/192`、`env.py:246/503/513/613` |
+| `yaw` | `:301` | `base_rpy[2]` | **目前没有任何调用点**（保留的理由：平地/未来朝向条件任务需要，且它是文档化的公开属性） |
+| `foot_clearance` | `:307` | `(4,)` 足端**表面**到其正下方地形的间隙（已减足端半径） | `reward.py:140`（足端抬升项） |
+
+**② 内部辅助（18 个）—— 每个只回答一个问题**
+
+| 成员 | 定义 | 作用 | 内部调用点 |
+| --- | --- | --- | --- |
+| `_build_model()` | `:195` | 编译 MJCF、建 `MjModel`/`MjData`、抽 `meta` | `__init__` `:153`、`set_stair` `:224` |
+| `_success_target_x()` | `:230` | 成功要越过的 x（楼梯 = 顶端远边缘；平地 = 固定前进距离） | `:179`、`:225` |
+| `_success_reached()` | `:242` | 本步是否已登顶（x 越过顶端 **且** 高度到位） | `step` `:590` |
+| `_terrain_height(x)` | `:315` | 任意 x 处的地形高；**平地直接返回 0**，不走 `height_at` | `foot_clearance` `:313` |
+| `_obs_frame()` | `:322` | 装配**单帧**观测（按 `ObsConfig` 开关拼接） | `reset` `:528`、`step` `:607` |
+| `_observation()` | `:344` | `np.concatenate(_hist)` → float32，长度 `obs.size` | `reset` `:532`、`step` `:629` |
+| `_compute_reward(...)` | `:349` | 转发 `robotdog.reward.compute_reward`，把 `terminal` 塞进 `terms` | `step` `:596` |
+| `_foot_contact_mask()` | `:362` | `(4,)` bool：每只足端 geom 是否接触地形 | `reset` `:522`、`step` `:584`；**也被 `reward.py:163` 跨模块调用**（`air_time` 项 `foot_contact=None` 时） |
+| `_advance_foot_air_time(fc)` | `:377` | 累加腾空时间、刷新 `_prev_foot_contact` | `step` `:600`（**必须在奖励之后**） |
+| `_contact_flags()` | `:384` | `(trunk_contact, leg_contact)`：躯干 / 腿部是否接触地形 | `step` `:583` |
+| `_effective_contact_steps()` | `:419` | 消抖后的致命接触步数阈值 `max(1, terminate_contact_steps)` | `_contact_fatal` `:435` |
+| `_contact_fatal(tc, lc)` | `:423` | 躯干接触是否已连续够久（**会写** `_trunk_contact_streak`） | `_terminated` `:482` |
+| `_support_height()` | `:437` | 四足下方**最低**地形高（真正撑住机器人的那个面） | `_fall_reference_height` `:472` |
+| `_support_height_mean()` | `:446` | 四足下方地形高的**均值**（可选终止参照，见下） | `_fall_reference_height` `:469` |
+| `_height_reference()` | `:456` | `obs.base_height` 的参照面（= 躯干下地形） | `_obs_frame` `:334` |
+| `_fall_reference_height()` | `:460` | 按 `terminate_height_ref` 三选一：`support_mean` / `support` / 其它→躯干下 | `_terminated` `:476` |
+| `_terminated(tc, lc)` | `:474` | `(terminated, truncated)`：摔倒或致命接触 / 超时 | `step` `:585` |
+| `_gait_action()` | `:534` | 先验在当前相位的关节角偏移；先验关时恒零 | `_target_from_action` `:560` |
+| `_target_from_action(a)` | `:544` | 唯一的动作映射：`home + gait + action_scale*a`，然后 clip | `step` `:570` |
+
+> `_support_height()` 与 `_support_height_mean()` 只差一个 `min`/`mean`，但**不是「更宽松」**：
+> 跨越立面时均值高于最小值，所以会**更早**触发终止；它消除的是 **单帧不连续**
+> （`min` 会在最后一只脚落地时一帧跳一整个立面 ⇒ 幽灵摔倒）。
+> 当前 `config.yaml` 用默认的 `"support"`。
+
+**③ Gymnasium 接口（`__init__` / `reset` / `step` / `render` / `close`）**
+
+| 成员 | 定义 | 谁在调它 |
+| --- | --- | --- |
+| `__init__(stair=None, cfg=None, *, seed=None)` | `:143` | `scripts/train.py:282` 的 `make_env_fn`、`scripts/play.py` |
+| `reset(*, seed=None, options=None)` | `:483` | SB3 自动调；`scripts/play.py:279` 手动调（每回合带新 seed）；`env.py:220` 的 `set_stair` 里也调 |
+| `step(action)` | `:559` | SB3 自动调；`scripts/play.py:288` 手动调（**注意**：`env.py` 里那条 `def step` 上方的 docstring 是说明，不是调用） |
+| `render(camera="side", *, width, height)` | `:636` | 只有 `scripts/play.py:291`（GIF 与静帧） |
+| `close()` | `:696` | `scripts/play.py:458`、`scripts/train.py:290` |
+| `set_stair(stair)` | `:212` | **当前没有任何调用点**。唯一调用者 `training.set_terrain()` 已在本轮清理中删除；课程每一级走 `make_vec_env` 新建环境，而不是换地形。保留是因为「换地形」是真需求且文档把它当公开 API |
+
+**当前实际用到哪些？**
+
+* **`config.yaml` 已开的观测块**只用到 4 个属性：`joint_pos`、`joint_vel`、`base_ang_vel_body`、
+  `base_lin_vel_body`（外加 `base_rpy` 恒在基础帧里）。`base_height` / `gait_phase` 是
+  `false`，所以 `_height_reference()` 当前**没有被实际走到**（它只在 `obs.base_height=true` 时
+  被 `_obs_frame` 调），但仍属于可开的通路。
+* **两个零调用点成员**：`yaw`、`set_stair()`。两者都是**文档化的公开属性/方法**，
+  按本仓的判据保留（见 `experience.md` §9 的「三类假死」）。
+* 其余成员全部有真实读者：奖励侧 9 处（`reward.py` 的 `:104/105/129/134/140/158-165/176-183/192-200`）、
+  播放侧 `play.py`、以及 `step`/`reset` 自身的内部流水线。
+* **`_foot_contact_mask()` 是唯一被跨模块调用的下划线方法**（`reward.py:163`）—— 改它的签名
+  要同时改 `robotdog/reward.py`。
 
 ## 5. 内部结构与数据流
 
@@ -525,7 +600,7 @@ Go2StairsEnv.__init__()
     terminated: terminated = True; truncated = False`。
 11. `reward, terms = _compute_reward(action, trunk_contact, foot_contact,
     leg_contact=leg_contact, terminated=terminated)` —— 终止奖励在这一步内部结算
-    （`robotdog/env.py:344`）。
+    （`robotdog/env.py:349`）。
 12. `_advance_foot_air_time(foot_contact)`（**必须在奖励之后**：`air_time` 读的是落地那一步的
     腾空时长，而奖励已经用掉了这一步的 `_foot_air_time`）。
 14. `_prev_action = _last_action.copy()`；`_last_action = action.copy()`。
@@ -547,7 +622,8 @@ _obs_frame()
 
 `_observation()` = `np.concatenate(self._hist).astype(np.float32)` —— 历史栈**先到先出**，
 所以第 0..9 帧的排布是「最旧 → 最新」，最新一帧在**尾部**。
-`_height_reference()` 直接返回 `terrain_height_under_base`（`robotdog/env.py:451-453`）。
+`_height_reference()` 直接返回 `terrain_height_under_base`，不加任何偏置
+（实现见 `robotdog/env.py:456-458`）。
 
 ### 5.5 奖励调用链
 

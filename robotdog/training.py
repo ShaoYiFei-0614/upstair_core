@@ -23,7 +23,6 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable
 
-import numpy as np
 import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import (
@@ -87,17 +86,6 @@ def make_vec_env(
             venv, training=True, norm_obs=True, norm_reward=norm_reward, clip_obs=10.0
         )
     return venv
-
-
-def set_terrain(venv: VecEnv, stair: StairSpec) -> None:
-    """给每个子环境换地形并 reset。
-
-    地形烘焙在编译后的 MJCF 里，所以每个子环境都要重编译（约 250 ms × n_envs）。
-    ``VecNormalize`` 包装器被刻意复用：上一阶段攒下的观测统计继续有效，课程才能
-    干净地迁移。
-    """
-    venv.env_method("set_stair", stair)
-    venv.reset()
 
 
 # --------------------------------------------------------------------------- #
@@ -164,16 +152,6 @@ def build_ppo(
         seed=seed,
         verbose=verbose,
         )
-
-
-def load_ppo(path: str | Path, venv: VecEnv, *, device: str = "cpu") -> PPO:
-    """加载检查点；``path`` 带不带 ``.zip`` 后缀都可以。"""
-    p = Path(path)
-    if not p.is_file() and p.suffix.lower() != ".zip":
-        alt = p.with_suffix(".zip")
-        if alt.is_file():
-            p = alt
-    return PPO.load(str(p), env=venv, device=device)
 
 
 def load_policy(
@@ -330,9 +308,6 @@ def format_duration(seconds: float) -> str:
     if seconds < 3600:
         return f"{seconds / 60:.1f}min"
     return f"{seconds / 3600:.2f}h"
-def mean_abs_action(actions: np.ndarray) -> float:
-    """``mean(|a|)``：判断策略是否退化成「纯先验」的关键量（健康值约 0.3~0.45）。"""
-    return float(np.mean(np.abs(np.asarray(actions, dtype=np.float64))))
 
 
 __all__ = [
@@ -341,11 +316,8 @@ __all__ = [
     "build_ppo",
     "format_duration",
     "load_policy",
-    "load_ppo",
     "make_env_fn",
     "make_vec_env",
-    "mean_abs_action",
     "restore_vecnormalize",
     "save_vecnormalize",
-    "set_terrain",
 ]

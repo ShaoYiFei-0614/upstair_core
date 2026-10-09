@@ -31,7 +31,7 @@ __all__ = ["console", "paths", "terrain"]
 
 （本文件共 18 行；导入行在 `robotdog/tools/__init__.py:16`，`__all__` 在 `:18`。）
 
-理由：包级命名空间保持成一张**稳定的名称表**，而不是第二套 API 面。全仓消费者都写精确导入 —— `robotdog/env.py:48` 写 `from robotdog.tools.terrain import StairSpec, build_terrain_xml`、`robotdog/training.py:39` 写 `from robotdog.tools.paths import RUNS_DIR`。精确导入让「这个符号来自哪个文件」在阅读时不需要跳转。
+理由：包级命名空间保持成一张**稳定的名称表**，而不是第二套 API 面。全仓消费者都写精确导入 —— `robotdog/env.py:48` 写 `from robotdog.tools.terrain import StairSpec, build_terrain_xml`、`robotdog/training.py:38` 写 `from robotdog.tools.paths import RUNS_DIR`。精确导入让「这个符号来自哪个文件」在阅读时不需要跳转。
 
 **被否决的方案**：
 
@@ -141,8 +141,8 @@ from robotdog.tools.paths import RUNS_DIR
 | `robotdog/go2_model.py:405` | `from robotdog.tools.paths import GENERATED_DIR`（函数内延迟导入） |
 | `robotdog/policy.py:18` | `from robotdog.tools.terrain import StairSpec` |
 | `robotdog/policy.py:301` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec`（函数内延迟导入） |
-| `robotdog/training.py:39` | `from robotdog.tools.paths import RUNS_DIR` |
-| `robotdog/training.py:39` | `from robotdog.tools.terrain import StairSpec` |
+| `robotdog/training.py:38` | `from robotdog.tools.paths import RUNS_DIR` |
+| `robotdog/training.py:38` | `from robotdog.tools.terrain import StairSpec` |
 | `scripts/train.py:54` | `from robotdog.tools import console  # noqa: E402` |
 | `scripts/play.py:48` | `from robotdog.tools import console, paths  # noqa: E402` |
 

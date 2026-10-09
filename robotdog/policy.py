@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 import numpy as np
 

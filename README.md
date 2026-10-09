@@ -19,8 +19,10 @@
 继续练。入口脚本只有两个：`scripts/train.py`（训练）与 `scripts/play.py`（评估 /
 渲染 GIF）。
 
-本文件只讲**环境配置**与**具体代码实现**。配套两份：
+本文件只讲**环境配置**与**具体代码实现**。配套四份：
 
+* [`agent.md`](agent.md) —— **改代码之前先读这份**：仓库地图、最短验证流程、本机硬约束
+  （编码/编码重定向/并发上限）、以及已经实测确认、不要重新论证的领域事实。
 * [`experience.md`](experience.md) —— 踩过的坑、错过的判据、以及为什么默认值是现在这个值。
 * [`train.md`](train.md) —— 训练过程、实测复现结论、能力边界。
 * [`docs/`](docs/README.md) —— `robotdog/` 下**每个 `.py`** 的设计文档（目录一一对应）。
@@ -63,6 +65,13 @@ python -m venv .venv
   （`SEC_E_NO_CREDENTIALS` / `接收时发生错误`，http_code 000），但 **Python 的
   `urllib` 正常**。要下载东西时用 Python，不要用 curl。
 * 约束模式下 pip 需要写系统临时目录，可能被拒绝（`PermissionError: [Errno 13]`）。
+* **读中文：PowerShell 里先设 `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8``。
+  不设它 `Get-Content` 会把 UTF-8 显示成 GBK 乱码，**文件本身没有问题**。
+* **不要内联 `python -c "..."`**：`pwsh` 会吃掉反引号与花括号。写 `.tmp/*.py` 再跑。
+* **长训练必须在受管后台任务里跑并设 `PYTHONUNBUFFERED=1`**：`Start-Process` 起的长任务
+  不跨工具调用存活。**并发上限是 2 臂**（4 臂 × 8 env 会 OOM）。
+
+  以上全部细节见 [`agent.md`](agent.md) §5。
 
 ---
 
@@ -70,7 +79,7 @@ python -m venv .venv
 
 ```
 upstair_core/
-  README.md  experience.md  train.md     三份根文档
+  README.md  agent.md  experience.md  train.md   四份根文档
   config.yaml                            ★ 全部超参（脚本不再从命令行输入）
   requirements.txt
   artifacts/
@@ -114,7 +123,7 @@ upstair_core/
 | `action_scale` | 0.30 rad | 残差的权限；先验走 `GaitParams.action_scale`，**两者独立** |
 | 增益 `kp` / 阻尼 `kd` | `[30, 30, 45]` / `[0.6, 0.6, 0.9]` | 关节 PD，力矩 `tau = kp*(target-q) - kd*qd` 后按 `ctrlrange` 截断；选型依据见下 |
 
-目标角（`robotdog/env.py:539` 的 `_target_from_action()`）：
+目标角（`robotdog/env.py:544` 的 `_target_from_action()`）：
 
 ```python
 target = home + gait_gain * gait.radians(phase) + action_scale * action
@@ -198,7 +207,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 两个关键点：
 
 * **所有奖励数学都在 `robotdog/reward.py`**（纯函数 `compute_reward(env, ...)`），
-  `robotdog/env.py:344` 只留一个三行转发方法。为了便于研究与改动，单看那一个文件就够。
+  `robotdog/env.py:349` 只留一个三行转发方法。为了便于研究与改动，单看那一个文件就够。
 * 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
   （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
   拆解可以安全地相加。
@@ -335,3 +344,105 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
   文件，会退回 `stair_from_height` 的默认 3 cm，需要手动在 `config.yaml` 里写
   `play.stage_height_cm`。
 * **本仓的课程是固定六级**，没有自动晋级/回退、没有域随机化、没有高度带混合。
+
+---
+
+## 6. 代码规模与清理
+
+### 6.1 现在的模块行数
+
+| 文件 | 行数 | 说明 |
+| --- | --- | --- |
+| `robotdog/env.py` | 696 | 环境 + 观测 + 终止 + 渲染（奖励数学已移出） |
+| `robotdog/go2_model.py` | 460 | MJCF 组装 / 场景编译 / 元信息 |
+| `robotdog/curriculum.py` | 309 | 课程数据类 + 汇总写出 |
+| `robotdog/training.py` | 323 | 向量环境 / PPO / 运行目录 / 权重加载 |
+| `robotdog/policy.py` | 323 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
+| `robotdog/reward.py` | 202 | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
+| `robotdog/gait.py` | 191 | 开环 trot 先验 |
+| `robotdog/config.py` | 297 | 读 `config.yaml` |
+| `robotdog/tools/terrain.py` | 242 | 楼梯几何 |
+| `robotdog/tools/paths.py` | **38** | 路径常量（**没有任何函数**） |
+| `robotdog/tools/console.py` | 29 | UTF-8 控制台 |
+| `robotdog/__init__.py` / `tools/__init__.py` | 19 / 18 | 包入口 |
+
+### 6.2 清理掉了哪些（本轮）
+
+判据是**「有没有任何读者」**，用 token 流做全仓引用计数。真删的只有 6 个符号：
+
+`load_ppo()`、`mean_abs_action()`、`set_terrain()`（都在 `robotdog/training.py`）、
+`GO2_SCENE_XML`、`ensure_dir()`、`ensure_output_dirs()`（都在 `robotdog/tools/paths.py`），
+外加三个失去使用者的 import（`training.py` 的 `numpy`、`policy.py` 的 `Sequence`、
+`download_go2.py` 的 `sys`）。
+
+**看起来能删但必须留的 7 个**分两类：框架回调（`scripts/train.py` 里两个 `_on_step`，
+SB3 `BaseCallback` 钩子）、文档化的公开 API（`GaitParams.static()` / `targets()`、
+`policy.Policy`、`StairSpec.down_end_x`、`Go2StairsEnv.yaw`、`Go2StairsEnv.set_stair()`）。
+细节与判据（含「零读者 **且** 不是文档化契约才算死」这条规则）见 `experience.md` §9。
+
+> **`GaitParams.static()` 是文档里「怎么关掉步态先验」的唯一正确写法**，所以哪怕零调用者也留着——
+> 删掉它，文档就在教一个不存在的函数。
+>
+> **`Go2StairsEnv.set_stair()`** 的处境相同但更微妙：它**曾经**有调用者
+> （`training.set_terrain()`），而 `set_terrain` 是零读者所以被删了，于是 `set_stair`
+> 变成零调用点。但「换地形」本身是真需求（当前课程每级是 `make_vec_env` 新建环境，
+> 不是换地形），所以保留。
+
+### 6.3 `env.py` 为什么还有 696 行
+
+它不是「奖励算在里面」——奖励数学在 `robotdog/reward.py`（202 行）。`env.py` 的构成是：
+
+| 类别 | 行数 | 占比 |
+| --- | --- | --- |
+| 代码 | 433 | 62.2% |
+| docstring | 120 | 17.2% |
+| 注释 | 59 | 8.5% |
+| 空行 | 106 | 15.2% |
+
+其中 `class Go2StairsEnv` 一个类占 **559 行**（代码 439），最大的成员是
+`step()`（66 行）、`render()`（59 行）、`__init__()`（49 行）、`reset()`（45 行）、
+`_contact_flags()`（34 行）。
+
+长的原因有三条，都是**有意的**：
+
+1. **一个 Gymnasium 环境的接口面天生就宽**。`step` / `reset` / `render` / `close` +
+   观测 / 终止 / 成功 / 接触 / 高度参照 / 落脚空气时间 / 模型与场景构建 / 楼梯测距，
+   加起来 **37 个成员**（其中 13 个是两三行的只读属性）。这不是「一个类干了很多事」，
+   而是「Gym 环境本来就要求这么多钩子」。
+2. **`render()` 的 59 行是相机与 HUD**，与物理仿真没有关系。它可以搬到 `scripts/play.py`
+   或独立的渲染模块，但那样它就得通过 30 多个 `env.<私有属性>` 读状态——**耦合面反而更大**，
+   所以留在环境里、和状态同生共死。
+3. **盲走设计把状态量摊在了很多小方法里**（`_contact_flags` / `_support_height_mean` /
+   `_fall_reference_height` / `_obs_frame` …）。这是刻意的：每个方法只回答一个问题，
+   且各自有 docstring 说明「为什么不是更简单的写法」（例如 `_support_height_mean` 用均值
+   而不是 `min`，因为 `min` 会在最后一只脚落地时一帧跳一整个立面）。
+
+**如果一定要更短**，唯一的无损做法是把 `render()` 拆出去（约 59 行）；剩下的
+`step` / `reset` / `_obs_frame` / `_compute_reward` 转发 / 接触与终止判据属于环境本体，
+拆开会把「谁能改物理状态」这条边界搅浑。当前的取舍是：**奖励数学已经拆干净，
+渲染暂不拆。**
+
+`Go2StairsEnv` 的 37 个成员逐个是干什么的、各自被谁调用，见
+[`docs/robotdog/env.md`](docs/robotdog/env.md) §4 与 §5。
+
+### 6.4 改完代码怎么验证
+
+`.tmp/` 下六支脚本是回归门（都在 1 秒内跑完，且**不依赖 `runs/` 里的任何权重**）：
+
+```bat
+.venv\Scripts\python.exe -m compileall -q robotdog scripts
+.venv\Scripts\python.exe .tmp\check_lines.py     :: 文档里的 文件.py:行号 是否越界/指向空行
+.venv\Scripts\python.exe .tmp\ref_truth.py       :: 每个行号指向的真实内容（抓「漂移但未越界」）
+.venv\Scripts\python.exe .tmp\check_doc_code.py  :: markdown 的 ```python 块能否 ast.parse
+.venv\Scripts\python.exe .tmp\check_xrefs.py     :: 文档之间的相互引用是否存在
+.venv\Scripts\python.exe .tmp\audit_docs.py      :: 10 节结构 / 交叉引用 / 索引完整性
+```
+
+`check_lines.py` **只报症状不报病因**——两个盲点：①发现不了「文档描述了一个不存在的
+API」；②发现不了「行号整体漂移但没越界」（源文件里加一段 docstring 就会造成这种情况，
+本轮就踩到了：`robotdog/env.py` 的 `set_stair` docstring 加长 5 行，全仓 14 处
+`env.py:344` / `env.py:539` 全部指到了别的函数）。`ref_truth.py` 就是为第 ② 个盲点写的：
+它把每条引用的**真实行内容**打出来，指到 `def`/`class` 就报警。所以改了公开 API 之后
+仍要人工读一遍对应文档。完整的验证流程（含训练/播放冒烟与奖励改动的等价性证明）
+见 [`agent.md`](agent.md) §7。
+

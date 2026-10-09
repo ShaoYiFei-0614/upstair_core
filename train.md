@@ -94,8 +94,15 @@ scripts/train.py
 ```
 
 * **逐级 warm-start**：每一级在上一级的权重上继续练（`PPO.set_parameters`）。
-* **换地形只能在阶段边界**。`set_stair` 会重编译 MJCF（约 250 ms/子环境），
-  在 rollout 中间换会让当次观测与状态不一致，所以切阶段一定发生在 `learn()` 返回之后。
+* **换地形是整环境重建**，不是在原地调 `set_stair`。主循环每一级都 `trainer.make_env(stage)`
+  新建整套 `DummyVecEnv → VecMonitor → VecNormalize`，上一级的链在 `finally: venv.close()`
+  里整体丢掉（地形烘焙在编译后的 MJCF 里，重建才换得干净）。
+  * 连带后果：**`VecNormalize` 的观测统计每级都从零重新攒**，跨级继承的只有权重。
+    所以换级后的前若干步，策略会拿到一套均值/方差还在漂移的观测。
+  * `set_terrain(venv, stair)` 已随死代码清理删除；`Go2StairsEnv.set_stair()` 还在但
+    零调用点（改地形要自己写 `venv.env_method("set_stair", stair)` + `venv.reset()`，
+    代价是每子环境重编译 MJCF 约 250 ms × `n_envs`）。细节见 `experience.md` §9.1
+    与 `docs/robotdog/training.md` §3.5。
 * PPO 的更新粒度 = `n_steps 256 × n_envs 8 = 2048` 步。**每一级至少有 48 次以上更新**，
   这是刻意的：早期版本的课程毕业判据没有最少步数，导致每档只跑 0~1 次更新、策略输出
   恒等于 0（见 `experience.md` §4.1）。
@@ -280,7 +287,11 @@ IK（触地时记抬脚点 → 求目标踏面 → 摆动相插值到落点 → 
 
 ## 4. 训练时的核对清单
 
-1. **观测维数**与 `summary.json` 的 `obs_config` 对得上（默认 460；开 `gait_phase` 是 480）。
+> 改代码之前先读仓根的 [`agent.md`](agent.md)：那里有完整的验证门（5 支 `.tmp/` 校验脚本 +
+> 2 个冒烟）与「改完之后必须跑什么」。
+
+1. **观测维数**与 `summary.json` 的 `obs_config` 对得上（本仓 `history_len=1` ⇒ **46**；
+   改回 10 帧是 460，开 `gait_phase` 再加 20）。
 2. **`*_vecnormalize.pkl` 与 `*.zip` 成对**。缺了它确定性评估会从 100% 掉到 0%。
 3. **`mean|a|` 是否在增长**。停在 0.02~0.10 就是退化成纯先验，继续跑也不会好。
 4. **`train/explained_variance`**。接近 0 或负数说明 critic 没学到东西，先查奖励尺度。
@@ -288,3 +299,6 @@ IK（触地时记抬脚点 → 求目标踏面 → 摆动相插值到落点 → 
    `play.py --mode eval` 复测。
 6. **至少 40 个回合**（`play.py` 默认 100）。
 7. 看产品权重在**没训练过的台阶高**上的表现（泛化）比看训练台阶更有信息量。
+8. **并发上限是 2 臂**（本机 15.7 GB）。4 臂 × 8 env 会报
+   `engine error: Could not allocate memory`，那是内存不足，**不是地形几何问题**。
+

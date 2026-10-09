@@ -70,7 +70,7 @@ target = home + gait_gain * gait.radians(t) + action_scale * action
 ```
 
 `gait.action_scale` 说「先验动作多大」（它是搜索出来的一部分），
-`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:539`）。
+`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:544`）。
 `gait_gain` 默认 `1.0` 且**没有 CLI 开关**，只能改 `cfg`。
 
 **被否决的方案**：共用一个 `action_scale`（先验与策略同权）。否决原因就是上面那条实测：
@@ -391,7 +391,7 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   `ValueError: {path} has no 'top' entries` 或 `IndexError` 上炸掉。
 * **两个 `action_scale` 同名但不同义**：`GaitParams.action_scale`（出货值 `1.0`）是
   「先验幅度」，`EnvConfig.action_scale`（`0.30`）是「策略权限」。源码里没有任何一处把
-  两者相加或相乘后再 clip；真实实现（`robotdog/env.py:539-557`）是
+  两者相加或相乘后再 clip；真实实现（`robotdog/env.py:544-562`）是
   `target = clip(home + gait_gain*gait.radians(t) + cfg.action_scale*action, act_low, act_high)`
   ——clip 的是最终关节目标（用 MJCF 关节限位），没有「先求和再 clip 到 ±1」这一步。
   `grep "action_scale"` 会同时命中两处，对账时注意区分。以代码为准。

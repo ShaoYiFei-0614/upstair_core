@@ -472,3 +472,104 @@ mini-batches, there will be a truncated mini-batch of size 256
 * `extract_meta()` 的 `floor_geom_id` 走 `mj_name2id` 且**不检查 `< 0`**（其余 id 都走
   `_resolve_id` 抛 `KeyError`）；`_OPTION` 正则只认自闭合 `<option .../>`，
   改成非自闭合会**静默失效**。
+
+---
+
+## 9. 死代码清理：哪些能删、哪些看起来能删但必须留
+
+本轮清理用的判据是**「这个符号有没有任何读者」**，用 `.tmp/dead3.py` 按 token 流做全仓引用计数（排除定义行）。它一次报出 13 个「零引用」候选，但**真正该删的只有 6 个**——剩下 7 个每一次都落进下面三类**假死**里。
+
+### 9.1 三类假死（扫描器永远看不出来）
+
+| 类型 | 例子 | 为什么不能删 |
+| --- | --- | --- |
+| **字符串派发** | *（本仓目前没有实例）* | `venv.env_method("某个方法", ...)` 把名字藏在字符串里，AST 看不见。这是最容易误删的一类，改 `DummyVecEnv` 相关代码时留意 |
+| **框架回调** | `ProgressCallback._on_step`（`scripts/train.py:83`）、`CheckpointCallback._on_step`（`scripts/train.py:106`） | SB3 的 `BaseCallback` 按固定名字回调，从不被本仓代码显式调用 |
+| **文档化的公开 API** | `GaitParams.static`（`robotdog/gait.py:170`）、`GaitParams.targets`（`robotdog/gait.py:90`）、`policy.Policy`（`robotdog/policy.py:21`）、`StairSpec.down_end_x`（`robotdog/tools/terrain.py:108`）、`Go2StairsEnv.yaw`（`robotdog/env.py:296`）、`Go2StairsEnv.set_stair`（`robotdog/env.py:212`） | 设计文档把它们的签名与理由逐条写下来了，是给人用的接口面。删掉等于同时删两处文档，而它们各只有 1–5 行 |
+
+**留下的判据**：`GaitParams.static()` 是文档里「怎么关掉先验」的**唯一正确写法**（`docs/robotdog/gait.md:434` 的示例直接 `off = GaitParams.static()`），所以哪怕零调用者也要留——删了文档就在教一个不存在的函数。
+
+**`set_stair()` 的处境更微妙，值得单独记**：它**曾经**有一处真实调用者——`robotdog/training.py` 的 `set_terrain(venv, stair)`（函数体就是 `venv.env_method("set_stair", stair)` + `venv.reset()`）。而 `set_terrain` 自己是零读者，于是被删；删掉它之后 `set_stair` 才变成零调用点。**当前课程根本不用换地形**：`scripts/train.py` 每一级都调 `trainer.make_env(stage)` 新建整个向量环境。所以这条链的真相是「**一个零读者的包装器是另一个符号的唯一调用者**」——删之前必须**看两跳**，否则会把「被间接调用」误判成「被间接需要」。
+
+> **修正一条曾经的错误结论**：本轮清理的早期，`experience.md` 与 `README.md` 都把 `set_stair` 归类为「字符串派发，调用点在 `robotdog/training.py:99` 的 `venv.env_method("set_stair", stair)`」。**那是错的**——全仓 grep `env_method` 与 `set_stair` 只剩定义行与注释，`training.py:99` 是 `build_ppo` 的 `seed: int = 0,` 形参。两个符号当时**都已经删了**。教训：**「字符串派发」这个类别要靠 grep 证明，不能靠印象归类**。
+
+### 9.2 真正删掉的 6 个
+
+| 符号 | 位置 | 为什么它真的死了 |
+| --- | --- | --- |
+| `load_ppo(path, venv, *, device)` | `robotdog/training.py` | `load_policy` 是唯一实际入口；`load_ppo` 是 `PPO.load()` 的薄包装，没有任何调用者 |
+| `mean_abs_action(actions)` | `robotdog/training.py` | 三行的诊断量（`float(np.mean(np.abs(a)))`），训练循环从不统计它；只有临时脚本会算 |
+| `set_terrain(venv, stair)` | `robotdog/training.py` | 函数体就是 `env_method("set_stair")` + `reset()` 两行，没有任何调用者。**删它之前看过两跳**：它自己是零读者，但它是 `set_stair` 的唯一调用者，所以删完 `set_stair` 也变成了零调用点（那个保留了，见 §9.1） |
+| `GO2_SCENE_XML` | `robotdog/tools/paths.py:15` | 本仓从不用官方 `scene.xml`（场景由 `compile_scene()` 现场拼 XML）；`scene.xml` 只在 `scripts/download_go2.py:44` 的 `WANT_FILES` 里以**字符串字面量**出现 |
+| `ensure_dir(path)` | `robotdog/tools/paths.py:29` | 零调用者，且自带两个坑（传 `str` 抛 `AttributeError`、对文件路径会建出同名目录） |
+| `ensure_output_dirs()` | `robotdog/tools/paths.py:35` | 零调用者；`scripts/play.py:215` 的 `write_gif` 自己 `path.parent.mkdir(...)` |
+
+顺带删掉三个**失去全部使用者**的 import：`robotdog/training.py` 的 `numpy`（`mean_abs_action` 是唯一使用者）、`robotdog/policy.py` 的 `Sequence`、`scripts/download_go2.py` 的 `sys`（末尾写的是 `raise SystemExit(main())` 而不是 `sys.exit`）。
+
+### 9.3 教训：符号存废是**人工核对项**，行号检查永远抓不到
+
+删掉 `mean_abs_action` 之后，`robotdog/training.py` 从 350 行变成 **323 行**，于是文档里 6 处指向该文件第 39 行（`RUNS_DIR` 与 `StairSpec` 的 import）与一处 `:295-297`（`RunDir.summary`）的引用全部指到了空行或错误位置。
+
+`.tmp/check_lines.py` 抓到了**全部 7 处**——但它抓到的是**症状**（「这一行是空行」），不是**病因**。真正的原因是「源码少了一行，所有下游行号整体上移」。这意味着：
+
+> **每次删函数、加函数，都必须重跑 `check_lines.py`。** 它报的每一条「是空行」都在说「上游源码行数变了」。而它**永远**不会报「这个函数不存在」——`ensure_dir` 在源码里被删掉之后，文档里那 20 多处提及它依然「行号合法」（因为文档写的是散文，没有行号）。
+
+### 9.4 顺带发现：LF/CRLF 在两种工具之间来回翻转
+
+本仓约定 **CRLF**（`core.autocrlf=true`）。用 `write` 工具整篇重写文件时，输出是 **LF**，于是：
+* `git status` 会警告 `LF will be replaced by CRLF the next time Git touches it`；
+* 更隐蔽的是**行尾不一致本身**——同一个文件里既有 LF 又有 CRLF 时，某些编辑器会显示成「整篇都改了」。
+
+实测有 11 个文件处于裸 LF 状态（`robotdog/env.py`、`robotdog/reward.py`、`scripts/train.py`，以及 8 份文档）。修法是 `.tmp/fix_eol.py`：把 `\r\n` 先归一成 `\n` 再统一展开成 `\r\n`，**只处理含裸 LF 的文本文件**。跑完复检 `still bare-LF: none`，且 `git diff --shortstat HEAD` 没有因为行尾而产生额外的行数变化。
+
+**教训**：整篇 `write` 重写文件之后，要么用 `edit` 做增量修改（保留原行尾），要么立刻跑一次行尾归一化。
+
+---
+
+## 10. 行号漂移：`check_lines.py` 的第二个盲点
+
+### 10.1 症状
+
+给 `robotdog/env.py` 的 `set_stair()` 补了 5 行 docstring（说明「当前零调用点」），
+`robotdog/env.py` 从 696 行长到 **701 行**。于是**它后面所有定义的物理行号整体下移 5 行**：
+
+| 定义 | 改前 | 改后 |
+| --- | --- | --- |
+| `_compute_reward` | 344 | **349** |
+| `_target_from_action` | 539 | **544** |
+| `_gait_action` | 529 | **534** |
+| `_contact_flags` | 379 | **384** |
+| `_contact_fatal` | 418 | **423** |
+| `_fall_reference_height` | 455 | **460** |
+| `base_ang_vel_body` | 274 | **279** |
+| `step` | 559 | **564** |
+
+`check_lines.py` 只报了两条（说是「`robotdog/env.py` 的这一行是空行」）——因为它检查的是
+**范围的两个端点**，而旧写法那两个范围的末尾恰好还落在下一个函数的 docstring 里。
+其余十几处引用（`README.md`、`docs/robotdog/reward.md`、`docs/robotdog/gait.md` …里指向
+`_compute_reward` / `_target_from_action` 的那些）**行号完全合法、指向非空行**，
+只是指向了**别的函数**（旧数字 344 现在落到了 `_observation` 的 `def` 行上）。
+
+### 10.2 病因
+
+> **行号是「相对坐标」，只要上游插/删一行，下游全部失效。**
+> `check_lines.py` 能抓的是「越界」和「空行」——那是**症状**；「漂移」没有任何症状，
+> 因为漂移后的行号依然指向一个合法、非空的 Python 行。
+
+### 10.3 修法（两个层次）
+
+1. **引用写法**：文档引用代码改成 `` `robotdog/env.py` 的 `compute_reward()` `` 这种
+   **文件 + 符号名**形式，行号只在确实要特指某一行实现时才写。符号名不会漂移。
+2. **新增检查器 `.tmp/ref_truth.py`**：把全仓 `.md` 里每条 `文件.py:行号` 引用解析出来，
+   打印它**实际指向的那一行内容**。判据三条：
+   * 越界 → `OOR`；
+   * 空行 → `BAD`；
+   * **指向 `def`/`class` 行但没有预先登记** → `BAD`（因为裸数字指到定义行，几乎总是
+     漂移后随手写下的数字——想指定义就该写符号名）。
+   同时维护一张 `EXPECT` 白名单（「第 N 行应该含 `def xxx`」），合法引用就不会误报。
+   本轮跑完：`refs checked: 210   suspicious: 0`。
+
+**教训**：新增一支脚本的时候，要先问「它**不能**抓什么」。`check_lines.py` 从 CRLF 时代
+就一直在报「是空行」，让人误以为文档行号是有守护的——其实守护的只是「越界」。
+
+

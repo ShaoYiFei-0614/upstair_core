@@ -2,14 +2,13 @@
 
 ## 1. 一句话定位
 
-**工具层**（`robotdog/tools/`）里的**纯数据模块**：把整个项目的目录与关键文件位置定义成一组 `pathlib.Path` 常量，并附两个 `mkdir` 辅助函数。它解决的问题是「同一个目录被十个模块用十种写法拼出来」——所有派生路径只有一个来源，改目录结构只改这一个文件。
+**工具层**（`robotdog/tools/`）里的**纯数据模块**：把整个项目的目录与关键文件位置定义成一组 `pathlib.Path` 常量。它解决的问题是「同一个目录被十个模块用十种写法拼出来」——所有派生路径只有一个来源，改目录结构只改这一个文件。
 
 ## 2. 职责边界
 
 **做**：
 
-* 定义唯一的工作区根 `WORKSPACE`，其余全部由它派生（模型、脚本、实验产物、交付物、生成物）。
-* 提供两个目录创建辅助：`ensure_dir(path)`（`mkdir -p` 并返回路径）、`ensure_output_dirs()`（只建交付物部分）。
+* 定义唯一的工作区根 `WORKSPACE`，其余全部由它派生（模型、实验产物、交付物、生成物）。
 * 用注释把「哪些是交付物、哪些是按需创建的工作目录」写死在常量旁边。
 
 **不做**：
@@ -17,6 +16,7 @@
 * **不做 glob / 不搜文件、不校验文件是否存在、不读文件内容**。
 * **不 import 任何项目模块**（连 `robotdog.tools.*` 都不），只依赖 stdlib `pathlib`。
 * **不在 import 时创建任何目录**（模块顶层没有任何 `mkdir` 调用）。
+* **不提供目录创建辅助**。历史上这里有过 `ensure_dir(path)` / `ensure_output_dirs()` 两个函数，在死代码清理中被删除（见 §8）——现在**本模块只有常量，没有任何函数**。
 * **不清理 / 不删除 / 不归档**目录。
 * **不处理 CLI 覆盖**（例如「用 `--root` 指定另外的输出目录」在调用方实现）。
 * **不 import `robotdog.env`**，不知道 PPO / 课程 / 训练循环。
@@ -26,9 +26,9 @@
 ### 3.1 `WORKSPACE` 用 `Path(__file__).resolve().parents[2]`，并配一条显式注释
 
 ```python
-# .../upstair_core  -- 本文件在 <workspace>/robotdog/tools/ 下，所以往上走三级。
-# （它曾经是 robotdog/paths.py 走两级；搬进 tools 子包后所有派生路径都指错，
-# 直到冒烟测试才被抓到，因此保留这条注释。）
+# .../upstair_core —— 本文件在 <workspace>/robotdog/tools/ 下，所以往上走三级。
+# （它原本是 robotdog/paths.py，只走两级；下沉到 tools 子包后所有派生路径都指向了
+# robotdog/ 里面，直到冒烟测试才被抓住，故留这条注释。）
 WORKSPACE: Path = Path(__file__).resolve().parents[2]
 ```
 
@@ -45,9 +45,7 @@ WORKSPACE: Path = Path(__file__).resolve().parents[2]
 * 用 `importlib.resources` / 打包元数据定位 —— 否决，本仓是「源代码目录 = 工作目录」的形态（`models/`、`scripts/` 与包同级），资源 API 面向的是安装后的包数据，语义不符。
 * 用 `os.getcwd()` —— 否决，工作目录随调用位置变化，训练脚本从别的目录启动就会指向错误位置。
 
-### 3.2 只有 `OUTPUT_GIFS_DIR` 是「交付物」，`output/` 下只有这两个目录
-
-源码把这条写成注释 + 一个专用函数：
+### 3.2 只有 `OUTPUT_GIFS_DIR` 是「交付物」
 
 ```python
 #: 人要**看**的东西放这里。只有 ``gifs/`` 是交付件（``output/gifs/<名字>.gif``），
@@ -58,39 +56,23 @@ OUTPUT_GIFS_DIR: Path = OUTPUT_DIR / "gifs"
 
 理由：`OUTPUT_GIFS_DIR` 存的是**给人看的最终动画**，是仓库的交付物。历史上这里还有 `stills/`（拼图 PNG）、`frames/`（逐帧转储）、`reports/`（渲染 JSON）、`exports/`（预留导出）四个常量，它们随 `scripts/render_checkpoint.py` 一起被删除 —— 那两个脚本与 **4 个 output 子目录常量**是同一批淘汰物（见 `experience.md` 的重构小节）。留下的教训仍然有效：**不要为了「以后可能用得上」预先声明目录**，空目录在归档与对比产物时是噪声，而交付物是否存在本身就是「渲染成功」的证据。
 
-因此现在的形状是：`ensure_output_dirs()` 只建 `(OUTPUT_DIR, OUTPUT_GIFS_DIR)` 两项，其余任何工作目录由**真正要写东西的那个调用方**现建（`scripts/play.py:215` 的 `write_gif` 在保存前自己 `path.parent.mkdir`）。
+### 3.3 目录由**真正要写东西的调用方**现建（本次清理的决定）
 
-**被否决的方案**：干脆不提供 `ensure_output_dirs()`，让每个写者都自己 `ensure_dir` —— 否决，因为 GIF 目录是**约定**（多个脚本都往同一个固定位置写），约定需要一个单一入口来保证一致，否则改目录名要改多处。
+本模块**不提供**创建辅助。当前仓内的三条创建路径全部在调用方：
 
-### 3.3 `ensure_dir` 返回路径，`ensure_output_dirs` 返回 `None`
+| 目录 | 谁建 | 代码位置 |
+| --- | --- | --- |
+| `output/` + `output/gifs/` | `scripts/play.py` 的 `write_gif`，保存前建父目录 | `scripts/play.py:215` `path.parent.mkdir(parents=True, exist_ok=True)` |
+| `runs/<名字>/` 及其子目录 | `robotdog/training.py` 的 `RunDir.ensure()` | `robotdog/training.py:265` |
+| `.generated/` | `robotdog/go2_model.py` 的 `compile_scene`（编译失败才建） | `robotdog/go2_model.py:405-408` |
 
-```python
-def ensure_dir(path: Path) -> Path:
-    """``mkdir -p``，并把路径还回来（方便一行写完）。"""
-```
+**被否决的方案（历史，已随函数一起删除）**：用 `ensure_output_dirs()` 做「启动时一次性准备」，再用 `ensure_dir(path)` 给任意工作目录做 `mkdir -p` 并返回路径（支持 `write_bytes(ensure_dir(d) / "x.bin", blob)` 这种一行式写法）。否决理由是**实证的**：这两个函数从写出来到删除，**全仓零调用者**——`play.py` 由 `write_gif` 自建父目录，`RUNS_DIR` 由 `RunDir.ensure()` 建，`GENERATED_DIR` 由 `compile_scene` 建。一个「约定单一入口」如果没有任何人走这个入口，它就只是**多一条可以腐坏的 API 面**（`ensure_dir` 还有「传字符串抛 `AttributeError: 'str' object has no attribute 'mkdir'`」「对文件路径调用会建出同名目录」两个坑）。真正的约定现在写在常量注释里，而不是写在一个没人调的函数里。
 
-理由：`ensure_dir` 的典型调用点是**表达式里** —— 把「建目录」和「用目录」写成一行：
-
-```python
-write_bytes(ensure_dir(some_work_dir) / "x.bin", blob)
-```
-
-返回 `None` 就只能先写一行语句。而 `ensure_output_dirs` 是「启动时一次性准备」，不需要返回值（返回一个目录列表只会诱导调用方去用它做别的事）。
-
-**被否决的方案**：两个函数统一返回 `None` 或统一返回 `list[Path]` —— 前者牺牲一行式调用点，后者给批量函数凭空加了一个没人要的返回值。
-
-### 3.4 创建一律用 `path.mkdir(parents=True, exist_ok=True)`
-
-* `parents=True`：允许 `output/gifs` 在 `output/` 不存在时一次建成（对应 `mkdir -p`）。
-* `exist_ok=True`：并发/重复调用不抛 `FileExistsError`。这条很重要，因为多个脚本会各自调用 `ensure_output_dirs()`，而本仓明确允许并行 run（上限见 `experience.md` §5.5）。
-
-**被否决的方案**：先 `if not path.exists(): path.mkdir(...)` —— 否决，是 TOCTOU 竞态，且多一次系统调用。
-
-### 3.5 常量全部用**类型注解**写（`WORKSPACE: Path = ...`）
+### 3.4 常量全部用**类型注解**写（`WORKSPACE: Path = ...`）
 
 理由：`Path` 与 `str` 的混淆是本项目最容易犯的类型错误（`path / "x"` 对 `str` 会退化成字符串拼接或抛类型错误）。带注解让 IDE 与类型检查器在调用点就能拦住「把常量当字符串用」。注释用 `#:` 前缀（Sphinx 属性文档语法），说明这些注释是**生成文档用**的，而不是普通行内注释。
 
-### 3.6 `GENERATED_DIR` 用点号前缀
+### 3.5 `GENERATED_DIR` 用点号前缀
 
 ```python
 #: 动态生成的 MJCF 场景（不污染 vendored 的模型目录）。
@@ -99,19 +81,17 @@ GENERATED_DIR: Path = WORKSPACE / ".generated"
 
 理由：这里放的是**调试产物**（编译失败的 MJCF 转储 `failed_scene.xml`，见 `robotdog/go2_model.py:405-408`），不是交付物、也不是可复现的实验产物。两条约束：(1) 不能写进 `MODELS_DIR` —— 那是 vendored 的 Unitree 模型目录，往里丢生成文件会污染「原样拷贝的第三方资产」；(2) 点号前缀让它在 `ls` 里默认不可见，与要长期保留的实验产物 `artifacts/` 在视觉上区分开。
 
-> **注**：`artifacts/` 目录**仍然是有效载荷**（装着出厂步态先验 `artifacts/trot_stairs.json`），但它现在**由 `config.yaml` 的字符串常量 `env.gait_file` 经 `paths.WORKSPACE` 指向**，没有任何 `ARTIFACTS_DIR` 常量 —— 该常量已随死代码清理删除（§9）。
+> **注**：`artifacts/` 目录**仍然是有效载荷**（装着出厂步态先验 `artifacts/trot_stairs.json`），但它现在**由 `config.yaml` 的字符串常量 `env.gait_file` 经 `paths.WORKSPACE` 指向**，没有任何 `ARTIFACTS_DIR` 常量 —— 该常量已随死代码清理删除（§8）。
 
 ## 4. 公开 API
 
-常量（签名逐字来自源码，`robotdog/tools/paths.py:10-26`）：
-
+常量（签名逐字来自源码，`robotdog/tools/paths.py:10-25`）——**9 个，没有函数**：
 ```python
 WORKSPACE: Path = Path(__file__).resolve().parents[2]
 
 MODELS_DIR: Path = WORKSPACE / "models"
 GO2_DIR: Path = MODELS_DIR / "unitree_go2"
 GO2_XML: Path = GO2_DIR / "go2.xml"
-GO2_SCENE_XML: Path = GO2_DIR / "scene.xml"
 GO2_ASSETS_DIR: Path = GO2_DIR / "assets"
 
 RUNS_DIR: Path = WORKSPACE / "runs"
@@ -130,49 +110,28 @@ GENERATED_DIR: Path = WORKSPACE / ".generated"
 | `WORKSPACE` | `<ws>` | 仓库根，唯一来源 | 所有派生的基准，很少被直接使用 |
 | `MODELS_DIR` | `models/` | vendored 模型根 | 派生用 |
 | `GO2_DIR` | `models/unitree_go2/` | Go2 模型目录 | 派生用 |
-| `GO2_XML` | `models/unitree_go2/go2.xml` | 机器人的主 MJCF | `robotdog/go2_model.py:41` |
-| `GO2_SCENE_XML` | `models/unitree_go2/scene.xml` | 官方场景 MJCF | 参考用 |
-| `GO2_ASSETS_DIR` | `models/unitree_go2/assets` | mesh/纹理目录，编译 MJCF 时的 `meshdir` | `robotdog/go2_model.py:41` |
-| `RUNS_DIR` | `runs/` | 每次训练 run 的子目录 | `robotdog/training.py:39` |
-| `OUTPUT_DIR` | `output/` | 给人看的产物根 | `ensure_output_dirs()` |
-| `OUTPUT_GIFS_DIR` | `output/gifs/` | **交付物**：动画 GIF | `scripts/play.py` |
+| `GO2_XML` | `models/unitree_go2/go2.xml` | 机器人的主 MJCF | `robotdog/go2_model.py:38` |
+| `GO2_ASSETS_DIR` | `models/unitree_go2/assets` | mesh/纹理目录，编译 MJCF 时的 `meshdir` | `robotdog/go2_model.py:38` |
+| `RUNS_DIR` | `runs/` | 每次训练 run 的子目录 | `robotdog/training.py:38` |
+| `OUTPUT_DIR` | `output/` | 给人看的产物根 | `scripts/play.py`（经 `write_gif` 建父目录） |
+| `OUTPUT_GIFS_DIR` | `output/gifs/` | **交付物**：动画 GIF | `scripts/play.py:342` |
 | `GENERATED_DIR` | `.generated/` | 调试用生成的 MJCF | `robotdog/go2_model.py:405` |
 
-函数（`robotdog/tools/paths.py:29-38`）：
+`__all__`（`robotdog/tools/paths.py:28-38`）与上表逐字一致，9 项。
 
-```python
-def ensure_dir(path: Path) -> Path:
-    """``mkdir -p``，并把路径还回来（方便一行写完）。"""
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def ensure_output_dirs() -> None:
-    """创建交付需要的 ``output/`` 与 ``output/gifs/``。"""
-    for path in (OUTPUT_DIR, OUTPUT_GIFS_DIR):
-        path.mkdir(parents=True, exist_ok=True)
-```
-
-| 函数 | 参数 | 返回 | 语义 | 异常 |
-| --- | --- | --- | --- | --- |
-| `ensure_dir(path: Path)` | `path`：要建的目录 | `Path`（原样返回入参） | 对**任意**目录做 `mkdir -p`，返回值便于一行式调用 | 权限/磁盘问题冒泡 `OSError`（`PermissionError` 是其子类） |
-| `ensure_output_dirs()` | 无 | `None` | 只建 `OUTPUT_DIR` 与 `OUTPUT_GIFS_DIR` 两个**交付物**目录 | 同上 |
-
-* 两个函数都不吞异常，都不打印，都不检查路径是否真的是目录（若同名文件已存在，`exist_ok=True` 仍会抛 `FileExistsError`）。
-* `ensure_dir` 的入参注解是 `Path` 而非 `str | Path`，传字符串会在 `path.mkdir` 处抛 `AttributeError: 'str' object has no attribute 'mkdir'`。
+**已删除、不要再引用**：`SCRIPTS_DIR`、`ARTIFACTS_DIR`、`LOGS_DIR`、`GO2_SCENE_XML`（= `models/unitree_go2/scene.xml`）、`ensure_dir()`、`ensure_output_dirs()`。其中 `LOGS_DIR` 最具误导性——课程报告早已改写到 `runs/<名字>/summary.json`（`robotdog/training.py` 的 `RunDir.summary_path`）。
 
 ## 5. 内部结构与数据流
 
 常量是**声明式**的，唯一的数据流是「`__file__` → 根 → 派生」：
 
-```
+```text
 Path(__file__).resolve()                          # <ws>/robotdog/tools/paths.py
   → .parents[2]                                   # <ws>
       → WORKSPACE
           → WORKSPACE / "models"                  → MODELS_DIR
               → MODELS_DIR / "unitree_go2"        → GO2_DIR
                   → GO2_DIR / "go2.xml"           → GO2_XML
-                  → GO2_DIR / "scene.xml"         → GO2_SCENE_XML
                   → GO2_DIR / "assets"            → GO2_ASSETS_DIR
           → WORKSPACE / "runs"                    → RUNS_DIR
           → WORKSPACE / "output"                  → OUTPUT_DIR
@@ -180,125 +139,83 @@ Path(__file__).resolve()                          # <ws>/robotdog/tools/paths.py
           → WORKSPACE / ".generated"              → GENERATED_DIR
 ```
 
-两个创建辅助各自独立，互不调用（`ensure_output_dirs` 不调用 `ensure_dir`，它直接写 `mkdir`，因为返回值无用）：
+**模块体内没有第二条语句**：没有 `mkdir`、没有 I/O、没有函数定义。`import robotdog.tools.paths` 的副作用只有构造 10 个 `Path` 对象。
 
-```
-ensure_dir(path)      → path.mkdir(parents=True, exist_ok=True)   → return path
-ensure_output_dirs()  → path.mkdir(parents=True, exist_ok=True)   × 2
-```
+调用方侧的三条典型链：
 
-调用方侧的典型链（给出 GIF）：
+```text
+[编译场景] robotdog/go2_model.py:38 from robotdog.tools.paths import GO2_ASSETS_DIR, GO2_XML
+           robotdog/go2_model.py:405（函数内延迟导入）from robotdog.tools.paths import GENERATED_DIR
+           robotdog/go2_model.py:407 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+                                :408 dump = GENERATED_DIR / "failed_scene.xml"
 
-```
-scripts/play.py:48    from robotdog.tools import console, paths
-scripts/play.py:342   gif = paths.OUTPUT_GIFS_DIR / f"{name}.gif"
-scripts/play.py:215   path.parent.mkdir(parents=True, exist_ok=True)   # write_gif 内部
-```
+[实验产物] robotdog/training.py:38 from robotdog.tools.paths import RUNS_DIR
+           robotdog/training.py:257 self.root = Path(root) if root else (RUNS_DIR / name)
+           robotdog/training.py:265 def ensure(self) -> Path: （真正 mkdir 的地方）
 
-> 注意：`scripts/play.py` **不调用** `ensure_output_dirs()`，它由 `write_gif`
-> 在保存前自己建父目录。当前仓内 `ensure_output_dirs()` 与 `ensure_dir()`
-> **都没有调用方**（见 §9）。
-
-模型编译侧的链（延迟导入 + 仅在失败时落盘）：
-
-```
-robotdog/go2_model.py:41    from robotdog.tools.paths import GO2_ASSETS_DIR, GO2_XML
-robotdog/go2_model.py:405   from robotdog.tools.paths import GENERATED_DIR   # 函数内，失败分支
-                → :414   GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-                → :415   dump = GENERATED_DIR / "failed_scene.xml"
-```
-
-训练产物侧的链（默认值来自工具层、显式覆盖来自调用方）：
-
-```
-robotdog/training.py:39    from robotdog.tools.paths import RUNS_DIR
-robotdog/training.py       self.root = Path(root) if root else (RUNS_DIR / name)
+[交付 GIF] scripts/play.py:48 from robotdog.tools import console, paths  # noqa: E402
+           scripts/play.py:215 path.parent.mkdir(parents=True, exist_ok=True)（在 write_gif 内）
+           scripts/play.py:342 gif = paths.OUTPUT_GIFS_DIR / f"{name}.gif"
 ```
 
 ## 6. 关键常量与默认值
 
-| 项 | 真实值 |
+| 项 | 值 |
 | --- | --- |
-| 上溯级数 | `3`（`parents[2]`），源码注释：本文件在 `<workspace>/robotdog/tools/` 下，所以往上走三级 |
-| 历史级数 | `2`（文件还叫 `robotdog/paths.py` 时的取值） |
-| 常量总数 | **10** 个 `Path`（含 `WORKSPACE`） |
-| `ensure_output_dirs()` 建立的目录数 | 2（`OUTPUT_DIR`、`OUTPUT_GIFS_DIR`） |
-| `output/` 子目录数 | **1**（`gifs`），且它是唯一的交付物 |
-| `mkdir` 关键字参数 | `parents=True, exist_ok=True` |
-| 实测解析结果（本机） | `WORKSPACE` = `D:\项目\RobortDog\upstair_core` |
-| 实测已存在 | 全部 10 个（10/10 `exists() == True`；`output/` 与 `output/gifs/` 由 `scripts/play.py` 的 `write_gif` 按需建立） |
-
-度量方法（可复现）：`for n in dir(paths) if n.isupper(): getattr(paths, n).exists()`。
+| 常量数 | 9 |
+| 函数数 | **0** |
+| `__all__` 项数 | 9 |
+| 模块总行数 | **38** |
+| import 依赖 | stdlib `pathlib` 一项 |
 
 ## 7. 与其它模块的关系
 
-**上游**：仅 stdlib —— `from __future__ import annotations`、`from pathlib import Path`。**不 import numpy、不 import mujoco、不 import 任何 robotdog 模块**。
-
-**下游**（全仓扫描，四处）：
-
-| 位置 | 导入/使用的符号 | 依赖方向为什么是这样 |
-| --- | --- | --- |
-| `robotdog/go2_model.py:41` | `GO2_ASSETS_DIR`, `GO2_XML` | 编译 MJCF 需要机器人主文件与 mesh 目录；这是**环境层**对**工具层**的依赖，方向向下 |
-| `robotdog/go2_model.py:405` | `GENERATED_DIR` | 编译失败要落盘转储；用函数内延迟导入，避免为一个失败分支把常量绑进模块顶层 |
-| `robotdog/training.py:39` | `RUNS_DIR` | 训练产物根目录；`self.root = Path(root) if root else (RUNS_DIR / name)`，即「默认值来自工具层，显式覆盖来自调用方」 |
-| `robotdog/config.py:38` | 整体导入 `paths`（`paths.WORKSPACE`） | 定位仓根的 `config.yaml`；`:181` 再用 `paths.WORKSPACE` 解析 `env.gait_file` 这类相对路径 |
-| `scripts/play.py:48` | 整体导入 `paths`（用 `paths.OUTPUT_GIFS_DIR`） | 写 GIF 交付物 |
-
-**为什么方向只能是这个方向**：路径常量是**零知识**信息（只需要知道仓库长什么样），所以它可以在依赖图最底端被任何层读取；反过来它一旦 import 任何项目模块，就从最底端变成环的一部分。这也解释了为什么本文件**不允许**包含「确保文件存在」之类的校验逻辑 —— 那需要知道业务语义（哪个文件该存在），属于环境层/训练层。
-
-**导入路径唯一**：规范路径是 `robotdog.tools.paths`。仓里**没有**顶层 `robotdog/paths.py`，`from robotdog.paths import ...` 与 `from robotdog import paths` 都会 `ModuleNotFoundError`。早期版本用 `sys.modules[__name__] = _mod` 的替身模块保留过这两条旧路径，已删除 —— 替身本身没有逻辑，只会让 traceback 与 IDE 静态分析指错文件。
+* **向上**被 `robotdog/go2_model.py`（`GO2_ASSETS_DIR`、`GO2_XML`、`GENERATED_DIR`）、`robotdog/training.py`（`RUNS_DIR`）、`robotdog/config.py`（`WORKSPACE`，用于解析 `config.yaml` 里 `env.gait_file` 这种相对路径）、`scripts/play.py`（`OUTPUT_GIFS_DIR`）使用。
+* **向下**不依赖任何模块，也不依赖 `robotdog.tools` 的其它三个模块。
+* `robotdog/tools/__init__.py:16` 把它列进包级导入，所以 `from robotdog.tools import paths` 与 `from robotdog.tools.paths import ...` 等价。**`import robotdog.tools.paths` 只加载 numpy 之外的 stdlib**（本模块自身不拉 Mujoco）。
 
 ## 8. 实测与经验教训
 
-* 并行 run 的上限（为什么重复 `mkdir(exist_ok=True)` 是必要的）、以及后台 run 的输出丢失，见 `experience.md` §5.5、§5.6。
-* Windows 下把脚本输出重定向到文件时的编码/引号坑（会影响「拿到的日志路径里有什么」），见 `experience.md` §5.8。
-* 训练产物的目录结构（`runs/<name>/` 下有什么）与课程如何组织，见 `train.md` §1、§2「产物」（本文档不重复其结论）。
-* **本文档是「常量删了、文档没删」的典型受害样本**：`CONFIGS_DIR`、四个 `output/` 子目录常量、`ensure_dirs()`，以及后来死掉的 `SCRIPTS_DIR` / `ARTIFACTS_DIR` / `LOGS_DIR` 都曾是这里的描述对象。而 `.tmp/check_lines.py` 当时只抓到**三条行号问题**（两条越界、一条指向空行）—— 「函数根本不存在」「常量少了五个」这类事实**行号检查永远抓不到**，只能靠对着源码逐条重写。所以下面这段文字不再写具体行号：一旦源文件再变，它们自己就会变成下一批腐坏引用。
+* **本轮死代码清理删掉的 6 个符号**：
+
+  | 符号 | 曾经的用途 | 为什么删 |
+  | --- | --- | --- |
+  | `ensure_dir(path: Path) -> Path` | `mkdir -p` 并返回路径，便于一行式调用 | 全仓零调用者；且有两个坑（传 `str` 抛 `AttributeError`、对文件路径建出同名目录） |
+  | `ensure_output_dirs() -> None` | 启动时建 `output/` 与 `output/gifs/` | 全仓零调用者；`write_gif` 自己建父目录 |
+  | `GO2_SCENE_XML` | `models/unitree_go2/scene.xml` 的路径 | 本仓从不用官方 `scene.xml`（场景由 `robotdog/go2_model.py:compile_scene()` 现场拼 XML 字符串）；`scene.xml` 只在 `scripts/download_go2.py:44` 的 `WANT_FILES` 里以字面量出现 |
+  | `SCRIPTS_DIR` / `ARTIFACTS_DIR` / `LOGS_DIR` | 早期版本的目录常量 | 只命中定义与 `__all__`；`LOGS_DIR` 尤其误导（报告早已改写到 `runs/<名字>/summary.json`） |
+
+* **本文档曾是「常量删了、文档没删」的典型受害样本**：`CONFIGS_DIR`、四个 `output/` 子目录常量、`ensure_dirs()`，以及后来死掉的 `SCRIPTS_DIR` / `ARTIFACTS_DIR` / `LOGS_DIR` 都曾是这里的描述对象。而 `.tmp/check_lines.py` 当时只抓到**三条行号问题**（两条越界、一条指向空行）——「函数根本不存在」「常量少了五个」这类事实**行号检查永远抓不到**，只能靠对着源码逐条重写。
+* **推论**：本次清理之后，本模块的「越界行号」风险降到最低（38 行、9 个常量），但**符号存废**仍然是人工核对项。
 
 ## 9. 已知限制与坑
 
-* **位置敏感**：把 `robotdog/tools/paths.py` 再挪一层目录，`parents[2]` 立刻错位。历史症状是
-  `FileNotFoundError: ...\robotdog\models\unitree_go2\go2.xml`
-  —— 路径里多出一个 `robotdog\` 段，说明 `WORKSPACE` 被解析成了 `<ws>/robotdog`（即 `parents[1]`）。看到这个报错先查 `parents[N]`，不要先怀疑文件真的丢了。
-* **没有 `ensure_dirs()` 这个函数**。它曾在早期版本里一次性创建 `models/` / `configs/` / `artifacts/` / `runs/` / `logs/` / `.generated/`，已随 `CONFIGS_DIR` 一起删除。现在**没有任何代码创建仓库级目录** —— 它们是仓库快照的一部分（`models/`、`artifacts/`）或由使用者按需创建（`runs/` 由 `RunDir.ensure()`）。想一次建好只能自己循环调 `ensure_dir`。
-* **没有 `CONFIGS_DIR`**。配置不再是「一个 `configs/` 目录」，而是仓根的单文件 `config.yaml`（见 `docs/robotdog/config.md`）。
-* **`SCRIPTS_DIR` / `ARTIFACTS_DIR` / `LOGS_DIR` 三个常量已被删除**（死代码清理，见 `experience.md`）。
-  它们是声明式的「位置表」条目，改动不会影响任何行为 —— 但也意味着**它们指向的目录不会被自动创建**。
-  `artifacts/` 是仓库快照的一部分（装着出厂先验 `trot_stairs.json`），现在由 `config.yaml` 的
-  **字符串常量** `env.gait_file` 经 `paths.WORKSPACE` 指向（`robotdog/config.py:181`）；
-  `scripts/` 是仓库快照本身；`LOGS_DIR` 尤其容易误导 —— 课程报告现在写到
-  `runs/<name>/summary.json`（属性名就是 `RunDir.summary`，`robotdog/training.py:296`），
-  `logs/` 只是历史遗留的空目录。
-* **`ensure_output_dirs()` 只保证 `output/` 与 `output/gifs/` 存在**，不保证任何其他子目录。若将来重新引入工作目录，必须自己先 `ensure_dir(...)`。
-* **`ensure_dir()` 与 `ensure_output_dirs()` 当前都没有调用方**。`scripts/play.py` 的 `write_gif` 在保存前自己 `path.parent.mkdir(parents=True, exist_ok=True)`（`scripts/play.py:215`），`RUNS_DIR` 由 `RunDir.ensure()` 按需创建。两个函数是**对外 API + 约定入口**，保守保留。
-* **传字符串给 `ensure_dir` 会抛 `AttributeError: 'str' object has no attribute 'mkdir'`**，因为注解是 `Path` 且内部直接调 `path.mkdir`。
-* **`ensure_dir` 不能用于文件路径**：对 `<...>/x.bin` 调 `ensure_dir` 会创建出一个**名为 `x.bin` 的目录**，后续 `write_bytes` 报 `PermissionError` / `IsADirectoryError`。要建的是 `path.parent`。
+* **没有 `ensure_dirs()` 这个函数**。它曾在早期版本里一次性创建 `models/` / `configs/` / `artifacts/` / `runs/` / `logs/` / `.generated/`，已随 `CONFIGS_DIR` 一起删除。现在**没有任何代码创建仓库级目录** —— 它们是仓库快照的一部分（`models/`、`artifacts/`）或由使用者按需创建（`runs/` 由 `RunDir.ensure()`）。想一次建好只能自己循环 `path.mkdir(parents=True, exist_ok=True)`。
 * **`output/` 可能不存在**（干净 clone 里就没有），所以直接读 `paths.OUTPUT_GIFS_DIR / "x.gif"` 之前必须保证父目录存在 —— 现在由 `write_gif` 自己保证（Pillow 的 `save` 不会建父目录）。
 * **没有「删除/清理」入口**：想清空产物只能自己在脚本里 `shutil.rmtree`，本模块不提供，避免误删 `runs/`。
+* **`GO2_DIR` 里不含 `scene.xml` 常量**：需要读官方场景请自己拼 `paths.GO2_DIR / "scene.xml"`，但要先确认文件真的在（`scripts/download_go2.py` 会下载它）。
+* **本模块不保证任何路径存在**：`Path` 的构造永远成功，`exists()` 才是判据。
 
 ## 10. 示例用法
 
 ```python
-from robotdog.tools.paths import (
-    OUTPUT_GIFS_DIR,
-    RUNS_DIR,
-    ensure_dir,
-    ensure_output_dirs,
-)
+from robotdog.tools import paths
 
 # 1) 只读常量：不产生任何副作用
-print(RUNS_DIR)                       # D:\项目\RobortDog\upstair_core\runs
-print(OUTPUT_GIFS_DIR)                # D:\项目\RobortDog\upstair_core\output\gifs
+print(paths.RUNS_DIR)                 # D:\项目\RobortDog\upstair_core\runs
+print(paths.OUTPUT_GIFS_DIR)          # D:\项目\RobortDog\upstair_core\output\gifs
 
-# 2) 交付物目录（output/ 与 output/gifs/）
-ensure_output_dirs()
+# 2) 写文件前自己建父目录（本模块不再提供 ensure_* 辅助）
+gif = paths.OUTPUT_GIFS_DIR / "model_final.gif"
+gif.parent.mkdir(parents=True, exist_ok=True)
+gif.write_bytes(b"...")
 
-# 3) 按需工作目录：先建父目录，再用返回值拼路径
-work = ensure_dir(RUNS_DIR / "_scratch")
-report = work / "scratch_report.json"
-print(report)
+# 3) 判定存在性只能靠 exists()，常量本身不代表文件存在
+assert paths.GO2_XML.exists(), f"缺少 Go2 主模型：{paths.GO2_XML}"
 
-# 4) 常用的整体导入（写明自己用的是工具层，避免只看到一个 `paths` 不知道来自哪层）
-from robotdog.tools import paths
-assert paths.OUTPUT_GIFS_DIR == OUTPUT_GIFS_DIR
+# 4) 从 config.yaml 的相对路径还原绝对路径
+from robotdog.config import load_config
+raw = load_config()
+gait_file = paths.WORKSPACE / raw["env"]["gait_file"]
+print(gait_file)                      # ...\artifacts\trot_stairs.json
 ```

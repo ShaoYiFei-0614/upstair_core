@@ -12,7 +12,6 @@ WORKSPACE: Path = Path(__file__).resolve().parents[2]
 MODELS_DIR: Path = WORKSPACE / "models"
 GO2_DIR: Path = MODELS_DIR / "unitree_go2"
 GO2_XML: Path = GO2_DIR / "go2.xml"
-GO2_SCENE_XML: Path = GO2_DIR / "scene.xml"
 GO2_ASSETS_DIR: Path = GO2_DIR / "assets"
 
 RUNS_DIR: Path = WORKSPACE / "runs"
@@ -26,29 +25,14 @@ OUTPUT_GIFS_DIR: Path = OUTPUT_DIR / "gifs"
 GENERATED_DIR: Path = WORKSPACE / ".generated"
 
 
-def ensure_dir(path: Path) -> Path:
-    """``mkdir -p``，并把路径还回来（方便一行写完）。"""
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def ensure_output_dirs() -> None:
-    """创建交付需要的 ``output/`` 与 ``output/gifs/``。"""
-    for path in (OUTPUT_DIR, OUTPUT_GIFS_DIR):
-        path.mkdir(parents=True, exist_ok=True)
-
-
 __all__ = [
     "GENERATED_DIR",
     "GO2_ASSETS_DIR",
     "GO2_DIR",
-    "GO2_SCENE_XML",
     "GO2_XML",
     "MODELS_DIR",
     "OUTPUT_DIR",
     "OUTPUT_GIFS_DIR",
     "RUNS_DIR",
     "WORKSPACE",
-    "ensure_dir",
-    "ensure_output_dirs",
 ]

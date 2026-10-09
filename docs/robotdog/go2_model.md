@@ -593,9 +593,10 @@ robotdog.go2_model
 7. **模块 docstring 里的工作区路径是 `D:\项目\RobortDog\upstair`**，而本仓实际是
    `...\upstair_core`（`tools/paths.py` 的 `WORKSPACE = Path(__file__).resolve().parents[2]`）。
    docstring 是历史漂移，路径以 `paths.py` 为准。
-8. **`GO2_SCENE_XML`（`models/unitree_go2/scene.xml`）在本模块里没有被使用** ——
+8. **`models/unitree_go2/scene.xml` 本模块从不使用，`GO2_SCENE_XML` 常量也已删除** ——
    它是 vendored 的完整场景（`<include file="go2.xml"/>` + 地面 + visual），
    只作为「原版怎么写」的参考。训练路径上真正的场景由 `build_scene_xml` 生成。
+   需要读它请自己拼 `paths.GO2_DIR / "scene.xml"`（`scripts/download_go2.py` 会下载）。
 9. **`trunk_geom_ids` / `leg_geom_ids` 依赖 vendored XML 的 group 约定**：碰撞图元必须在
    `geom_group == 3`，否则两者为空，`env._contact_flags()` 会显式返回 `(False, False)`，
    终止判据静默失效（不会抛错）。

@@ -19,7 +19,7 @@
 **不做**：
 
 * **不加载 PPO**。加载 PPO 需要先有一个环境，那是 `robotdog/training.py` 的
-  `load_ppo()` / `load_policy()` 的活；本模块只负责「环境怎么配」和「观测怎么归一化」。
+  `load_policy()` 的活；本模块只负责「环境怎么配」和「观测怎么归一化」。
 * **不训练、不评估、不渲染**。评估与 GIF 在 `scripts/play.py`。
 * **不碰奖励归一化**。`VecNormalize.ret_rms` 只在导出时有用，推理不需要。
 * **不写文件**。
@@ -237,7 +237,7 @@ play.Runner.predict(obs)
                               ▲
 robotdog/env.py (EnvConfig/ObsConfig) + robotdog/reward.py (RewardConfig) ──►  robotdog/policy.py
                               ▲                              ▲
-                     robotdog/training.py ──────────────────┘   (load_policy / load_ppo)
+                     robotdog/training.py ──────────────────┘   (load_policy)
                               ▲
                         scripts/play.py
 ```
