@@ -192,6 +192,29 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "它看不见的量打分，只能靠关节速度和 10 帧历史反推，这是"
                         "『走不直怎么也修不好』的结构性原因。世界系版本 (base_lin_vel)"
                         "会随机身 yaw 改变含义，不适合做前进命令跟踪。")
+    p.add_argument("--obs-foot-lift-gap", action=argparse.BooleanOptionalAction,
+                   default=False, dest="obs_foot_lift_gap",
+                   help="观测里附加 4 维『每只脚**上一轮摆动**离越过台阶还差多少』"
+                        "（按 lift_goal 归一化, clip 到 [0,1], 0=已经抬够）。用"
+                        "**摆动峰值**结算，所以支撑相也携带『这只脚上一轮尝试的"
+                        "结果』。")
+    p.add_argument("--obs-foot-lift-deficit", action=argparse.BooleanOptionalAction,
+                   default=False, dest="obs_foot_lift_deficit",
+                   help="观测里附加 4 维『每只脚**此刻**还要再抬高多少才能越过它"
+                        "将踩上去的那一级』（按 lift_goal 归一化, clip 到 [0,1]）。"
+                        "参照面是**落脚面**（脚当前位置与落脚区间内最高的踏面），"
+                        "见 --cfg reward.foot_placement_reach。与上一条的分工是"
+                        "『当下 / 回顾』：只有 gap 时策略要等落地才知道失败原因，"
+                        "只有 deficit 时支撑相读到的是与刚做过的动作无关的数。")
+    # --- 奖励归一化 -------------------------------------------------- #
+    p.add_argument("--norm-reward", action=argparse.BooleanOptionalAction,
+                   default=False, dest="norm_reward",
+                   help="让 VecNormalize 同时归一化奖励（默认关闭，与原行为一致）。"
+                        "课程在阶段之间切换地形时，在 5cm 上学到的奖励尺度到了 "
+                        "11cm 会漂移，所以默认关闭。开启后 critic 目标更可学："
+                        "3cm 台阶 150k 步实测成功率 0.474->0.539、残差 mean|a| "
+                        "0.070->0.080；但这是**温和的稳定器而非解药**，两侧在 "
+                        "11cm 上都没有成功，所以不要指望它单独把台阶爬通。")
     # --- 终止条件 ---------------------------------------------------- #
     p.add_argument("--terminate-contact", default="trunk",
                    choices=["any", "trunk", "none"], metavar="{any,trunk,none}",
@@ -381,6 +404,8 @@ def main(argv=None) -> int:
     cfg.obs.stair_probe = bool(args.obs_stair_probe)
     cfg.obs.drift = bool(args.obs_drift)
     cfg.obs.base_lin_vel_body = bool(args.obs_base_lin_vel_body)
+    cfg.obs.foot_lift_gap = bool(args.obs_foot_lift_gap)
+    cfg.obs.foot_lift_deficit = bool(args.obs_foot_lift_deficit)
     cfg.terminate_contact = str(args.terminate_contact)
     if cfg.obs.foot_height or cfg.obs.base_height:
         print(f"[观测] 已扩展: base_height={cfg.obs.base_height} "
@@ -484,7 +509,8 @@ def main(argv=None) -> int:
 
     # ------------------------------------------------------------- vec env(s)
     venv = make_vec_env(stages[0].spec, n_envs=args.n_envs, cfg=cfg,
-                        seed=args.seed, normalize=True, monitor=True)
+                        seed=args.seed, normalize=True, monitor=True,
+                        norm_reward=bool(args.norm_reward))
 
     # ---------------------------------------------------------------- model
     if args.resume:

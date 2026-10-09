@@ -117,6 +117,48 @@ class ObsConfig:
     # "last-20%-yaw minus first-20%-yaw" = -0.53 deg, i.e. the robot was not
     # curving at all -- it was faithfully holding its spawn heading.
     drift: bool = False
+    # 4 values: how far the two FRONT (and then the two rear) feet are from the
+    # height they must reach to clear the step in front, normalised by that
+    # target.  ``0`` = the foot has already reached the required height this
+    # swing, ``1`` = this swing's peak is zero.
+    #
+    # Motivation (measured on the reference course22 policy, `.tmp/probe_kin.py`
+    # + `.tmp/analyze_kin.py`, 8.0 vs 11.0 cm, 3 episodes each): the swing-foot
+    # peak clearance is ~0.091-0.093 m at 8 cm but only ~0.079-0.085 m at 11 cm
+    # -- i.e. the prior/policy lifts the foot to a nearly CONSTANT height and
+    # even lifts it *lower* on the taller stair.  At 8 cm 101/135 swings clear
+    # the step; at 11 cm only 1-8/236 do, so the foot simply rams the riser
+    # (11 cm episodes spent 54% of their steps grazing a riser, and their
+    # timeout episodes never got past max_x = 1.88 m).  The policy cannot fix
+    # this because nothing in the 660-dim observation says *how much more* lift
+    # is required: ``foot_height`` is measured against the terrain directly
+    # under the foot, which reads ~0 on both sides of a riser, and the 3-dim
+    # ``stair_probe`` only describes the step ahead of the *base*, not the
+    # deficit of each individual foot.  With this block the deficit is explicit
+    # and per-foot.
+    #
+    # Measured separation with the lookahead reference (`.tmp/foot_trace.py`,
+    # reference course22 policy, 1 episode each, target = 1.0 * step height):
+    #   8.0 cm: swing peak p50 = 0.103 m vs goal 0.080 -> deficit 0 (satisfied)
+    #   11.0 cm: swing peak p50 = 0.084 m vs goal 0.110 -> deficit 0.24
+    # so this 4-dim block is the signal that actually tells the policy the 11 cm
+    # stair is out of reach, which the 660-dim observation never did.
+    foot_lift_gap: bool = False
+    # ``foot_lift_deficit``（4 维，默认 False）：每只脚**此刻**还要再抬高多少才能越
+    # 过它将踩上去的那一级，按 ``required_lift()`` 归一化后 clip 到 [0, 1]。
+    #
+    # 与上面 ``foot_lift_gap`` 的分工是「回顾 / 当下」：
+    #   foot_lift_gap      = 这只脚**上一轮摆动**离目标还差多少（落地清零，只在摆动
+    #                        结束后才有非零值）。它携带的是「我刚才那次尝试的结果」。
+    #   foot_lift_deficit  = 这只脚**此刻**离目标还差多少（瞬时值）。它携带的是
+    #                        「现在抬腿还来不来得及」。
+    # 单独给任何一个都不够：只有 gap，策略要等下一次落地才知道失败原因；只有
+    # deficit，策略在支撑相看到的是一个恒定的、与自己刚做的动作无关的数。
+    #
+    # 用 ``advance_clearance()`` 而不是 :attr:`foot_clearance`，理由见
+    # ``RewardConfig.foot_placement_reach``：后者的参照面在立面处是阶跃的，11 cm
+    # 上给出的绝对读数反而比 8 cm 还大，作为观测完全没有区分度。
+    foot_lift_deficit: bool = False
     # Per-frame size: q(12) + qd(12) + rpy(3) + omega(3) + prev_action(12)
     base_frame_size: int = 42
 
@@ -132,6 +174,8 @@ class ObsConfig:
         extra += 3 if self.stair_probe else 0
         extra += 2 if (self.stair_probe and self.stair_probe_full) else 0
         extra += 2 if self.drift else 0
+        extra += 4 if self.foot_lift_gap else 0
+        extra += 4 if self.foot_lift_deficit else 0
         return self.base_frame_size + extra
 
     @property
@@ -177,6 +221,69 @@ class RewardConfig:
     # 学会的 easy 阶段不会被改坏); 8cm -> 11.2cm; 12cm -> 16.8cm。
     foot_lift_target: float = 0.08
     foot_lift_step_ratio: float = 1.4
+    # ``foot_lift_target_cap``：有效抬升目标的上限 (m)，0 = 不设限。
+    #
+    # ratio=1.4 时 12 cm 台阶要求 16.8 cm 的足端离地，已经接近这条腿的几何
+    # 极限；再往上（19 cm -> 26.6 cm）就是**不可能满足**的目标，梯度会变成
+    # 常数推力而不是「再抬一点」。设 0.13~0.16 可以把目标压回可达区。
+    foot_lift_target_cap: float = 0.0
+    # ``foot_lift_goal_ratio``：**摆峰门槛**（``foot_lift_clear`` / ``obs.foot_lift_gap``）
+    # 用的目标 = ``max(foot_lift_target, goal_ratio * 台阶高)``。
+    #
+    # 为什么与连续项的 ``foot_lift_step_ratio = 1.4`` 分开: 两者量的不是同一件事。
+    #   连续项 ``foot_lift`` 用的是**逐步瞬时**离地间隙，量的是「这只脚此刻比脚下
+    #   地面高多少」，1.4 倍是针对「必须抬过头顶才能真正跨过去」的老口径标定的。
+    #   摆峰门槛用 ``advance_clearance()``（脚前方探路），它问的是「这只脚能不能
+    #   越过前方那一级」，物理上**恰好 1.0 倍台阶高**就已经跨过去了。
+    # 实测（参考 course22 权重，8/11 cm 各 1 回合，`.tmp/foot_trace.py`）以
+    # ``foot_lift_goal_ratio = 1.0`` 计:
+    #   8.0 cm: 摆峰 p50 = 0.103 m，目标 0.080 -> 达标;
+    #   11.0 cm: 摆峰 p50 = 0.084 m，目标 0.110 -> **差 0.026 m（24%）**。
+    # 用旧口径（正下方地形 + 1.4 倍）这个区分是**反的**：8 cm p50 0.125 vs
+    # 目标 0.112（比 1.11），11 cm p50 0.103 vs 目标 0.154（比 0.67）—— 比值虽然
+    # 也区分得开，但绝对读数在 11 cm 上反而**更大**，与「11 cm 抬不起来」的事实
+    # 相反，奖励里那 0.6 分的连续项因此在 11 cm 上给得比 8 cm 还多。
+    foot_lift_goal_ratio: float = 1.0
+    # ``foot_lift_support_ref``：抬升奖励/亏欠观测的**参照面**口径。
+    #
+    #   False (历史) : ``self.foot_clearance`` = 足尖减**该脚正下方**的地形高。
+    #                  问题是那个参照面是阶跃函数：脚在立面**正前方**时它读到的是
+    #                  下一级的高度，脚一旦越过立面上方，同一个离地高度会瞬间
+    #                  **少算一个台阶高**（`terrain.py:222-238 height_at`）。于是
+    #                  「已经跨过台阶的脚」和「还贴在地面上的脚」可能给出同样的
+    #                  clearance 数值 —— 奖励分不清这两者。
+    #   True         : 改用 :meth:`advance_clearance` 的**落脚面**口径，见那里的
+    #                  注释。名字保留是为了兼容已经写下的配置。
+    foot_lift_support_ref: bool = False
+    # ``foot_placement_reach``：判断「这只脚接下来要踩到哪一级」时，沿机身 x 方向
+    # 向前看到的距离 (m)，以足半径为基数再加这一段。
+    #
+    # 这是这次改动里最关键的一条。原来的 ``foot_clearance`` 问的是「这只脚比它
+    # **正下方**的地面高多少」，而台阶处真正决定成败的问题是「这只脚够不够高，
+    # 能不能越过**它即将踩上去的**那一级」。后者才是「11 cm 是墙」的判据：在
+    # 立面正前方时脚的正下方还是下一级，所以原口径会给出一个与任务无关的读数。
+    #
+    # 参照面 = ``max(脚当前位置, 前方 reach/2, 前方 reach`` 三处的踏面高 ``)``，
+    # 只用**位置**决定，与脚当前高度无关，所以同一个抬腿动作的读数不会在跨过立面
+    # 的那一帧发生跳变。取 0.10 m（加足半径约 0.13 m）：足端每控制步前进约
+    # 0.004 m，0.10 m 相当于提前约 25 步看到下一级，足够让策略在抬腿阶段就收到
+    # 「还不够高」的信号；再远就会开始看到**下一级之后**的台阶，给出这一轮摆动
+    # 无论如何都达不到的目标（那是下面 ``foot_lift_goal_ratio`` 要处理的事）。
+    foot_placement_reach: float = 0.10
+    # ``foot_lift_clear``：**摆动峰值**抬升奖励（默认 0.0 = 关闭），与 ``foot_lift``
+    # 的逐步连续项并列，不替代它。
+    #
+    # 为什么需要连续项之外再要一个峰值项: 11 cm 上 `foot_lift` 的实测满分线是
+    # 1.4*11 = 15.4 cm，而参考策略的摆动峰值只有 ~8 cm，于是它拿到的
+    # ``clip(8/15.4, 0, 1)`` 是 0.52 —— 已经**过半**。逐步连续项因此一直在奖励
+    # 「再多抬一点点」，却从不告诉策略「现在这样是**不够**的」。峰值项在**落地那一
+    # 步**一次性结算整个摆动过程的最高点，而且可以直接用二值门槛
+    # （``foot_lift_clear_binary``），于是「抬到 8 cm」和「抬到 11 cm」的差别从
+    # 0.52 -> 0.71 的渐变变成 0 -> 1 的阶跃。
+    foot_lift_clear: float = 0.0
+    # True = 峰值项用 0/1 门槛（峰值 >= 目标才付钱），False = 用 ``clip(peak/target)``
+    # 的连续比例。两者都只在落地那一步结算。
+    foot_lift_clear_binary: bool = False
     # 摆动门控的阈值 (m/s, 三维足端速度)。原来只看水平速度、阈值 0.35 m/s:
     # 高台阶需要的是**慢慢抬腿**, 水平速度很小, 于是门控把 credit 掐掉,
     # 等于鼓励「快速平扫」而不是「抬高跨越」。加上竖直分量并降低阈值。
@@ -254,6 +361,15 @@ class RewardConfig:
     #              正在抬起跨越立面的脚免罚。
     riser_graze_mode: str = "legacy"
     riser_graze_vz_eps: float = 0.10  # m/s，判定「脚在往上走」的垂直速度阈值
+    # ``riser_graze_probe_gate``：只在**前方测距确实看到台阶**时才罚蹭立面
+    # （默认 False = 历史行为，不看测距）。
+    #
+    # 为什么需要: 蹭立面的检测只看接触法向的世界 z 分量，在**平地**上小腿/髋部
+    # 与地面的边角接触也会被算成「蹭立面」。平地段（课程第一档，也是整个课程里
+    # 唯一一开始就能拿满分的档）因此一直拿到一个与任务无关的常数惩罚，而它恰恰
+    # 是策略最早期、最脆弱的阶段。用前方测距命中做门控后，平地上的假阳性被清掉，
+    # 真台阶上的惩罚不变（测距在台阶前 0.62 m 内必然命中）。
+    riser_graze_probe_gate: bool = False
     # Hard landing: quadratic excess of the touchdown normal force over
     # ``touch_impact_target``.  Soft landings are what keep the trot from
     # hammering the knees on the way down a staircase.
@@ -284,7 +400,14 @@ class RewardConfig:
     # The positive half of the same lesson: pay the robot when the rangefinder
     # sees a step coming **and** the front feet are already lifted for it.
     # This is 检测到楼梯就抬腿, expressed as a reward.
+    #
+    # ``stair_probe_lift_use_advance``（默认 False = 历史行为）把这里的 ``lift``
+    # 从「正下方地形参照」换成 ``advance_clearance()`` 的**前方探路**口径，与
+    # ``foot_lift_clear`` 一致。需要换的理由与 ``foot_lift_lookahead`` 相同：正
+    # 下方口径在脚跨过立面时会把同一个离地高度**少算一个台阶高**，于是这一项在
+    # 「看到台阶就抬腿」这个最需要它的时刻反而给不出分。
     stair_probe_lift: float = 1.20
+    stair_probe_lift_use_advance: bool = False
     # Per-step penalty when a *leg* geom (hip / thigh / calf shape, never the
     # torso, never a foot sphere) is in contact with the terrain.
     #
@@ -591,6 +714,10 @@ class Go2StairsEnv(gym.Env):
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
+        # 摆动相内的**峰值**「相对支撑面的离地间隙」，落地那一步用于
+        # ``foot_lift_clear`` 结算，也是 ``obs.foot_lift_gap`` 的来源之一。
+        self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
+        self._peak_tread = np.zeros(len(self.meta.foot_geom_ids))
         # Gait-prior clock (seconds since episode start).
         self._gait_t = 0.0
         self._gait_phase = 0.0
@@ -868,6 +995,10 @@ class Go2StairsEnv(gym.Env):
                          else self._touch.probe_obs(self.cfg.touch))
         if obs_cfg.drift:
             parts.append(np.array([self.lateral_offset, self.heading_error]))
+        if obs_cfg.foot_lift_gap:
+            parts.append(self.foot_lift_gap())
+        if obs_cfg.foot_lift_deficit:
+            parts.append(self.foot_lift_deficit())
         return np.concatenate(parts).astype(np.float64)
 
     def _observation(self) -> np.ndarray:
@@ -917,16 +1048,47 @@ class Go2StairsEnv(gym.Env):
                        0.0, 1.0)
         # geom_xpos is the SPHERE CENTRE, so subtract the radius to get the
         # real gap between the foot surface and the terrain.
-        clearance = self.foot_clearance
+        #
+        # ``foot_lift_support_ref`` 时参照面换成 ``advance_clearance()``（见
+        # RewardConfig 注释：原参照面是阶跃函数，脚跨过立面时会凭空少算一个台阶高，
+        # 于是 11 cm 上的绝对读数反而比 8 cm 大）。
+        clearance = (
+            self.advance_clearance() if bool(rc.foot_lift_support_ref)
+            else self.foot_clearance
+        )
         # 目标随地形长大: 要踏上 h 米高的台阶, 足端至少要高出脚下那一级 h 米。
         # 5 cm 台阶下 max(0.08, 1.4*0.05)=0.08 与旧行为**逐位相同**, 所以已经
         # 学会的 easy 阶段不会因为这次改动而退化; 8/12 cm 才会真正收到更高的目标。
-        lift_target = max(
-            float(rc.foot_lift_target),
-            float(rc.foot_lift_step_ratio) * float(self.stair.step_height),
-        )
-        lift = np.clip(clearance / max(lift_target, 1e-6), 0.0, 1.0)
+        lift_target = self.required_lift()
+        lift = np.clip(clearance / lift_target, 0.0, 1.0)
         terms["foot_lift"] = rc.foot_lift * float(np.mean(gate * lift))
+        # 摆动峰值结算项（默认关闭）。峰值用 ``_peak_swing_clearance``：它是本摆动
+        # 到**这一步为止**的最大离地间隙（见 ``_advance_swing_clearance``），
+        # ``landed_lc`` 为真的这一步就是落地那一步，结算之后
+        # ``_advance_foot_air_time`` 会把峰值清零，所以这一项每个摆动周期恰好结算
+        # 一次。用整段摆动的峰值而不是落地瞬间的瞬时值，是因为落地那一步足端已经
+        # 贴地、瞬时值恒为零。注意峰值与判定用的是同一个参照面口径（都在
+        # :meth:`_advance_swing_clearance` 里算），落地这一步不需要再补测。
+        if rc.foot_lift_clear != 0.0:
+            if foot_contact is None:
+                foot_contact = self._foot_contact_mask()
+            landed_lc = foot_contact & ~self._prev_foot_contact
+            if landed_lc.any():
+                ratio = self._peak_swing_clearance[landed_lc] / self.lift_goal()
+                credit = (
+                    (ratio >= 1.0).astype(np.float64) if bool(rc.foot_lift_clear_binary)
+                    else np.clip(ratio, 0.0, 1.0)
+                )
+                terms["foot_lift_clear"] = rc.foot_lift_clear * float(np.sum(credit))
+            else:
+                terms["foot_lift_clear"] = 0.0
+            # the swing is settled -> a foot that just landed starts fresh
+            np.copyto(
+                self._peak_swing_clearance,
+                np.where(foot_contact, 0.0, self._peak_swing_clearance),
+            )
+        else:
+            terms["foot_lift_clear"] = 0.0
 
         # 5) 机身碰撞惩罚 -- torso touching the terrain ---------------------
         # Per-step, bounded: the penalty scales with how long the torso is
@@ -1015,6 +1177,12 @@ class Go2StairsEnv(gym.Env):
 
         # --- step 11: 触觉 / 碰撞 ------------------------------------------
         touch = self._touch
+        # ``riser_graze_probe_gate``：只在测距真的命中前方台阶时才认定「蹭立面」。
+        # 平地段的假阳性（髋/小腿与地面边角接触也会让接触法向的世界 z 分量偏小）
+        # 因此被清掉；真台阶上 ``trigger`` 在台阶前 0.62 m 就为真，惩罚不变。
+        probe_gate_ok = True
+        if bool(rc.riser_graze_probe_gate):
+            probe_gate_ok = bool(touch.trigger(self.cfg.touch))
         # ``riser_graze_mode = "lifting"``：只惩罚**真卡住**（所有蹭立面的脚都没有
         # 向上速度）的步；正在抬脚跨越立面的脚免罚。见 RewardConfig.riser_graze_mode。
         if str(rc.riser_graze_mode).strip().lower() == "lifting":
@@ -1027,9 +1195,11 @@ class Go2StairsEnv(gym.Env):
                 stuck = not climbing
             else:
                 stuck = False
-            terms["riser_graze"] = rc.riser_graze * float(stuck)
+            terms["riser_graze"] = rc.riser_graze * float(stuck and probe_gate_ok)
         else:
-            terms["riser_graze"] = rc.riser_graze * float(touch.riser_graze.any())
+            terms["riser_graze"] = rc.riser_graze * float(
+                touch.riser_graze.any() and probe_gate_ok
+            )
 
         # Both tactile penalties below are *squared* functions of a physics
         # ratio, and MuJoCo contact forces spike without bound when a foot is
@@ -1074,8 +1244,12 @@ class Go2StairsEnv(gym.Env):
         # it AND the two front feet are actually lifted for it.  ``lift`` above
         # is the per-foot normalised clearance, ordered FL, FR, RL, RR.
         if rc.stair_probe_lift != 0.0:
+            probe_lift = (
+                np.clip(self.advance_clearance() / lift_target, 0.0, 1.0)
+                if bool(rc.stair_probe_lift_use_advance) else lift
+            )
             terms["stair_probe_lift"] = rc.stair_probe_lift * float(
-                touch.trigger(self.cfg.touch) * np.mean(lift[:2])
+                touch.trigger(self.cfg.touch) * np.mean(probe_lift[:2])
             )
         else:
             terms["stair_probe_lift"] = 0.0
@@ -1114,6 +1288,8 @@ class Go2StairsEnv(gym.Env):
 
     def _advance_foot_air_time(self, foot_contact: np.ndarray) -> None:
         """Accumulate flight time; called once per control step, after reward."""
+        # 先记下本步的峰值（含落地这一步的最高点），再清零落地脚的摆动状态。
+        self._advance_swing_clearance(foot_contact)
         self._foot_air_time = np.where(
             foot_contact, 0.0, self._foot_air_time + self.cfg.control_dt
         )
@@ -1227,6 +1403,161 @@ class Go2StairsEnv(gym.Env):
         """
         heights = [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
         return float(min(heights)) if heights else self.terrain_height_under_base
+
+    def _foot_tread_heights(self) -> np.ndarray:
+        """每只脚正下方的地形高度 (m, 4 维) —— ``foot_clearance`` 的参照面。"""
+        return np.array(
+            [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]],
+            dtype=np.float64,
+        )
+
+    def _step_surface_ahead(self) -> np.ndarray:
+        """每只脚**下次落脚时将会踩到**的那个踏面高度 (m, 4 维)。
+
+        台阶是阶梯状的, 所以「等一下要走过去的那块地」就是**从脚当前位置向前看,
+        脚和它的落脚区间会经历的最高踏面**。原 :attr:`foot_clearance` 用的是
+        「正下方」, 它在立面处是**阶跃**的: 脚还站在第 k 级、脚前缘已经在第 k+1
+        级上方时, 读数按哪一级算完全取决于脚本身有没有跨过 ``start_x + k*tread``
+        这条线, 于是同一个抬腿动作在跨线的一瞬间凭空少算/多算一个台阶高。
+
+        这里只用**位置**决定参照面, 与脚当前高度无关, 所以同一个动作的读数连续。
+        """
+        rc = self.cfg.reward
+        x = self.foot_pos[:, 0]
+        reach = float(self.meta.foot_radius) + float(rc.foot_placement_reach)
+        pts = x[:, None] + np.array(
+            [[0.0, 0.5 * reach, reach]], dtype=np.float64
+        )
+        heights = np.array(
+            [self.stair.height_at(float(v)) for v in pts.ravel()],
+            dtype=np.float64,
+        )
+        return heights.reshape(pts.shape).max(axis=1)
+
+    def advance_clearance(self) -> np.ndarray:
+        """每只脚相对**它将踩上去的那个踏面**的离地间隙 (m, 4 维)。
+
+        参照面是 :meth:`_step_surface_ahead` —— 脚当前位置与落脚区间内最高的踏面。
+        与原 :attr:`foot_clearance` 的区别就是参照面:
+
+        * **脚在立面正前方**时, 原口径读到的是脚下那一级 (与任务无关), 本口径读到
+          的是**要越过去的那一级** —— 这正是成败所在。
+        * **脚跨过立面之后**原口径会凭空跳一个台阶高, 本口径不会。
+
+        读数为负表示**还没抬够**: 例如站在平地、前方 11 cm 台阶、脚底抬到 8 cm 时
+        读数是 ``-0.03``。这比原来那个「11 cm 上比 8 cm 还大」的读数直接得多。
+        """
+        return self.foot_clearance + (
+            self._foot_tread_heights() - self._step_surface_ahead()
+        )
+
+    def required_lift(self) -> float:
+        """**连续项** ``foot_lift`` 的满分线 (m)。
+
+        ``max(foot_lift_target, foot_lift_step_ratio * step_height)``，再按
+        ``foot_lift_target_cap``（>0 时）截断。用的是**逐步瞬时**离地间隙，所以
+        与 ``_compute_reward`` 里 ``lift = clip(clearance / required_lift())``
+        的口径严格一致。
+        """
+        rc = self.cfg.reward
+        target = max(
+            float(rc.foot_lift_target),
+            float(rc.foot_lift_step_ratio) * float(self.stair.step_height),
+        )
+        cap = float(rc.foot_lift_target_cap)
+        if cap > 0.0:
+            target = min(target, cap)
+        return float(max(target, 1e-6))
+
+    def lift_goal(self) -> float:
+        """**摆动峰值门槛**（``foot_lift_clear`` / ``obs.foot_lift_gap``）的目标 (m)。
+
+        ``max(foot_lift_target, foot_lift_goal_ratio * step_height)``，同样受
+        ``foot_lift_target_cap`` 约束。物理含义是「这只脚在这次摆动里至少要抬到
+        比前方那一级高出多少」。
+        """
+        rc = self.cfg.reward
+        target = max(
+            float(rc.foot_lift_target),
+            float(rc.foot_lift_goal_ratio) * float(self.stair.step_height),
+        )
+        cap = float(rc.foot_lift_target_cap)
+        if cap > 0.0:
+            target = min(target, cap)
+        return float(max(target, 1e-6))
+
+    def foot_lift_gap(self) -> np.ndarray:
+        """每只脚**上一轮摆动**距离「越过前方台阶」还差多少，归一化后 clip 到 [0, 1]。
+
+        用**摆动峰值**（``_peak_swing_clearance``，落地清零）而不是瞬时值：
+        瞬时值在整个支撑相恒为 0，对策略毫无信息量；峰值则在这只脚刚刚抬过的高度
+        上给出「够/不够」的明确读数，并且天然携带「这只脚这一轮尝试的结果」。
+
+        0 = 这只脚这一轮已经抬到足够高，1 = 一点都没抬起来（峰值 ≈ 0）。
+        """
+        goal = self.lift_goal()
+        peak = getattr(self, "_peak_swing_clearance", None)
+        if peak is None or peak.shape != (len(self.meta.foot_geom_ids),):
+            peak = np.zeros(len(self.meta.foot_geom_ids), dtype=np.float64)
+        return np.clip((goal - peak) / goal, 0.0, 1.0)
+
+    def foot_lift_deficit(self) -> np.ndarray:
+        """每只脚**此刻**还要再抬高多少才能越过它将踩上去的那一级，归一化到 [0, 1]。
+
+        用 ``advance_clearance()``（落脚面口径）除以 ``lift_goal()`` —— 与
+        :meth:`foot_lift_gap` 用同一个门槛，于是「达到 goal」在观测里明确对应
+        deficit 归零，而不会逼着策略去追 ``required_lift()`` 那个更高、实际处在腿长
+        几何极限上的连续项满分线。已经足够高时为 0，完全没有抬起时为 1。
+
+        这是「现在就抬腿」这个动作唯一能直接看到的反馈量 —— 660 维的原始观测里
+        ``foot_height`` 在立面两侧读数都接近 0，分辨不出「站在台阶前面、脚还贴地」
+        和「已经站在上一级踏面上」。
+        """
+        goal = self.lift_goal()
+        return np.clip(1.0 - self.advance_clearance() / goal, 0.0, 1.0)
+
+    def _advance_swing_clearance(self, foot_contact: np.ndarray) -> None:
+        """Track how much the foot cleared *the surface it actually met*.
+
+        Two running peaks are kept for every foot, both reset on landing:
+
+        * ``_peak_tread`` -- the highest terrain directly under the foot since
+          this swing began.  It answers "which surface did this swing have to
+          clear?".  It is a **local** measurement, so it is immune to the
+          step-function error of :attr:`foot_clearance` -- that one reads the
+          tread under the foot's *kernel* and therefore drops by a whole step
+          the instant the foot crosses a riser, which made the old reading
+          *larger* on an 8 cm stair than on an 11 cm one.
+        * ``_peak_swing_clearance`` -- the largest value of
+          ``(peak foot height) - (peak tread)`` reached so far this swing,
+          i.e. the best clearance actually achieved against that surface.
+
+        Using the *peak* rather than the instantaneous value matters: on the
+        landing step the foot is already on the ground, so the instantaneous
+        clearance is exactly zero and a reward built on it would never pay.
+
+        ⚠ 时序：``_peak_swing_clearance`` 在**落地这一步也不再清零**，要等
+        :meth:`_compute_reward` 把 ``foot_lift_clear`` 结算完，才由 :meth:`reset`
+        或下一次摆动重新开始。否则落地那一步奖励读到的峰值已经归零，这一项永远
+        等于 0（这是实现里踩过的一个真坑）。
+        """
+        peak = getattr(self, "_peak_swing_clearance", None)
+        tread = getattr(self, "_peak_tread", None)
+        shape = foot_contact.shape
+        if peak is None or peak.shape != shape:
+            peak = np.zeros(shape, dtype=np.float64)
+            self._peak_swing_clearance = peak
+        if tread is None or tread.shape != shape:
+            tread = np.zeros(shape, dtype=np.float64)
+            self._peak_tread = tread
+        under = self._foot_tread_heights()
+        radius = float(self.meta.foot_radius)
+        foot_top = self.foot_pos[:, 2] - radius
+        # fold in this step's measurement against the surface met so far
+        np.copyto(peak, np.maximum(peak, foot_top - tread))
+        np.copyto(tread, np.maximum(tread, under))
+        # a foot that just landed starts a fresh swing from this tread
+        np.copyto(tread, np.where(foot_contact, under, tread))
 
     def _support_height_mean(self) -> float:
         """**四足足下地形高度的算术均值** —— 把 ``min`` 的那一次整跳拆成四步。
@@ -1382,6 +1713,8 @@ class Go2StairsEnv(gym.Env):
         self._prev_support_height = self._support_height()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = self._foot_contact_mask()
+        self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
+        self._peak_tread = np.zeros(len(self.meta.foot_geom_ids))
         # Prime the tactile/rangefinder reading so the very first observation
         # frame carries real forces instead of the neutral placeholder.
         self._touch = self.touch_sensor.read(

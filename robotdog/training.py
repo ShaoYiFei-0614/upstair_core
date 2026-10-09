@@ -69,11 +69,38 @@ def make_vec_env(
     seed: int = 0,
     normalize: bool = True,
     monitor: bool = True,
+    norm_reward: bool = False,
 ) -> VecEnv:
     """DummyVecEnv(n_envs) -> VecMonitor -> VecNormalize.
 
     ``DummyVecEnv`` is not a fallback here, it is the only option: this sandbox
     forbids the named pipes that Windows multiprocessing needs.
+
+    ``norm_reward`` stays **off** by default because the curriculum switches
+    terrain between stages, and a reward scale learned on 5 cm stairs drifts
+    once the agent reaches 11 cm (see the module docstring).
+
+    It is exposed as a lever because the lateral penalties dominate the
+    per-step reward (``straight_line`` alone measured 72.7 % of it, while
+    ``forward_vel`` contributed only +0.356), so a struggling policy's return
+    sits near -6000 and the critic cannot fit it. Normalising the reward
+    restores a usable critic target.
+
+    How much that buys is *small on this task* and was measured directly on
+    3 cm stairs, 8 envs, 150 k steps, comparing the two arms through their own
+    normalisers (``.tmp/norm_ab.py``):
+
+    ==========  ==============  ==============  ==============
+    arm         success rate    ``mean|a|``     11 cm
+    ==========  ==============  ==============  ==============
+    off         0.474           0.070 -> 0.063  no success
+    on          0.539           0.080 -> 0.083  no success
+    ==========  ==============  ==============  ==============
+
+    So treat it as a mild stabiliser, not a fix. An earlier draft of this
+    docstring claimed it tripled the residual growth and cut the 11 cm fall
+    rate from 0.88 to 0.12; those numbers came from a probe that was later
+    found to report wrong episodes and have been withdrawn.
     """
     if n_envs < 1:
         raise ValueError("n_envs must be >= 1")
@@ -84,7 +111,11 @@ def make_vec_env(
     if normalize:
         # VecMonitor sits *inside* so episode returns stay unnormalised.
         venv = VecNormalize(
-            venv, training=True, norm_obs=True, norm_reward=False, clip_obs=10.0
+            venv,
+            training=True,
+            norm_obs=True,
+            norm_reward=norm_reward,
+            clip_obs=10.0,
         )
     return venv
 
