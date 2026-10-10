@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import copy
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -133,31 +134,56 @@ class Trainer:
         self.ppo = ppo
         self.n_envs = n_envs
         self.last_stats = EpisodeStats(window=200)
+        # ⭐ ``config.yaml`` 的奖励基线（**没叠任何课程覆盖**的那一份）。
+        # ``make_env`` 每一级开始前把它抄回子环境，保证奖励覆盖是「从基线叠」
+        # 而不是「在上一次覆盖之上再叠」。这个陷阱在没有深拷贝的年代不可见
+        # （因为那时所有级共享同一个被改烂的 cfg），加上深拷贝之后才暴露出来。
+        self._reward_baseline = copy.deepcopy(cfg.reward)
 
     # ---- 每个阶段一个独立的向量环境（地形烘焙在编译后的 MJCF 里）----------
     def make_env(self, stage: StageSpec, *, warm_start: str | None = None):
+        # ⭐⭐ **每一级必须是自己的 ``EnvConfig`` 副本。**
+        #
+        # ``make_vec_env`` 只是把传进去的 cfg **原样绑**到每个子环境上
+        # （实测 ``env.cfg is 传入的 cfg`` 为 True），它不做拷贝。而下面那一串
+        # 下发全是**就地改写**：``set_commands`` 写 ``cfg.command.vy_max/yaw_max``、
+        # ``set_command_now`` 写 ``cfg.command.vx``、
+        # ``set_reward_overrides`` 用 ``setattr`` 写 ``cfg.reward.*``、
+        # ``set_flat_success_distance`` 写 ``cfg.flat_success_distance``。
+        #
+        # 于是如果直接传 ``self.cfg``，这些设置会**跨阶段累积**：某一级放宽过的
+        # 量程 / 压低过的 vx / 叠上去的奖励覆盖，会一路带到后面每一级，而且
+        # 顺序敏感（``command_vx=0.0`` 的级因为走 falsy 分支不会把它压回来，
+        # 结果楼梯段一直在用平地最后一级的 vx=0.45）。深拷贝一份，让每一级
+        # 都从 ``config.yaml`` 的基线出发。
+        stage_cfg = copy.deepcopy(self.cfg)
         venv = make_vec_env(
             stage.spec,
             n_envs=self.n_envs,
-            cfg=self.cfg,
+            cfg=stage_cfg,
             seed=int(self.run["seed"]),
             norm_reward=bool(self.ppo.get("norm_reward", True)),
         )
         # 指令课程：把这一级的横向 / 偏航指令范围下发给每一个子环境。
         # 阶段内不再改动 —— 观测的那 2 维在整个课程里恒定，PPO 的网络与
         # RolloutBuffer 才不用重建。
-        if stage.command_vy_max or stage.command_yaw_max:
-            venv.env_method("set_commands", stage.command_vy_max,
-                            stage.command_yaw_max)
+        #
+        # ⚠ 这里**不能**用 ``if stage.command_vy_max or stage.command_yaw_max:``
+        # 之类的守卫：量程为 0 是**有意义的设置**（这一级不练这个方向），
+        # 跳过下发只会让这一级继承上一级的范围。无条件下发。
+        venv.env_method("set_commands", stage.command_vy_max,
+                        stage.command_yaw_max)
         # 平地指令预热的头几级还会（可选地）压低前进指令、缩短成功距离：
         # 指令一放宽，机器人为了跟横移/旋转指令会绕路，原来的 3 m 判据会把
         # 成功拖成超时，而超时回合里学不到「跟踪」这件事。
-        if stage.command_vx or stage.flat_success_distance:
-            if stage.flat_success_distance:
-                venv.env_method("set_flat_success_distance",
-                                stage.flat_success_distance)
-            if stage.command_vx:
-                venv.env_method("set_command_now", None, None, stage.command_vx)
+        #
+        # ⚠ ``command_vx`` 同样**无条件**下发。0.0 是「这一级别前进」的正常
+        # 设置，而 ``if stage.command_vx:`` 会把 0.0 当假值跳过 —— 楼梯段的
+        # vx=0 因此从来没被下发过，机器人一直用着平地级的 0.45。
+        venv.env_method("set_command_now", None, None, float(stage.command_vx))
+        if stage.flat_success_distance:
+            venv.env_method("set_flat_success_distance",
+                            stage.flat_success_distance)
         # ⚠ 这一项**无条件**下发（不放在上面的 if 里）：它是「粘性」的，
         # 原地指令课程把它设成 False 之后，若不主动恢复，后面的楼梯阶段会
         # 继续用「撑满回合即成功」的判据 —— 那样墙上永远爬不上去也照样算成功。
@@ -166,6 +192,13 @@ class Trainer:
         # 奖励课程：这一级的奖励覆盖（``curriculum.reward_overrides``）叠到
         # ``reward:`` 段的基线值上。常见的用法是「台阶越高，越需要抬腿试探」，
         # 于是逐级放大 ``foot_lift`` / ``probe_lift`` 这类成形项。
+        #
+        # ``set_reward_overrides`` 是 ``setattr`` 就地改，所以必须先显式把
+        # 基线抄回去 —— 否则上一级叠上去的键会残留，而这一级没覆盖到的键
+        # 就永远是上一级的值（``stage_cfg`` 的深拷贝只保证「不污染 self.cfg」，
+        # 保证不了「每一级都从基线出发」）。
+        venv.env_method("set_reward_overrides",
+                        dict(asdict(self._reward_baseline)))
         if stage.reward_overrides:
             venv.env_method("set_reward_overrides", dict(stage.reward_overrides))
         return venv

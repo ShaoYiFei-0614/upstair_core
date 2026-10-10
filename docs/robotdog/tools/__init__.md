@@ -31,7 +31,7 @@ __all__ = ["console", "paths", "terrain"]
 
 （本文件共 18 行；导入行在 `robotdog/tools/__init__.py:16`，`__all__` 在 `:18`。）
 
-理由：包级命名空间保持成一张**稳定的名称表**，而不是第二套 API 面。全仓消费者都写精确导入 —— `robotdog/env.py:46` 写 `from robotdog.tools.terrain import StairSpec, build_terrain_xml`、`robotdog/training.py:38` 写 `from robotdog.tools.paths import RUNS_DIR`。精确导入让「这个符号来自哪个文件」在阅读时不需要跳转。
+理由：包级命名空间保持成一张**稳定的名称表**，而不是第二套 API 面。全仓消费者都写精确导入 —— `robotdog/env.py:46` 写 `from robotdog.tools.terrain import StairSpec, build_terrain_xml`、`robotdog/training.py:37` 写 `from robotdog.tools.paths import RUNS_DIR`。精确导入让「这个符号来自哪个文件」在阅读时不需要跳转。
 
 **被否决的方案**：
 
@@ -43,13 +43,13 @@ __all__ = ["console", "paths", "terrain"]
 
 导入行按字母序写 `console, paths, terrain`，`__all__` 用同一顺序。
 
-历史上这一节的理由是「工具层内部只有一条真实依赖 `robotdog/tools/touch.py:53 → robotdog.tools.terrain.TERRAIN_GEOM_GROUP`，字母序里 `terrain` 在 `touch` 之前，所以字母序同时也是合法加载顺序」。**`touch.py` 删除后这条依赖不复存在**，三个模块之间没有任何导入关系，于是顺序在任何排列下都合法 —— 保留字母序只是为了可读性与 diff 稳定，不再是正确性论据。
+历史上这一节的理由是「工具层内部只有一条真实依赖 已删除的 `robotdog/tools/touch.py` → `robotdog.tools.terrain.TERRAIN_GEOM_GROUP`，字母序里 `terrain` 在 `touch` 之前，所以字母序同时也是合法加载顺序」。**`touch.py` 删除后这条依赖不复存在**，三个模块之间没有任何导入关系，于是顺序在任何排列下都合法 —— 保留字母序只是为了可读性与 diff 稳定，不再是正确性论据。
 
 教训：把「顺序正确」做成某种副产品的论证，一旦被依赖的那条边消失，注释里的事实就悄悄过期了；这也是本文档（`tools/__init__.md`）整体重写的原因。
 
 ### 3.3 不在这里调用 `setup_utf8_console()`
 
-理由：编码修复必须在**任何输出发生之前**生效，而 `robotdog/tools/__init__.py` 会在 `robotdog/__init__.py:14` 的导入语句期间就被执行（导入 `robotdog.tools.console` 会先触发父包 `robotdog.tools` 的 `__init__`）。**真实调用点是脚本**（`scripts/train.py:255` / `scripts/play.py:429` 的 `main()` 第一行），因为本文件与 `robotdog/__init__.py` 都只导入、不调用 —— 「导入即修好编码」这件事从头到尾没有发生过。
+理由：编码修复必须在**任何输出发生之前**生效，而 `robotdog/tools/__init__.py` 会在 `robotdog/__init__.py:14` 的导入语句期间就被执行（导入 `robotdog.tools.console` 会先触发父包 `robotdog.tools` 的 `__init__`）。**真实调用点是脚本**（`scripts/train.py:294` / `scripts/play.py:449` 的 `main()` 第一行），因为本文件与 `robotdog/__init__.py` 都只导入、不调用 —— 「导入即修好编码」这件事从头到尾没有发生过。
 
 **被否决的方案**：在 `robotdog/tools/__init__.py` 里调用 —— 否决有两条：(1) 它让「导入一个路径常量」这种纯数据操作产生进程级副作用；(2) 顺序会变成「谁先 import 谁决定」，而 `robotdog.tools.console` 也可以被单独导入，那条路径下 `robotdog/__init__` 已经在更早的位置跑过了，重复调用虽然安全（见 `console.md` §3），但语义上变成了巧合而不是设计。
 
@@ -57,7 +57,7 @@ __all__ = ["console", "paths", "terrain"]
 
 模块 docstring 第 3-5 行声明「这里的模块都是**工具**：不知道 PPO、课程或训练循环的存在，而且**都不 import** `robotdog.env`」，并给出依赖方向 `训练层 → 环境层 → 工具层`，不会成环。
 
-理由：这条规则没法用代码表达（Python 没有分层检查），所以把它写在**唯一一个必然被每个工具层消费者读到的文件**里。它是「新增一个工具模块之前必须回答的问题」：它依赖 `env` 吗？依赖就不许放进来 —— `robotdog/render.py` 正是因此留在顶层（它需要驱动 `Go2StairsEnv`），否则会形成 `tools ↔ env` 环。
+理由：这条规则没法用代码表达（Python 没有分层检查），所以把它写在**唯一一个必然被每个工具层消费者读到的文件**里。它是「新增一个工具模块之前必须回答的问题」：它依赖 `env` 吗？依赖就不许放进来 —— `robotdog/render.py` 当年正是因此留在顶层（它需要驱动 `Go2StairsEnv`），否则会形成 `tools ↔ env` 环（该模块已在「盲走」重构中删除，但分层约束不变）。
 
 ## 4. 公开 API
 
@@ -101,7 +101,7 @@ import robotdog
 ```
 
 **没有调用 `setup_utf8_console()` 的那一步** —— 包入口只导入它。编码修复由脚本在
-`main()` 第一行显式调用（`scripts/train.py:255` / `scripts/play.py:429`）。
+`main()` 第一行显式调用（`scripts/train.py:294` / `scripts/play.py:449`）。
 
 从任一子模块进入时，父包 `robotdog.tools` 必然先执行，所以上表对 `from robotdog.tools.paths import RUNS_DIR` 同样成立：
 
@@ -132,18 +132,18 @@ from robotdog.tools.paths import RUNS_DIR
 | --- | --- |
 | `robotdog/__init__.py:14` | `from robotdog.tools import console, paths, terrain` |
 | `robotdog/__init__.py:15` | `from robotdog.tools.console import setup_utf8_console` |
-| `robotdog/config.py:34` | `from robotdog.tools import paths` |
-| `robotdog/config.py:35` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec` |
+| `robotdog/config.py:35` | `from robotdog.tools import paths` |
+| `robotdog/config.py:36` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec` |
 | `robotdog/env.py:46` | `from robotdog.tools.terrain import StairSpec, build_terrain_xml` |
 | `robotdog/curriculum.py:23` | `from robotdog.tools.terrain import StairSpec, demo_stairs_spec, flat_spec` |
-| `robotdog/go2_model.py:41` | `from robotdog.tools.paths import GO2_ASSETS_DIR, GO2_XML` |
-| `robotdog/go2_model.py:42` | `from robotdog.tools.terrain import TERRAIN_GEOM_GROUP` |
+| `robotdog/go2_model.py:38` | `from robotdog.tools.paths import GO2_ASSETS_DIR, GO2_XML` |
+| `robotdog/go2_model.py:39` | `from robotdog.tools.terrain import TERRAIN_GEOM_GROUP` |
 | `robotdog/go2_model.py:405` | `from robotdog.tools.paths import GENERATED_DIR`（函数内延迟导入） |
 | `robotdog/policy.py:18` | `from robotdog.tools.terrain import StairSpec` |
-| `robotdog/policy.py:301` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec`（函数内延迟导入） |
-| `robotdog/training.py:38` | `from robotdog.tools.paths import RUNS_DIR` |
+| `robotdog/policy.py:319` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec`（函数内延迟导入） |
+| `robotdog/training.py:37` | `from robotdog.tools.paths import RUNS_DIR` |
 | `robotdog/training.py:38` | `from robotdog.tools.terrain import StairSpec` |
-| `scripts/train.py:54` | `from robotdog.tools import console  # noqa: E402` |
+| `scripts/train.py:55` | `from robotdog.tools import console  # noqa: E402` |
 | `scripts/play.py:48` | `from robotdog.tools import console, paths  # noqa: E402` |
 
 **为什么方向是这样**：分层是单向的 `训练层 → 环境层 → 工具层`（`docs/README.md`「分层规则」表）。工具层被所有层依赖，所以它自己不能依赖任何一层 —— 一旦 `tools/` 里出现 `import robotdog.env` 就成环。包入口就是这条规则的落点：它列出的三个模块**就是**工具层的全部内容，新增模块必须回答「它依赖 `env` 吗」。
@@ -153,7 +153,7 @@ from robotdog.tools.paths import RUNS_DIR
 ## 8. 实测与经验教训
 
 * 控制台编码与重定向类坑见 `experience.md` §5.6、§5.8（本文档不重复结论）。
-* 「工具层不 import `env`」这条规则的来龙去脉与 `render.py` 为什么留在顶层，见 `README.md` §2、§3 与 `docs/README.md`「分层规则」。
+* 「工具层不 import `env`」这条规则的来龙去脉与 `render.py` 当年为什么留在顶层（该模块已删除），见 `README.md` §2、§3 与 `docs/README.md`「分层规则」。
 * 训练分层（`DummyVecEnv → VecMonitor → VecNormalize`）与逐阶段课程组织见 `train.md` §1。
 * **本文档曾是全仓最严重的文档腐坏样本**：`touch.py` 与 `png.py` 被删除、`robotdog/__init__.py` 的整体重排（导入从第 7 行移到第 9 行、`setup_utf8_console()` 调用从第 11 行移到第 10 行）之后，本文档仍在描述「五个模块」「四个模块」与 MuJoCo 加载代价。发现它的手段是 `.tmp/check_lines.py`（行号越界 / 指向空行）加人工通读；这类「结构与数量级的事实」（几个模块、是否加载 mujoco）**无法被行号检查捕获**，只能靠模块文档随重构重写。
 
@@ -164,7 +164,7 @@ from robotdog.tools.paths import RUNS_DIR
 * **`import robotdog.tools` 只加载标准库**（`sys` / `pathlib` / `dataclasses`），既不加载 `numpy`、也不加载 `mujoco`。这是删掉 `touch.py`（唯一 import mujoco 的工具模块）与 `terrain.py` 里两个射线函数（唯一 import numpy 的地方）之后的直接收益。
 * **`__all__` 只影响 `from robotdog.tools import *`**。`robotdog.tools.console` 等属性无论如何都可访问。
 * **模块名就是文件路径**。规范路径 `robotdog.tools.terrain` 对应 `robotdog/tools/terrain.py`；报错信息里的模块路径不会指向别的文件，因为顶层没有兼容层。
-* **本文件不调用 `setup_utf8_console()`**。`robotdog/__init__.py:15` 也只导入它、不调用。任何 `import robotdog.*` 都**不会**修好编码 —— 这件事只由脚本在 `main()` 第一行显式调用完成（`scripts/train.py:255` / `scripts/play.py:429`）。文档曾长期声称「导入即生效」，那是假的。
+* **本文件不调用 `setup_utf8_console()`**。`robotdog/__init__.py:15` 也只导入它、不调用。任何 `import robotdog.*` 都**不会**修好编码 —— 这件事只由脚本在 `main()` 第一行显式调用完成（`scripts/train.py:294` / `scripts/play.py:449`）。文档曾长期声称「导入即生效」，那是假的。
 
 ## 10. 示例用法
 

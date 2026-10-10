@@ -280,8 +280,23 @@ class EpisodeOutcome:
 
 def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
                 capture: bool, camera: str, width: int, height: int) -> EpisodeOutcome:
-    """跑一个回合；``capture=True`` 时每 ``FRAME_STRIDE`` 步取一帧。"""
+    """跑一个回合；``capture=True`` 时每 ``FRAME_STRIDE`` 步取一帧。
+
+    ⭐ 回合开始后**必须把指令钉成** ``cfg.command`` 里的那一条，而且
+    :meth:`Go2StairsEnv.set_command_now` 要在 ``reset()`` **之后**调 —— ``reset()``
+    会按 ``command_vy_max`` / ``command_yaw_max`` 重抽指令，把之前写进去的覆盖掉。
+    不钉的话，同一个权重每次回放的指令都不一样，GIF 里机器人一会儿横着走一会儿
+    转圈，看的人会误以为它「不听指挥」；钉住之后回放是确定的，也与
+    ``.tmp/eval_run.py`` 的评估口径一致。
+
+    ``reset()`` 返回的 ``obs`` 是在钉指令**之前**算出来的，所以要用
+    :meth:`Go2StairsEnv._observation` 重取一份。
+    """
     obs, _ = env.reset(seed=seed)
+    cmd = env.cfg.command
+    env.set_command_now(vx=float(cmd.vx), vy=float(cmd._now[1]),
+                        yaw_rate=float(cmd._now[2]))
+    obs = env._observation()
     x0, z0 = float(env.base_pos[0]), float(env.base_pos[2])
     max_steps = int(env.cfg.episode_length_s / env.cfg.control_dt)
     out = EpisodeOutcome(episode=episode, steps=0)

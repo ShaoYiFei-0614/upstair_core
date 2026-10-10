@@ -499,7 +499,7 @@ mini-batches, there will be a truncated mini-batch of size 256
 | 类型 | 例子 | 为什么不能删 |
 | --- | --- | --- |
 | **字符串派发** | *（本仓目前没有实例）* | `venv.env_method("某个方法", ...)` 把名字藏在字符串里，AST 看不见。这是最容易误删的一类，改 `DummyVecEnv` 相关代码时留意 |
-| **框架回调** | `ProgressCallback._on_step`（`scripts/train.py:83`）、`CheckpointCallback._on_step`（`scripts/train.py:106`） | SB3 的 `BaseCallback` 按固定名字回调，从不被本仓代码显式调用 |
+| **框架回调** | `ProgressCallback._on_step`（`scripts/train.py:84`）、`CheckpointCallback._on_step`（`scripts/train.py:107`） | SB3 的 `BaseCallback` 按固定名字回调，从不被本仓代码显式调用 |
 | **文档化的公开 API** | `GaitParams.static`（`robotdog/gait.py:170`）、`GaitParams.targets`（`robotdog/gait.py:90`）、`policy.Policy`（`robotdog/policy.py:21`）、`StairSpec.down_end_x`（`robotdog/tools/terrain.py:108`）、`Go2StairsEnv.yaw`（`robotdog/env.py:448`）、`Go2StairsEnv.set_stair`（`robotdog/env.py:291`） | 设计文档把它们的签名与理由逐条写下来了，是给人用的接口面。删掉等于同时删两处文档，而它们各只有 1–5 行 |
 
 **留下的判据**：`GaitParams.static()` 是文档里「怎么关掉先验」的**唯一正确写法**（`docs/robotdog/gait.md:434` 的示例直接 `off = GaitParams.static()`），所以哪怕零调用者也要留——删了文档就在教一个不存在的函数。
@@ -517,7 +517,7 @@ mini-batches, there will be a truncated mini-batch of size 256
 | `set_terrain(venv, stair)` | `robotdog/training.py` | 函数体就是 `env_method("set_stair")` + `reset()` 两行，没有任何调用者。**删它之前看过两跳**：它自己是零读者，但它是 `set_stair` 的唯一调用者，所以删完 `set_stair` 也变成了零调用点（那个保留了，见 §9.1） |
 | `GO2_SCENE_XML` | `robotdog/tools/paths.py:15` | 本仓从不用官方 `scene.xml`（场景由 `compile_scene()` 现场拼 XML）；`scene.xml` 只在 `scripts/download_go2.py:44` 的 `WANT_FILES` 里以**字符串字面量**出现 |
 | `ensure_dir(path)` | `robotdog/tools/paths.py:29` | 零调用者，且自带两个坑（传 `str` 抛 `AttributeError`、对文件路径会建出同名目录） |
-| `ensure_output_dirs()` | `robotdog/tools/paths.py:35` | 零调用者；`scripts/play.py:215` 的 `write_gif` 自己 `path.parent.mkdir(...)` |
+| `ensure_output_dirs()` | （已删除） | 零调用者；`scripts/play.py:220` 的 `write_gif` 自己 `path.parent.mkdir(...)` |
 
 顺带删掉三个**失去全部使用者**的 import：`robotdog/training.py` 的 `numpy`（`mean_abs_action` 是唯一使用者）、`robotdog/policy.py` 的 `Sequence`、`scripts/download_go2.py` 的 `sys`（末尾写的是 `raise SystemExit(main())` 而不是 `sys.exit`）。
 

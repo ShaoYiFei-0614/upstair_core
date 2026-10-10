@@ -171,7 +171,7 @@ def policy_arch(model_path: str | Path) -> tuple[int, ...] | None:
     ``(512, 256)`` 建网再 ``set_parameters``，一个用 ``(64, 64)`` 训出来的权重会
     直接 ``RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy: size
     mismatch for mlp_extractor.policy_net.0.weight: copying a param with shape
-    torch.Size([64, 460]) ... the shape in current model is torch.Size([512, 460])``。
+    torch.Size([64, 480]) ... the shape in current model is torch.Size([512, 480])``。
     ``policy_kwargs.net_arch`` 是普通 JSON（``{"pi": [...], "vf": [...]}``），不需要
     解 pickle。
     """
@@ -201,12 +201,12 @@ def env_config_for_model(model_path: str | Path) -> EnvConfig:
     ``<stem>_env.json``（精确，``train.py`` 每个 checkpoint 各存一份）→
     按 ``.zip`` 里保存的观测维度反推是哪几个观测块（**启发式**，会打一行提示）。
 
-    ``EnvConfig()`` 的默认观测是 10 帧 × 46 维 = 460 维，而本仓 ``config.yaml``
-    用 ``history_len: 1`` 只有 46 维；直接用默认配置加载本仓权重会抛
+    ``EnvConfig()`` 的默认观测是 10 帧 × 48 维 = 480 维，而本仓 ``config.yaml``
+    用 ``history_len: 1`` 只有 48 维；直接用默认配置加载本仓权重会抛
     ``ValueError: Observation spaces do not match``，所以反推这条退路必须保留。
 
     反推**不可能**打开 ``obs.base_height``：那个开关在 :class:`ObsConfig` 里
-    被硬性禁止（含地形真值，破坏盲走），所以 460/474 这类旧维度要么被无歧义
+    被硬性禁止（含地形真值，破坏盲走），所以 480/474 这类旧维度要么被无歧义
     还原，要么走 :meth:`_obs_config_for_dim` 返回 ``None`` 的报错分支。
     """
     model_path = Path(model_path)
@@ -295,7 +295,7 @@ def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
 
     **``base_height`` 故意不在枚举里**：它在 :class:`ObsConfig` 的 ``__post_init__``
     里被硬性禁止（含地形真值，会破坏盲走），所以任何会打开它的组合都不可构造。
-    归档 checkpoint 里那些 460/474 维的权重本来就与本仓 46 维观测不兼容，
+    归档 checkpoint 里那些 480/474 维的权重本来就与本仓 48 维观测不兼容，
     不必为它们保留反推能力。
     """
     from itertools import product

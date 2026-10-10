@@ -12,7 +12,7 @@
 **做**：
 
 * 读 YAML（`load_config`），给出中文的错误信息（文件不存在 / 语法错 / 顶层不是映射）。
-* 把 `env` + `env.obs` + `reward` 三段写进 `EnvConfig`（`config_to_env`）。
+* 把 `env` + `env.obs` + `env.command` + `reward` 四段写进 `EnvConfig`（`config_to_env`）。
 * 把 `curriculum` 段展开成阶段表，按高度生成 `flat_spec` 或 `demo_stairs_spec`
   （`config_to_stages`）。
 * 补齐缺省值（`config_to_run` / `config_to_ppo` / `config_to_play` / `n_envs` / `device`）。
@@ -128,12 +128,14 @@ def _timesteps(value, n_stages, *, where) -> list[int]
 def _floats(value, n_stages, *, where, default) -> list[float]
 def _spread(weights, n) -> list[float]              # 线性重采样
 def _apply(target, values, *, where) -> None        # 未知键报错
+def _bools(value, n_stages, *, where, default) -> list[bool]
+def _unique_name(base, seen) -> str               # 阶段重名时加 _2 / _3
 def _load_gait(gait_file) -> GaitParams
 ```
 
-`config_to_env` 会**弹出**三个键再交给 `_apply`：`obs`（嵌套子段，单独处理）、
-`n_envs`（属于运行参数，不属于 `EnvConfig`）、`gait_file`（只有开了 `gait_prior`
-才真的读文件）。
+`config_to_env` 会**弹出**四个键再交给 `_apply`：`obs` 与 `command`（嵌套子段，
+各自单独 `_apply` 到 `cfg.obs` / `cfg.command`）、`n_envs`（属于运行参数，不属于
+`EnvConfig`）、`gait_file`（只有开了 `gait_prior` 才真的读文件）。
 
 ## 5. 内部结构与数据流
 
@@ -148,8 +150,9 @@ raw: dict
    ├── env:         config_to_env    → EnvConfig
    │     ├── env.*      → EnvConfig 字段（_apply）
    │     ├── env.obs.*  → ObsConfig 字段（_apply）
+   │     ├── env.command.* → CommandConfig 字段（_apply + __post_init__）
    │     └── gait_file  → load_gait（仅 gait_prior=true 时）
-   ├── reward:      cfg.reward ← _apply（在 config_to_env 内，robotdog/config.py:165；字段定义在 robotdog/reward.py）
+   ├── reward:      cfg.reward ← _apply（在 config_to_env 内，robotdog/config.py:185；字段定义在 robotdog/reward.py）
    ├── ppo:         config_to_ppo    → dict（原样透传）
    └── play:        config_to_play   → dict（补渲染默认值）
 ```
@@ -162,7 +165,7 @@ raw: dict
 | `DEFAULT_STAGE_TIMESTEPS` | `[100_000] + [250_000] × 5` | `curriculum.timesteps` 省略时用 |
 | `DEFAULT_LR` | `1.5e-4` | `curriculum.learning_rate` 省略时用 |
 | `env.n_envs` | `8` | |
-| `run.name` / `seed` / `save_every` / `log_every` | `course3` / `0` / `50000` / `20` | |
+| `run.name` / `seed` / `save_every` / `log_every` | `course1` / `0` / `50000` / `20` | 代码缺省是 `course1`（`robotdog/config.py:380-387`）；`config.yaml` 现值是 `course3` |
 | `play.episodes_gif` / `episodes_eval` | `10` / `100` | |
 | `play.camera` / `width` / `height` / `fps` / `scale` | `track` / `960` / `540` / `25` / `2` | |
 | `play.seed` | `0` | |
@@ -178,7 +181,7 @@ raw: dict
   常量）、`robotdog.gait`（`load_gait`）、`robotdog.tools.terrain`（造地形）、
   `robotdog.tools.paths`（定位仓根与先验文件）、第三方 `yaml`。
   奖励字段（`reward:` 段）定义在 `robotdog/reward.py`，但本模块**不直接 import 它**：
-  靠 `robotdog/env.py:37` 的重导出，`_apply(cfg.reward, ...)`（`robotdog/config.py:165`）
+  靠 `robotdog/env.py:37` 的重导出，`_apply(cfg.reward, ...)`（`robotdog/config.py:185`）
   就能工作 —— 依赖方向仍是 `config.py → env.py → reward.py`，没有新增边。
 * **被依赖** `scripts/train.py`（`config_to_run` / `config_to_env` / `config_to_stages` /
   `config_to_ppo` / `n_envs`）与 `scripts/play.py`（`config_to_play`）。

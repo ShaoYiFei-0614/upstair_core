@@ -23,10 +23,11 @@
 * **不含闭环**：不读 qpos/qvel、不做平衡、不知道台阶，相位纯由外部累加的时间 `t` 决定；
 * 不做 PD 控制、不写 `mjData`、不碰 MuJoCo；
 * 不决定「先验开不开」——`gait_prior` / `gait` / `gait_gain` 都是 `EnvConfig` 的字段，
-  `_gait_action()`（`robotdog/env.py:817-825`）才决定要不要用它；
-* 不决定观测里有没有步态时钟——那是 `ObsConfig.gait_phase`（`robotdog/env.py:66`）；
+  `_gait_action()`（`robotdog/env.py:883-891`）才决定要不要用它；
+* 不决定观测里有没有步态时钟——那是 `ObsConfig.gait_phase`（`robotdog/env.py:66`，
+  观测块在 `robotdog/env.py:556-558`）；
 * **不做相位随机化**：`gait_phase_randomize` 字段已从 `EnvConfig` 删除，
-  `reset()` 里 `_gait_t = _gait_phase = 0.0` 是固定值（`robotdog/env.py:812-813`）。
+  `reset()` 里 `_gait_t = _gait_phase = 0.0` 是固定值（`robotdog/env.py:870-871`）。
 
 ## 3. 关键设计决策与理由
 
@@ -47,9 +48,10 @@
 **被否决的方案**：把先验做成一个隐藏的闭环控制器（如相位驱动的足端 IK）。否决原因——
 那条路会让「策略学到什么」不可解释，而且先验变成不可检查的黑盒；本模块的先验是一条
 可打印、可存 JSON、可离线重现的**轨迹**。`EnvConfig.gait_prior` 默认 `False`
-（`robotdog/env.py:172-173`），所以「纯残差、无先验」的朴素形式依然可用；
+（`robotdog/env.py:175`），所以「纯残差、无先验」的朴素形式依然可用；
 而 `config.yaml` 的 `env.gait_prior` 默认 `true`，训练侧默认是**开**先验的
-（`robotdog/config.py:155-178`；CLI 不再有 `--gait-prior` 开关）。
+（`robotdog/config.py:171` 的 `config_to_env` 在 198-199 读 `gait_prior` 后调
+`_load_gait`（`robotdog/config.py:203-212`）；CLI 不再有 `--gait-prior` 开关）。
 
 ### D2 —— 幅度单位用「归一化动作单位」，不用弧度
 
@@ -70,7 +72,8 @@ target = home + gait_gain * gait.radians(t) + action_scale * action
 ```
 
 `gait.action_scale` 说「先验动作多大」（它是搜索出来的一部分），
-`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:827`）。
+`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:893-911` 的
+`_target_from_action()`）。
 `gait_gain` 默认 `1.0` 且**没有 CLI 开关**，只能改 `cfg`。
 
 **被否决的方案**：共用一个 `action_scale`（先验与策略同权）。否决原因就是上面那条实测：
@@ -204,7 +207,7 @@ _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
 
 ```
 EnvConfig()
-  → field(default_factory=GaitParams.default_trot)          # robotdog/env.py:170-171
+  → field(default_factory=GaitParams.default_trot)          # robotdog/env.py:176
     → GaitParams.from_dict(dict(_FALLBACK_TROT))            # robotdog/gait.py:165-167
       → cls(**kw).normalize()
 ```
@@ -212,10 +215,10 @@ EnvConfig()
 **控制步（每个 `step()` 一次）**：
 
 ```
-Go2StairsEnv.step(action)                                    # robotdog/env.py:756
-  → self._gait_phase = self._gait_t                          # env.py:761（本步实际用的相位）
-  → self._target_from_action(action)                         # env.py:762
-    → self._gait_action()                                    # env.py:726
+Go2StairsEnv.step(action)                                    # robotdog/env.py:913
+  → self._gait_phase = self._gait_t                          # env.py:918（本步实际用的相位）
+  → self._target_from_action(action)                         # env.py:919
+    → self._gait_action()                                    # env.py:883
        若 not cfg.gait_prior 或 cfg.gait_gain == 0.0 → zeros(12)
        否则 → cfg.gait_gain * cfg.gait.radians(self._gait_phase)
               → GaitParams.radians(t)                        # gait.py:94
@@ -224,14 +227,14 @@ Go2StairsEnv.step(action)                                    # robotdog/env.py:7
                     → GaitParams.leg_phases(t)               # gait.py:77
                     → GaitParams._calf_wave(p + ph_ca)       # gait.py:68
   → target = home + _gait_action() + cfg.action_scale * action
-  → np.clip(target, act_low, act_high)                       # env.py:769-771
-  → self._gait_t += cfg.control_dt                           # env.py:763（20 ms）
+  → np.clip(target, act_low, act_high)                       # env.py:911
+  → self._gait_t += cfg.control_dt                           # env.py:920（20 ms）
 ```
 
 **观测里的步态时钟**（`ObsConfig.gait_phase=True`，每帧 2 维）：
 
 ```
-_obs_frame()                                                 # robotdog/env.py:498
+_obs_frame()                                                 # robotdog/env.py:541-578
   → theta = 2π * cfg.gait.freq * self._gait_phase
   → np.array([np.sin(theta), np.cos(theta)])
 ```
@@ -239,12 +242,12 @@ _obs_frame()                                                 # robotdog/env.py:4
 **CLI 加载**：
 
 ```
-config.yaml: env.gait_prior / env.gait_file                    # robotdog/config.py:155-178
-  → load_gait(PATH)                                            # robotdog/config.py:184 → robotdog/gait.py:181
+config.yaml: env.gait_prior / env.gait_file                    # robotdog/config.py:198-199
+  → load_gait(PATH)                                            # robotdog/config.py:212 → robotdog/gait.py:181
       → GaitParams.from_search_json(PATH)                      # 有 "top" 键时
         → from_dict(entry["gait"] | action_scale=entry["action_scale"])
   → cfg.gait_prior = True; cfg.gait = gait
-  → play.py 打印 f"[步态] {cfg.gait.summary()}"                 # scripts/train.py:262 的启动自检
+  → play.py 打印 f"[步态] {cfg.gait.summary()}"                 # scripts/train.py:324 的启动横幅
 ```
 
 ## 6. 关键常量与默认值
@@ -350,12 +353,13 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   所以现在这个坑在结构上不会发生 —— 但「先验越强，别让策略少学」这句话仍然成立。
 * `experience.md` §3.4 —— 残差策略不知道自己处在步态周期的哪一点：叠加在周期先验上
   的残差策略若无法判断相位就不可能是最优的，修法是 `ObsConfig.gait_phase`
-  （sin/cos 两维）。实现就在 `robotdog/env.py:507-509`。
+  （sin/cos 两维）。实现就在 `robotdog/env.py:556-558`。
 * 先验自身的标定数字（在平地、确定性 reset、零动作噪声下用真实 `Go2StairsEnv` 测）：
   `default_trot()` 速度目标 0.550 m/s、8 s 走 4.39 m、100% 存活、机身高度 0.268 m。
   （`fast_trot()` 的 1.702 m/s、6 s 走 10.19 m 是同批标定的另一半，但该 classmethod
   已在死代码清理中删除。）速度目标写在 classmethod 的 docstring 里
-  （`robotdog/gait.py:190-191`）；**模块 docstring（`:1-23`）只记「从零学不出步态」
+  （`robotdog/gait.py:190-191` 是 `load_gait` 的两条 `return`）；
+  **模块 docstring（`robotdog/gait.py:1-23`）只记「从零学不出步态」
   的两次标定**，不记这几个速度数字。
 * 先验的几何能力（摆动峰值 0.1124 m / 频率 ×0.6 → 0.1658 m）与「开环调参也翻不过去」
   见 `experience.md` §6（能力边界：11 cm 的墙）、§6.3、§6.4；`train.md` §3 的消融说明
@@ -376,9 +380,10 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   3.0 cm → 12%、4.0 cm → 25%。它能迈上去，但不稳——先验是**起点不是解**。
 * **`_FALLBACK_TROT` 的注释不再指向任何文件**：它引用过 `artifacts/trot_gait.json`，
   该文件从未入库，现在 `artifacts/` 下只有 `trot_stairs.json`（`_FALLBACK_TROT` 在
-  `robotdog/gait.py:41`，注释里已经不带路径）。
+  `robotdog/gait.py:39`，注释里已经不带路径）。
 * **产生出货 JSON 的脚本不在仓里**：`from_search_json` 的 docstring
-  （`robotdog/gait.py:154`）与加载分支的注释（`:189`）都写 `scripts/search_trot.py`，
+  （`robotdog/gait.py:154`）与加载分支的注释（`robotdog/gait.py:189`）都写
+  `scripts/search_trot.py`，
   但 `scripts/` 下现在只有 `download_go2.py` / `play.py` / `train.py` / `__init__.py`。
   所以 `artifacts/trot_stairs.json` 是**不可重建的 artifact**——改了它无法重搜。
 * **`from_dict()` 静默忽略未知键**（`kw = {k: v for k, v in d.items() if k in known}`）：
@@ -391,7 +396,7 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   `ValueError: {path} has no 'top' entries` 或 `IndexError` 上炸掉。
 * **两个 `action_scale` 同名但不同义**：`GaitParams.action_scale`（出货值 `1.0`）是
   「先验幅度」，`EnvConfig.action_scale`（`0.30`）是「策略权限」。源码里没有任何一处把
-  两者相加或相乘后再 clip；真实实现（`robotdog/env.py:827`）是
+  两者相加或相乘后再 clip；真实实现（`robotdog/env.py:893-911`）是
   `target = clip(home + gait_gain*gait.radians(t) + cfg.action_scale*action, act_low, act_high)`
   ——clip 的是最终关节目标（用 MJCF 关节限位），没有「先求和再 clip 到 ±1」这一步。
   `grep "action_scale"` 会同时命中两处，对账时注意区分。以代码为准。

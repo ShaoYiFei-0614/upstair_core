@@ -43,7 +43,7 @@
 要做 warm-start、每级学习率、每级产物命名，都必须在「类 → 协议 → 训练器」之间来回传参；
 实际使用中 `train.py` 从来**没有构造过 `Curriculum`**，它自带 for 循环直接调
 `train_stage` —— 于是整个驱动器成了孤儿（只有 `default_curriculum()` 在造它）。
-删掉后本模块从 558 行降到 308 行，且没有任何行为变化。
+删掉后本模块从 558 行降到 332 行，且没有任何行为变化。
 
 教训：**当调用方绕过你的抽象层自己写循环时，那不是调用方的错，是抽象层的错**。
 
@@ -104,6 +104,9 @@ class StageSpec:
     command_yaw_max: float = 0.0     # 该阶段偏航指令上界 [rad/s]
     command_vx: float = 0.0          # 该阶段定值前进指令 [m/s]，0 = 用 env 基线
     flat_success_distance: float = 0.0   # 平地段成功距离 [m]，0 = 用 env 基线
+    # 平地段是否要求真的前进一段才算成功。原地指令课程必须关掉（改成「撑满回合」），
+    # 否则 `command_vx = 0` 时 `is_success` 永远不触发，日志成功率恒为 0。
+    flat_success_needs_progress: bool = True
     reward_overrides: dict[str, float] = field(default_factory=dict)   # 奖励课程
 
     @property
@@ -180,7 +183,7 @@ def format_seconds(seconds: float) -> str: ...   # 12.3s / 4.5min / 1.20h
 
 `__all__` = `["STAGE_HEIGHTS_CM", "EpisodeStats", "StageResult", "StageSpec",
 "format_curriculum", "format_seconds", "write_summary"]`
-（`robotdog/curriculum.py:300-308`）
+（`robotdog/curriculum.py:324-332`）
 
 语义要点：
 
@@ -193,7 +196,10 @@ def format_seconds(seconds: float) -> str: ...   # 12.3s / 4.5min / 1.20h
 * `format_curriculum` 的表格宽度按最长表头算，`results=None` 时只输出定义部分。
 * `write_summary` 里 `out.parent.mkdir(parents=True, exist_ok=True)` 已包含建目录；
   不需要先调 `RunDir.ensure()`。
-* `as_dict()` 的浮点都做了 `round`：`success_rate`/`fall_rate` 四位、`mean_return` 三位。
+* `as_dict()` 的浮点都做了 `round`，但两个类的 `mean_return` 精度**不同**：
+  `EpisodeStats.as_dict()` 用 `round(mean_return, 2)`（`robotdog/curriculum.py:175`），
+  `StageResult.as_dict()` 用 `round(mean_return, 3)`（`robotdog/curriculum.py:225`）；
+  两者的 `success_rate`/`fall_rate` 都是四位、`mean_length` 一位。
 
 ## 5. 内部结构与数据流
 
@@ -202,7 +208,8 @@ def format_seconds(seconds: float) -> str: ...   # 12.3s / 4.5min / 1.20h
 ```
 config.yaml (curriculum: heights_cm / tread / n_up / timesteps / learning_rate
                         / command_vy_max / command_yaw_max / command_vx
-                        / flat_success_distance / reward_overrides)
+                        / flat_success_distance / flat_success_needs_progress
+                        / reward_overrides)
   → robotdog/config.py  config_to_stages()
       → flat_spec(tread=...)                    # 第 1 级
       → demo_stairs_spec(step_height=h/100, tread=..., n_up=...)   # 其余 5 级
@@ -240,8 +247,8 @@ write_summary(path, stages, results, meta)
 | `DEFAULT_N_UP` | `8` |
 | `EpisodeStats.window` 默认 | `50` |
 | `format_seconds` 分界 | `< 60` → `12.3s`；`< 3600` → `4.5min`；否则 `1.20h` |
-| `as_dict()` 舍入 | `success_rate`/`fall_rate` 4 位，`mean_return` 3 位，`mean_length` 1 位 |
-| 文件行数 | 308 行 |
+| `as_dict()` 舍入 | `success_rate`/`fall_rate` 4 位、`mean_length` 1 位；`mean_return` 在 `EpisodeStats` 是 **2** 位、在 `StageResult` 是 **3** 位 |
+| 文件行数 | 332 行 |
 
 ## 7. 与其它模块的关系
 
@@ -280,7 +287,10 @@ write_summary(path, stages, results, meta)
   `isinstance(path, dict)` 重载已随死代码清理删除，传 `dict` 给 `path` 会在
   `Path(dict)` 处抛 `TypeError`，不会静默走错分支。
 * **本模块不再有 `Curriculum` / `StageTrainer` / `default_curriculum`**。
-  在旧文档或旧脚本里看到这些名字，一律是过期引用。
+  在旧文档或旧脚本里看到这些名字，一律是过期引用。已知残留一处：
+  `scripts/train.py:124` 的 `Trainer` docstring 仍写「实现
+  `robotdog.curriculum.StageTrainer` 协议」——该协议已删，这句是历史残留
+  （Sphinx `:class:` 引用会因此解析失败），不影响运行。
 
 ## 10. 示例用法
 

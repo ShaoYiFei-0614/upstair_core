@@ -204,8 +204,8 @@ f'condim="3" friction="{fr}" rgba="{self.rgba}" group="{TERRAIN_GEOM_GROUP}"/>'
 ```python
 DEFAULT_STAIR_FRICTION: tuple[float, float, float] = (0.9, 0.005, 0.0001)   # :27
 DEFAULT_STAIR_RGBA = "0.62 0.60 0.55 1"                                     # :28
-TERRAIN_GEOM_GROUP = 1                                                     # :49
-CREST_SEAM_OVERLAP = 1.0                                                   # :68
+TERRAIN_GEOM_GROUP = 1                                                     # :48
+CREST_SEAM_OVERLAP = 1.0                                                   # :67
 ```
 
 > 模块级常量**只有这四个**。已删除（不要再引用）：`DEFAULT_EDGE_RGBA`
@@ -236,8 +236,8 @@ CREST_SEAM_OVERLAP = 1.0                                                   # :68
 
 | 属性 | 返回类型 | 公式 | 源码行 |
 | --- | --- | --- | --- |
-| `crest_height` | `float` | `n_up * step_height` | `:99-101` |
-| `up_end_x` | `float` | `start_x + n_up * tread`（最后一道立面的踏面结束处 = crest 起点） | `:103-106` |
+| `crest_height` | `float` | `n_up * step_height` | `:99-100` |
+| `up_end_x` | `float` | `start_x + n_up * tread`（最后一道立面的踏面结束处 = crest 起点） | `:103-105` |
 | `down_end_x` | `float` | `up_end_x + landing + n_down * tread`（下降段回到地面高度处的 x） | `:108-110` |
 
 > 已删除的派生属性：`span_end_x`（`x where solid staircase geometry ends`）与
@@ -337,8 +337,8 @@ pyramid : 平地 → n_up 级上升立面 → 平的 crest → n_down 级下降�
 | --- | --- | --- |
 | `DEFAULT_STAIR_FRICTION` | `(0.9, 0.005, 0.0001)` | 模块级 `:27` |
 | `DEFAULT_STAIR_RGBA` | `"0.62 0.60 0.55 1"` | 模块级 `:28` |
-| `TERRAIN_GEOM_GROUP` | `1` | 模块级 `:49`（载荷，见 §3.4） |
-| `CREST_SEAM_OVERLAP` | `1.0`（单位：踏面） | 模块级 `:68`（载荷，见 §3.3） |
+| `TERRAIN_GEOM_GROUP` | `1` | 模块级 `:48`（载荷，见 §3.4） |
+| `CREST_SEAM_OVERLAP` | `1.0`（单位：踏面） | 模块级 `:67`（载荷，见 §3.3） |
 | `StairSpec.step_height` | `0.05` | 字段默认 |
 | `StairSpec.tread` | `0.50` | 字段默认 |
 | `StairSpec.width` | `2.00` | 字段默认 |
@@ -372,12 +372,12 @@ pyramid : 平地 → n_up 级上升立面 → 平的 crest → n_down 级下降�
 
 | 位置 | 使用的符号 | 依赖方向为什么是这样 |
 | --- | --- | --- |
-| `robotdog/go2_model.py:42` | `TERRAIN_GEOM_GROUP` | 生成地面 plane 时也要打同一个 group（`default_floor_geom`） |
+| `robotdog/go2_model.py:39` | `TERRAIN_GEOM_GROUP` | 生成地面 plane 时也要打同一个 group（`default_floor_geom`） |
 | `robotdog/env.py:46` | `StairSpec, build_terrain_xml` | 环境层持有 spec 并驱动编译（`_build_model()` 调 `build_terrain_xml(self.stair)`） |
 | `robotdog/env.py` | `height_at` | 地形高、`foot_clearance`、支撑面参照（见 §5） |
 | `robotdog/env.py` | `crest_height` | 出生点与**成功判据**（`terrain_height_under_base >= crest_height - 1e-9`） |
-| `robotdog/config.py:35` | `demo_stairs_spec, flat_spec` | `config_to_stages()` 按 `config.yaml` 造阶段表 —— **当前唯一的课程构造路径**（见 `docs/robotdog/config.md`） |
-| `robotdog/policy.py:18/301` | `StairSpec, demo_stairs_spec, flat_spec` | `stair_from_height()` 由高度造地形，服务 `play.py` |
+| `robotdog/config.py:36` | `demo_stairs_spec, flat_spec` | `config_to_stages()` 按 `config.yaml` 造阶段表 —— **当前唯一的课程构造路径**（见 `docs/robotdog/config.md`） |
+| `robotdog/policy.py:18/319` | `StairSpec, demo_stairs_spec, flat_spec` | `stair_from_height()` 由高度造地形，服务 `play.py` |
 | `robotdog/training.py:38` | `StairSpec` | 建环境/向量环境时透传 spec |
 | `scripts/play.py` | `stair.crest_height` | 评估/渲染的头部信息打印 |
 
@@ -390,7 +390,7 @@ pyramid : 平地 → n_up 级上升立面 → 平的 crest → n_down 级下降�
 `from robotdog.tools.terrain import TERRAIN_GEOM_GROUP` 构造「只对地形生效」的射线掩码，
 那是工具层**内部**唯一一条依赖。触觉/测距整套逻辑已随「盲走楼梯」重构删除，现在工具层
 内部**没有任何跨模块依赖**，`TERRAIN_GEOM_GROUP` 的唯一消费者是
-`robotdog/go2_model.py:42`（给地面 plane 打同一组，保留可以让地形与地面在渲染器里同组可见）。
+`robotdog/go2_model.py:39`（给地面 plane 打同一组，保留可以让地形与地面在渲染器里同组可见）。
 
 ## 8. 实测与经验教训
 
@@ -415,7 +415,7 @@ pyramid : 平地 → n_up 级上升立面 → 平的 crest → n_down 级下降�
 | `mujoco_mj_ray(...)` | 只被 `raycast_heights` 调用；删掉后本模块**彻底不依赖 mujoco/numpy** |
 | `StairSpec.span_end_x` / `StairSpec.max_height` | 分别是 `down_end_x`/`up_end_x` 与 `crest_height` 的派生别名，零使用者 |
 
-顺带修掉的一处**历史必炸缺陷**：`robotdog/evaluate.py:87` 曾把它写成方法调用
+顺带修掉的一处**历史必炸缺陷**：已删除的 `robotdog/evaluate.py` 曾把它写成方法调用
 `spec = rand.sample_spec(rng)` —— `AttributeError: 'TerrainRandomization' object has no
 attribute 'sample_spec'`（正确写法是模块级 `sample_spec(rng, rand)`；该文件已随重构删除）。
 这是「模块级函数被当成方法调用」这类缺陷的典型：**语法合法，只有执行到那一行才炸**。

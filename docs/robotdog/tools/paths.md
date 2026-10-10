@@ -62,8 +62,8 @@ OUTPUT_GIFS_DIR: Path = OUTPUT_DIR / "gifs"
 
 | 目录 | 谁建 | 代码位置 |
 | --- | --- | --- |
-| `output/` + `output/gifs/` | `scripts/play.py` 的 `write_gif`，保存前建父目录 | `scripts/play.py:215` `path.parent.mkdir(parents=True, exist_ok=True)` |
-| `runs/<名字>/` 及其子目录 | `robotdog/training.py` 的 `RunDir.ensure()` | `robotdog/training.py:265` |
+| `output/` + `output/gifs/` | `scripts/play.py` 的 `write_gif`，保存前建父目录 | `scripts/play.py:220` `path.parent.mkdir(parents=True, exist_ok=True)` |
+| `runs/<名字>/` 及其子目录 | `robotdog/training.py` 的 `RunDir.ensure()` | `robotdog/training.py:264` |
 | `.generated/` | `robotdog/go2_model.py` 的 `compile_scene`（编译失败才建） | `robotdog/go2_model.py:405-408` |
 
 **被否决的方案（历史，已随函数一起删除）**：用 `ensure_output_dirs()` 做「启动时一次性准备」，再用 `ensure_dir(path)` 给任意工作目录做 `mkdir -p` 并返回路径（支持 `write_bytes(ensure_dir(d) / "x.bin", blob)` 这种一行式写法）。否决理由是**实证的**：这两个函数从写出来到删除，**全仓零调用者**——`play.py` 由 `write_gif` 自建父目录，`RUNS_DIR` 由 `RunDir.ensure()` 建，`GENERATED_DIR` 由 `compile_scene` 建。一个「约定单一入口」如果没有任何人走这个入口，它就只是**多一条可以腐坏的 API 面**（`ensure_dir` 还有「传字符串抛 `AttributeError: 'str' object has no attribute 'mkdir'`」「对文件路径调用会建出同名目录」两个坑）。真正的约定现在写在常量注释里，而不是写在一个没人调的函数里。
@@ -112,9 +112,9 @@ GENERATED_DIR: Path = WORKSPACE / ".generated"
 | `GO2_DIR` | `models/unitree_go2/` | Go2 模型目录 | 派生用 |
 | `GO2_XML` | `models/unitree_go2/go2.xml` | 机器人的主 MJCF | `robotdog/go2_model.py:38` |
 | `GO2_ASSETS_DIR` | `models/unitree_go2/assets` | mesh/纹理目录，编译 MJCF 时的 `meshdir` | `robotdog/go2_model.py:38` |
-| `RUNS_DIR` | `runs/` | 每次训练 run 的子目录 | `robotdog/training.py:38` |
+| `RUNS_DIR` | `runs/` | 每次训练 run 的子目录 | `robotdog/training.py:37` |
 | `OUTPUT_DIR` | `output/` | 给人看的产物根 | `scripts/play.py`（经 `write_gif` 建父目录） |
-| `OUTPUT_GIFS_DIR` | `output/gifs/` | **交付物**：动画 GIF | `scripts/play.py:342` |
+| `OUTPUT_GIFS_DIR` | `output/gifs/` | **交付物**：动画 GIF | `scripts/play.py:362` |
 | `GENERATED_DIR` | `.generated/` | 调试用生成的 MJCF | `robotdog/go2_model.py:405` |
 
 `__all__`（`robotdog/tools/paths.py:28-38`）与上表逐字一致，9 项。
@@ -139,7 +139,7 @@ Path(__file__).resolve()                          # <ws>/robotdog/tools/paths.py
           → WORKSPACE / ".generated"              → GENERATED_DIR
 ```
 
-**模块体内没有第二条语句**：没有 `mkdir`、没有 I/O、没有函数定义。`import robotdog.tools.paths` 的副作用只有构造 10 个 `Path` 对象。
+**模块体内没有第二条语句**：没有 `mkdir`、没有 I/O、没有函数定义。`import robotdog.tools.paths` 的副作用只有构造 9 个 `Path` 对象。
 
 调用方侧的三条典型链：
 
@@ -149,13 +149,13 @@ Path(__file__).resolve()                          # <ws>/robotdog/tools/paths.py
            robotdog/go2_model.py:407 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
                                 :408 dump = GENERATED_DIR / "failed_scene.xml"
 
-[实验产物] robotdog/training.py:38 from robotdog.tools.paths import RUNS_DIR
-           robotdog/training.py:257 self.root = Path(root) if root else (RUNS_DIR / name)
-           robotdog/training.py:265 def ensure(self) -> Path: （真正 mkdir 的地方）
+[实验产物] robotdog/training.py:37 from robotdog.tools.paths import RUNS_DIR
+           robotdog/training.py:256 self.root = Path(root) if root else (RUNS_DIR / name)
+           robotdog/training.py:264 def ensure(self) -> Path: （真正 mkdir 的地方）
 
 [交付 GIF] scripts/play.py:48 from robotdog.tools import console, paths  # noqa: E402
-           scripts/play.py:215 path.parent.mkdir(parents=True, exist_ok=True)（在 write_gif 内）
-           scripts/play.py:342 gif = paths.OUTPUT_GIFS_DIR / f"{name}.gif"
+           scripts/play.py:220 path.parent.mkdir(parents=True, exist_ok=True)（在 write_gif 内）
+           scripts/play.py:362 gif = paths.OUTPUT_GIFS_DIR / f"{name}.gif"
 ```
 
 ## 6. 关键常量与默认值
@@ -182,7 +182,7 @@ Path(__file__).resolve()                          # <ws>/robotdog/tools/paths.py
   | --- | --- | --- |
   | `ensure_dir(path: Path) -> Path` | `mkdir -p` 并返回路径，便于一行式调用 | 全仓零调用者；且有两个坑（传 `str` 抛 `AttributeError`、对文件路径建出同名目录） |
   | `ensure_output_dirs() -> None` | 启动时建 `output/` 与 `output/gifs/` | 全仓零调用者；`write_gif` 自己建父目录 |
-  | `GO2_SCENE_XML` | `models/unitree_go2/scene.xml` 的路径 | 本仓从不用官方 `scene.xml`（场景由 `robotdog/go2_model.py:compile_scene()` 现场拼 XML 字符串）；`scene.xml` 只在 `scripts/download_go2.py:44` 的 `WANT_FILES` 里以字面量出现 |
+  | `GO2_SCENE_XML` | `models/unitree_go2/scene.xml` 的路径 | 本仓从不用官方 `scene.xml`（场景由 `robotdog/go2_model.py:compile_scene()` 现场拼 XML 字符串）；`scene.xml` 只在 `scripts/download_go2.py:43` 的 `WANT_FILES` 里以字面量出现 |
   | `SCRIPTS_DIR` / `ARTIFACTS_DIR` / `LOGS_DIR` | 早期版本的目录常量 | 只命中定义与 `__all__`；`LOGS_DIR` 尤其误导（报告早已改写到 `runs/<名字>/summary.json`） |
 
 * **本文档曾是「常量删了、文档没删」的典型受害样本**：`CONFIGS_DIR`、四个 `output/` 子目录常量、`ensure_dirs()`，以及后来死掉的 `SCRIPTS_DIR` / `ARTIFACTS_DIR` / `LOGS_DIR` 都曾是这里的描述对象。而 `.tmp/check_lines.py` 当时只抓到**三条行号问题**（两条越界、一条指向空行）——「函数根本不存在」「常量少了五个」这类事实**行号检查永远抓不到**，只能靠对着源码逐条重写。

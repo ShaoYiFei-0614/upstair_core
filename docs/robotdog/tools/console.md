@@ -52,7 +52,7 @@ if reconfigure is None:
 
 `getattr(sys, stream_name, None)` 一起兜掉了「解释器没有 `sys.stdout`」（pythonw、`-c` 下 `sys.stdout` 为 `None`）的情况 —— 此时 `stream` 是 `None`，`getattr(None, "reconfigure", None)` 返回 `None`，走 `continue`。
 
-`reconfigure` 已知会在两种情形抛异常并写入源码注释 `# 例如流已分离或已关闭；这里无能为力`（`robotdog/tools/console.py:27`）：
+`reconfigure` 已知会在两种情形抛异常并写入源码注释 `# 例如流已分离或已关闭；这里无能为力`（`robotdog/tools/console.py:28`）：
 
 * `ValueError`：流已关闭。
 * `OSError`：流已分离（detached）。
@@ -62,7 +62,7 @@ if reconfigure is None:
 ### 3.5 调用点是脚本，不是 `robotdog/__init__.py`
 
 `robotdog/__init__.py:15` 只**导入**它、**从不调用**它。真实调用点是
-`scripts/train.py:255` 与 `scripts/play.py:429`，两处都在 `main()` 的第一行。
+`scripts/train.py:294` 与 `scripts/play.py:449`，两处都在 `main()` 的第一行。
 
 理由：编码必须在**任何输出发生之前**生效，而脚本的 `main()` 第一行正是这个确定位置；
 放成包导入的副作用会让「导入一个纯数据模块」改进程 I/O，范围超出合理预期（见
@@ -71,7 +71,7 @@ if reconfigure is None:
 
 **被否决的方案**：在 `console.py` 模块层直接调用自己 —— 否决，因为那样连
 `from robotdog.tools.console import setup_utf8_console` 都会改进程 I/O，而这个函数
-**需要**能被显式调用（`scripts/train.py:235` / `scripts/play.py:429` 正是这么用的），
+**需要**能被显式调用（`scripts/train.py:294` / `scripts/play.py:449` 正是这么用的），
 显式与隐式两条路径会叠加。
 
 **历史腐坏**：本文档与 `robotdog/__init__.py`、`robotdog/tools/console.py` 三处曾一致声称
@@ -123,8 +123,8 @@ def setup_utf8_console() -> None:
 一次真实调用（脚本在 `main()` 第一行主动调用）：
 
 ```
-scripts/train.py:54   from robotdog.tools import console  # noqa: E402
-scripts/train.py:235  console.setup_utf8_console()        # main() 的第一条语句
+scripts/train.py:55   from robotdog.tools import console  # noqa: E402
+scripts/train.py:294  console.setup_utf8_console()        # main() 的第一条语句
   → setup_utf8_console()
       → for stream_name in ("stdout", "stderr")
           → getattr(sys, stream_name, None)          # 得到 TextIOWrapper 或 None
@@ -134,12 +134,12 @@ scripts/train.py:235  console.setup_utf8_console()        # main() 的第一条�
           → except (ValueError, OSError): pass
 ```
 
-`scripts/play.py:48` 精确导入同一个模块，`scripts/play.py:429` 在 `main()` 的第一行
+`scripts/play.py:48` 精确导入同一个模块，`scripts/play.py:449` 在 `main()` 的第一行
 以同样方式调用：
 
 ```
 scripts/play.py:48    from robotdog.tools import console, paths  # noqa: E402
-scripts/play.py:429   console.setup_utf8_console()               # main() 的第一条语句
+scripts/play.py:449   console.setup_utf8_console()               # main() 的第一条语句
 ```
 
 **没有任何「靠导入触发」的路径**：`import robotdog` 只执行
@@ -167,8 +167,8 @@ scripts/play.py:429   console.setup_utf8_console()               # main() 的第
 | 位置 | 用法 | 方向理由 |
 | --- | --- | --- |
 | `robotdog/__init__.py:15` | **只导入，不调用** | 供 `from robotdog import setup_utf8_console` 使用；导入本身不产生副作用，所以 `import robotdog` 不会改进程 I/O |
-| `scripts/train.py:54, 235` | 显式导入模块并在 `main()` 首行调用 | 独立脚本可能不经 `import robotdog` 启动，所以自己兜一次（幂等） |
-| `scripts/play.py:48, 429` | 同上 | 同上 |
+| `scripts/train.py:55, 294` | 显式导入模块并在 `main()` 首行调用 | 独立脚本可能不经 `import robotdog` 启动，所以自己兜一次（幂等） |
+| `scripts/play.py:48, 449` | 同上 | 同上 |
 
 **为什么方向是「工具层被所有人依赖」**：编码修复是最底层的横切关注点，它不需要任何项目知识，因此可以放在依赖图的最底端被所有层调用；反过来它绝不 import 任何项目模块，否则就从最底端变成环的一环。
 

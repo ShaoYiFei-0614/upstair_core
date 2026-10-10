@@ -29,7 +29,7 @@
 ### D1 —— 控制台修复由脚本显式调用，不做成 import 副作用
 
 本文件**只导入** `setup_utf8_console`，不调用它。真正调用它的是
-`scripts/train.py:255` 与 `scripts/play.py:429`，两处都在 `main()` 的第一行。
+`scripts/train.py:294` 与 `scripts/play.py:449`，两处都在 `main()` 的第一行。
 
 **为什么不做成 import 副作用**：`setup_utf8_console()` 会改进程级的
 `sys.stdout` / `sys.stderr`。把它挂在包导入上，意味着任何第三方
@@ -147,7 +147,7 @@ import robotdog
 * **下游**：`robotdog.tools`（`console` / `paths` / `terrain`）。
 * **绝不指向**：`robotdog.env` 及其任何依赖（D2）。
 * **被谁触发**：任何 `import robotdog.*` 都会先执行本文件（Python 包语义）。
-* **被谁显式调用**：`scripts/train.py:235`、`scripts/play.py:429`（`setup_utf8_console()`）。
+* **被谁显式调用**：`scripts/train.py:294`、`scripts/play.py:449`（`setup_utf8_console()`）。
 
 ## 8. 实测与经验教训
 
