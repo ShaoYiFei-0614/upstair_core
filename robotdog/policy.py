@@ -14,7 +14,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from robotdog.env import EnvConfig, ObsConfig, RewardConfig
+from robotdog.env import CommandConfig, EnvConfig, ObsConfig, RewardConfig
 from robotdog.tools.terrain import StairSpec
 
 
@@ -93,6 +93,11 @@ def env_config_from_summary(summary_path: str | Path) -> EnvConfig:
         env_kw["obs"] = _rebuild(ObsConfig, data["obs_config"])
     if data.get("reward_config"):
         env_kw["reward"] = _rebuild(RewardConfig, data["reward_config"])
+    if isinstance(env_kw.get("command"), dict):
+        # 指令是嵌套 dataclass（含当前值 ``_now``）。JSON 往返后它是个普通
+        # dict，直接塞给 EnvConfig 会让 ``env._command`` 变成 dict，
+        # ``set_command_now`` 当场 AttributeError。必须重建。
+        env_kw["command"] = _rebuild(CommandConfig, env_kw["command"])
     if isinstance(env_kw.get("gait"), dict):
         env_kw["gait"] = GaitParams.from_dict(env_kw["gait"])
     known = {f.name for f in fields(EnvConfig)}
@@ -284,9 +289,9 @@ def step_height_from_model(model_path: str | Path) -> float | None:
 def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
     """反推是哪几个观测块拼出了 ``total`` 维。
 
-    ``base_lin_vel_body``(3) / ``gait_phase``(2) / ``step_height``(1) 三个开关组合
-    不多，直接枚举。``base_lin_vel_body`` 默认开，所以枚举顺序把它放前面，使最简
-    配置优先命中。
+    ``base_lin_vel_body``(3) / ``gait_phase``(2) / ``step_height``(1) / ``command``(2)
+    四个开关组合不多，直接枚举。``base_lin_vel_body`` 与 ``command`` 默认开，所以
+    枚举顺序把它们放前面，使最简配置优先命中。
 
     **``base_height`` 故意不在枚举里**：它在 :class:`ObsConfig` 的 ``__post_init__``
     里被硬性禁止（含地形真值，会破坏盲走），所以任何会打开它的组合都不可构造。
@@ -295,7 +300,7 @@ def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
     """
     from itertools import product
 
-    flags = ("base_lin_vel_body", "gait_phase", "step_height")
+    flags = ("base_lin_vel_body", "gait_phase", "step_height", "command")
     for combo in product((False, True), repeat=len(flags)):
         cand = ObsConfig(history_len=history_len, **dict(zip(flags, combo)))
         if cand.size == total:

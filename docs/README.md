@@ -2,7 +2,8 @@
 
 本目录为 `robotdog/` 下的**每一个 `.py`** 提供一份设计文档，**目录结构与
 `robotdog/` 一一对应**：`robotdog/` 下共 12 个 `.py`（9 个在顶层，3 个在
-`tools/`），因此本目录共 12 份模块文档 + 本索引。
+`tools/`），因此本目录共 12 份模块文档 + 本索引。**`scripts/` 下的 4 个入口脚本
+不在 `robotdog/` 包内**，没有对应的模块文档（用法见本文件下方与仓根 `README.md`）。
 
 ```
 docs/
@@ -16,7 +17,7 @@ docs/
     policy.md               训练产物的加载与观测归一化
     reward.md               ★ 全部奖励数学（RewardConfig + compute_reward）
     training.md             PPO 组装 / 向量环境 / 运行目录
-    curriculum.md           六级课程（平地 + 3/6/9/12/15 cm）
+    curriculum.md           六级课程（三级平地预热 + 3/6/9 cm）
     tools/
       __init__.md           工具子包入口
       console.md            UTF-8 控制台
@@ -30,6 +31,9 @@ docs/
 * `scripts/train.py` —— 按课程训练，产物落进 `runs/<名字>/`。
 * `scripts/play.py` —— 评估现有权重：`--mode gif`（渲染 10 个回合合成 GIF）
   或 `--mode eval`（跑 100 个回合统计成功率）。
+* `scripts/teleop.py` —— 外部控制器演示：每控制步调 `env.set_command_now()` 改写
+  当前指令，模拟人遥感操控（可以读地形与机身位置，这不违反盲走 —— 盲走只限制
+  **策略的观测**）。
 
 仓根另有四份面向人的文档，职责互不重叠：`README.md`（项目是什么 + 怎么用 +
 代码规模）、`train.md`（怎么训 + 产物 + 实测成绩）、`experience.md`（症状 → 根因 →
@@ -41,7 +45,7 @@ docs/
 | 层 | 位置 | 允许依赖 | 说明 |
 | --- | --- | --- | --- |
 | 工具层 | `robotdog/tools/` | 只依赖标准库（`sys` / `pathlib` / `dataclasses`），以及**同层**模块 | **不 import `robotdog.env`**，不知道 PPO / 课程 / 训练循环 |
-| 环境层 | `robotdog/env.py`、`go2_model.py`、`gait.py` | 工具层 | 一个 Gymnasium 环境及其模型装配 |
+| 环境层 | `robotdog/env.py`、`go2_model.py`、`gait.py`、`reward.py` | 工具层 | 一个 Gymnasium 环境、其模型装配，以及**全部奖励数学**（`reward.py` 是纯函数，`env.py` 只转发） |
 | 训练层 | `robotdog/training.py`、`curriculum.py`、`policy.py` | 环境层 + 工具层 | PPO 组装、课程调度、权重与归一化统计的加载 |
 
 依赖是**单向**的：`训练层 → 环境层 → 工具层`。按这个规则，工具层的模块只有
@@ -55,6 +59,11 @@ from robotdog.tools import paths
 是唯一写法，`robotdog.terrain` / `robotdog.paths` 之类的扁平路径**不可用**。
 （早期版本用 `sys.modules[__name__] = _mod` 的替身模块保留过旧路径，已删除：
 报错 traceback 与 IDE 静态分析都会指到那个没有逻辑的替身文件，代价大于收益。）
+
+**`robotdog/reward.py` 是环境层里唯一的「无状态」模块**：它不 import 环境，只被
+`robotdog/env.py:37` 导入（`env.py` 再把 `RewardConfig` 重导出给 `config.py` 与
+`policy.py` 用）。所以依赖方向仍然是 `config.py → env.py → reward.py`，
+**不要**让 `reward.py` 反向 import `env`（那会成环，也会让纯函数变成难测的东西）。
 
 ## 文档规范
 

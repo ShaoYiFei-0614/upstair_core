@@ -136,13 +136,39 @@ class Trainer:
 
     # ---- 每个阶段一个独立的向量环境（地形烘焙在编译后的 MJCF 里）----------
     def make_env(self, stage: StageSpec, *, warm_start: str | None = None):
-        return make_vec_env(
+        venv = make_vec_env(
             stage.spec,
             n_envs=self.n_envs,
             cfg=self.cfg,
             seed=int(self.run["seed"]),
             norm_reward=bool(self.ppo.get("norm_reward", True)),
         )
+        # 指令课程：把这一级的横向 / 偏航指令范围下发给每一个子环境。
+        # 阶段内不再改动 —— 观测的那 2 维在整个课程里恒定，PPO 的网络与
+        # RolloutBuffer 才不用重建。
+        if stage.command_vy_max or stage.command_yaw_max:
+            venv.env_method("set_commands", stage.command_vy_max,
+                            stage.command_yaw_max)
+        # 平地指令预热的头几级还会（可选地）压低前进指令、缩短成功距离：
+        # 指令一放宽，机器人为了跟横移/旋转指令会绕路，原来的 3 m 判据会把
+        # 成功拖成超时，而超时回合里学不到「跟踪」这件事。
+        if stage.command_vx or stage.flat_success_distance:
+            if stage.flat_success_distance:
+                venv.env_method("set_flat_success_distance",
+                                stage.flat_success_distance)
+            if stage.command_vx:
+                venv.env_method("set_command_now", None, None, stage.command_vx)
+        # ⚠ 这一项**无条件**下发（不放在上面的 if 里）：它是「粘性」的，
+        # 原地指令课程把它设成 False 之后，若不主动恢复，后面的楼梯阶段会
+        # 继续用「撑满回合即成功」的判据 —— 那样墙上永远爬不上去也照样算成功。
+        venv.env_method("set_flat_success_needs_progress",
+                        bool(stage.flat_success_needs_progress))
+        # 奖励课程：这一级的奖励覆盖（``curriculum.reward_overrides``）叠到
+        # ``reward:`` 段的基线值上。常见的用法是「台阶越高，越需要抬腿试探」，
+        # 于是逐级放大 ``foot_lift`` / ``probe_lift`` 这类成形项。
+        if stage.reward_overrides:
+            venv.env_method("set_reward_overrides", dict(stage.reward_overrides))
+        return venv
 
     def train_stage(self, stage: StageSpec, venv, *, warm_start: str | None = None,
                     tensorboard_log: str | Path | None = None, **_: Any):
@@ -258,6 +284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"= {cfg.obs.size} 维")
     print(f"[动作] 残差模式, action_scale={cfg.action_scale} rad, "
           f"步态先验={'开' if cfg.gait_prior else '关'}")
+    cmd = cfg.command
+    print(f"[指令] 基线 vx={cmd.vx:g} m/s；实际 vx 与 vy/yaw 范围由指令课程按级下发"
+          f"（观测里的那 2 维恒在）")
     if cfg.gait_prior:
         print(f"[步态] {cfg.gait.summary()}")
     print(f"[奖励] forward_vel={cfg.reward.forward_vel} "

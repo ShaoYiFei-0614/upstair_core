@@ -39,17 +39,43 @@ class RewardConfig:
     """
 
     # --- 五个要求的项 ----------------------------------------------------- #
-    forward_vel: float = 2.5            # [SPEC] 对 command_vx 的高斯跟踪
+    forward_vel: float = 2.5            # [SPEC] 对 vx 指令的高斯跟踪
     forward_vel_sigma: float = 0.25     # m/s，高斯的标准差（**平方后作分母**）
     orientation: float = -1.2           # [SPEC] roll^2 + pitch^2（平方和）
     torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
     foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
-    body_collision: float = -4.0        # [SPEC] 躯干接触地形
+    body_collision: float = -1.2        # [SPEC] 躯干接触地形
+
+    # --- 横向 / 旋转指令跟踪（m08247 新增）--------------------------------- #
+    # 只在 ``EnvConfig.command`` 的范围非零时才可能非零（见 compute_reward 里的
+    # ``cmd.on`` 门），所以「只往前走」的阶段与旧行为逐位一致。
+    lateral_vel: float = 4.0            # 对 vy 指令的高斯跟踪
+    lateral_vel_sigma: float = 0.25     # m/s
+    yaw_rate: float = 3.0               # 对 wz 指令的高斯跟踪
+    yaw_rate_sigma: float = 0.25        # rad/s
 
     # --- 摆动足抬升 -------------------------------------------------------- #
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
     foot_lift_step_ratio: float = 1.4   # 取较大者：target = max(target, ratio * step_height)
     foot_lift_gate_speed: float = 0.25  # m/s，三维足端速度门限
+
+    # --- 被阻挡时的试探抬腿（m08247 后续新增）------------------------------ #
+    # 机器人在够不着的立面之前被阻挡时，唯一能改变局面的行为是「把脚抬得
+    # 比平时更高再试」。这一项是**势函数塑形**：只结算「被阻挡期间达到过的
+    # 最高摆动峰值又提高了多少」，所以总量有界、不可刷分，但对「抬得更高」
+    # 每一步都有梯度。
+    #
+    # 起算线为什么不用 ``ratio × 台阶高``：实测（``.tmp/calib_probe3.py``）在
+    # 15 cm 台阶前被阻挡时，默认步态的摆动峰值只到 0.09~0.12 m，而
+    # ``action_scale=0.30`` 下能搜到的最好固定动作也只到 0.148 m
+    # （``.tmp/calib_probe4.py``）。起算线一旦取 1.6×15cm = 0.24，梯度恒为零，
+    # 这一项永远不触发。所以起算线只跟「当前策略自己能抬多高」比 —— 见
+    # ``env.probe_target``。
+    probe_lift: float = 1.0             # 抬高进展的权重
+    probe_lift_target: float = 0.06     # m，进展的起算线（普通步态峰值带的上沿）
+    probe_lift_ratio: float = 1.0       # 记录用：曾按 ratio × 台阶高 取起算线，已弃用
+    probe_lift_max: int = 12            # 记录用：势函数本身有界，不再按次数截断
+    probe_blocked_frac: float = 0.30    # 实测前进速度 < 该比例 × 指令速度 ⇒ 被阻挡
 
     # --- 步态发现 ---------------------------------------------------------- #
     air_time: float = 0.6
@@ -109,10 +135,39 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 写法等于把 0.55 m/s 的偏差只按 sqrt(0.25)=0.5 m/s 折算，「站着不动」
     # 因此白拿 +0.86/步，是「原地拖延」局部最优的第一根支柱
     # （见 experience.md §12）。
-    err = lin[0] - env.cfg.command_vx
+    err = lin[0] - env.cfg.command.vx
     terms["forward_vel"] = (
         rc.forward_vel * float(np.exp(-(err * err) / (rc.forward_vel_sigma ** 2)))
     )
+
+    # 1b) 横向 / 偏航指令跟踪 ---------------------------------------------
+    # 指令来自外部控制器（或 reset 时的随机采样），是盲走允许的信息。
+    # 机体系横向速度直接取 ``base_lin_vel_body[1]``：它不会随偏航改变含义，
+    # 所以「横向」永远是这一个分量。
+    #
+    # ⭐ 这一项被门控住：**两个指令范围都为 0 时它恒为 0**。不门控的代价已经
+    # 量过 —— 高斯在 err 上有 0.25 的宽度，而机器人直走时 ``vy``/``yaw_rate``
+    # 的偏差恰好落在 sigma 附近，于是「什么都没做」每步也能白拿约 1.0 分
+    # （5 cm 上实测 125 步拿了 +139.7）。那就等于又造了一个「原地拖延」的正项。
+    #
+    # ⭐ 两个方向为什么是**求和**而不是取 ``max``（m10558 起）：取 max 时，
+    # 哪个方向的误差小就只保留那一个 —— 横向跟得还行时偏航项的梯度被整个丢掉，
+    # 策略于是永远学不会偏航。用一条实测确认了后果：course3 的 flat_3 检查点
+    # 横向上还有微弱相关性（r=+0.661、斜率 +0.028），偏航则完全为 0
+    # （r=−0.085、斜率 −0.006）。求和让两个方向各自都有梯度。
+    cmd = env.cfg.command
+    follow = 0.0
+    if cmd.vy_max:
+        vy_err = env.base_lin_vel_body[1] - cmd.vy
+        follow += rc.lateral_vel * float(
+            np.exp(-(vy_err * vy_err) / (rc.lateral_vel_sigma ** 2))
+        )
+    if cmd.yaw_max:
+        yaw_err = env.yaw_rate - cmd.wz
+        follow += rc.yaw_rate * float(
+            np.exp(-(yaw_err * yaw_err) / (rc.yaw_rate_sigma ** 2))
+        )
+    terms["command_follow"] = follow
 
     # 2) 姿态稳定奖励 -- 惩罚 roll 与 pitch -----------------------------
     terms["orientation"] = rc.orientation * float(rpy[0] ** 2 + rpy[1] ** 2)
@@ -195,6 +250,36 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     if climbed > 0.0:
         env._peak_terrain_height = env.terrain_height_under_base
     terms["stair_progress"] = rc.stair_progress * float(climbed)
+
+    # 8) 被阻挡时的试探抬腿 ------------------------------------------------
+    # 门控（全部满足才可能给分）：
+    #   ① 本回合已经被判定为「被阻挡」（``env._blocked``）—— 由
+    #      ``_update_probe_state()`` 在物理推进之后维护，判据是「有前进指令
+    #      但实测前进速度远低于指令」，而且一旦锁住就持续到机身下方的地形
+    #      刷新了新高度（真的上去了）才解除；
+    #   ② 本步的摆动峰值越过起算线 ``env.probe_target``。实测默认先验的峰值
+    #      带是 0.06~0.12 m（``.tmp/calib_probe3.py``），而 ``action_scale=0.30``
+    #      下搜到的最好固定动作能到 0.148 m（``.tmp/calib_probe4.py``）——
+    #      所以起算线取 0.06 m 这个「普通步态的上沿」，留出可优化的空间。
+    #
+    # ⭐ 这是**势函数塑形**（potential-based shaping），不是逐步固定分：
+    # ``env._probe_best`` 记住本回合「被阻挡期间达到过的最高峰值」，每一步只
+    # 结算「比历史最好还高出多少」。因此
+    #   * 总量有界：最多 ``probe_lift × (可达最高峰值 − 起算线)``；
+    #   * 不可刷分：重复做同样的高度拿不到任何分；
+    #   * 有梯度：每一次抬得更高都被记录，即使那一脚最终没踩上去。
+    # 为什么不用「落地那一刻峰值 > 门槛就给固定分」：实测那条路要么门槛太低
+    # （等于奖励普通步态），要么太高（一次都不触发）。见 experience.md §15。
+    if rc.probe_lift != 0.0 and env._blocked:
+        peaks = env._peak_swing_clearance
+        floor = max(env._probe_best, env.probe_target)
+        gain = float(np.sum(np.clip(peaks - floor, 0.0, None)))
+        if gain > 0.0:
+            env._probe_best = float(np.max(peaks))
+            env._probe_count += 1
+        terms["probe_lift"] = rc.probe_lift * gain
+    else:
+        terms["probe_lift"] = 0.0
 
     # --- 终止 -----------------------------------------------------------
     # 到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出楼梯远端摔下去。

@@ -10,18 +10,21 @@
 ### 1.1 固定六级课程
 
 `config.yaml` 的 `curriculum` 段（经 `robotdog/config.py:config_to_stages()` 展开）
-返回恰好六级（模板与 `robotdog/curriculum.py:STAGE_HEIGHTS_CM` 一致）：
+返回恰好六级。**前三级都是平地**：指令跟踪与爬楼是两种能力，混在一起学时跟踪会被
+爬楼的压力淹没（实测平地单级 250k 步也学不会，会横移的策略基本不转向）。
 
-| 阶段 | 台阶 | 踏面 | 级数 | 预算 | 学习率 |
-| --- | --- | --- | --- | --- | --- |
-| `flat` | 平地（`n_up=0`） | 0.50 | 0 | 100,000 | 1.5e-4 |
-| `stair3` | 3 cm | 0.50 | 8 | 250,000 | 1.5e-4 |
-| `stair6` | 6 cm | 0.50 | 8 | 250,000 | 1.2e-4 |
-| `stair9` | 9 cm | 0.50 | 8 | 250,000 | 1.0e-4 |
-| `stair12` | 12 cm | 0.50 | 8 | 250,000 | 8e-5 |
-| `stair15` | 15 cm | 0.50 | 8 | 250,000 | 6e-5 |
+| 阶段 | 台阶 | 踏面 | 级数 | 预算 | 学习率 | 指令范围 | 定值 vx | 平地成功距离 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `flat` | 平地（`n_up=0`） | 0.50 | 0 | 100,000 | 1.5e-4 | 0 / 0 | 0.45 | 2.0 m |
+| `flat_2` | 平地 | 0.50 | 0 | 250,000 | 1.5e-4 | ±0.15 / ±0.15 | 0.45 | 2.0 m |
+| `flat_3` | 平地 | 0.50 | 0 | 250,000 | 1.2e-4 | ±0.35 / ±0.50 | 0.45 | 2.5 m |
+| `stair3` | 3 cm | 0.50 | 8 | 250,000 | 1.0e-4 | ±0.30 / ±0.35 | 0.55 | 3.0 m |
+| `stair6` | 6 cm | 0.50 | 8 | 250,000 | 8e-5 | ±0.35 / ±0.55 | 0.55 | 3.0 m |
+| `stair9` | 9 cm | 0.50 | 8 | 250,000 | 6e-5 | ±0.40 / ±0.70 | 0.55 | 3.0 m |
 
 **默认总预算 1,350,000 步**。台阶越高、学习率越低（越往上越接近微调，不希望破坏已学的地形）。
+同一高度出现多次时阶段名会自动变成 `flat` / `flat_2` / `flat_3`（代码里的
+`_unique_name()`），否则 checkpoint 与 tensorboard 目录会互相覆盖。
 
 ```bat
 .venv\Scripts\python.exe scripts\train.py --run-name walk1
@@ -34,27 +37,33 @@
 ```
 [配置] config.yaml
 [运行] ...\runs\walk1  (seed=0, n_envs=8)
-[观测] 每帧 46 维 × history 1 = 46 维
+[观测] 每帧 48 维 × history 1 = 48 维
 [动作] 残差模式, action_scale=0.3 rad, 步态先验=开
+[指令] 基线 vx=0.55 m/s；实际 vx 与 vy/yaw 范围由指令课程按级下发（观测里的那 2 维恒在）
 [步态] 5.48 Hz, ±0.265 thigh / ±0.986 calf (norm. units), shape=sin, scale=1.00 rad, period=183 ms
 [奖励] forward_vel=2.5 foot_lift=0.9 success=50.0 termination=-15.0
 [PPO] 网络=[512, 256] n_steps=256 batch=512 epochs=5 target_kl=0.03 log_std_init=-2.0 norm_reward=True
 
 阶段       标签             台阶    踏面   级数      顶端         预算      学习率
 flat     平地           0.0c   50c    0   0.00m    100,000  0.00015
-stair3   3cm 台阶       3.0c   50c    8   0.24m    250,000  0.00015
-stair6   6cm 台阶       6.0c   50c    8   0.48m    250,000  0.00012
-stair9   9cm 台阶       9.0c   50c    8   0.72m    250,000   0.0001
-stair12  12cm 台阶     12.0c   50c    8   0.96m    250,000    8e-05
-stair15  15cm 台阶     15.0c   50c    8   1.20m    250,000    6e-05
+flat_2   平地           0.0c   50c    0   0.00m    250,000  0.00015
+flat_3   平地           0.0c   50c    0   0.00m    250,000  0.00012
+stair3   3cm 台阶       3.0c   50c    8   0.24m    250,000   0.0001
+stair6   6cm 台阶       6.0c   50c    8   0.48m    250,000    8e-05
+stair9   9cm 台阶       9.0c   50c    8   0.72m    250,000    6e-05
 合计 6 级, 总预算 1,350,000 步
 ```
+
+> `flat_3` / `stair3` 起每级的课程行末尾会多出 `指令 vy±0.35 wz±0.5`、
+> `vx=0.45`、`成功距离=2.5m`、`奖励覆盖 foot_lift=… probe_lift=…` 之类的后缀 ——
+> 分别来自 `config.yaml` 的 `curriculum.command_vy_max` / `command_yaw_max` /
+> `command_vx` / `flat_success_distance` / `reward_overrides`。
 
 每一级开头与结尾各有一行：
 
 ```
-[课程] >>> 第 2/6 级 'stair3' (3cm 台阶) stair3   3cm 台阶     台阶=  3.0cm 踏面=  50cm 级数=8  顶端= 0.24m 预算=  250,000 lr=0.00015
-    [warm-start] 从 flat_final.zip 继承权重
+[课程] >>> 第 4/6 级 'stair3' (3cm 台阶) stair3   3cm 台阶     台阶=  3.0cm 踏面=  50cm 级数=8  顶端= 0.24m 预算=  250,000 lr=0.0001
+    [warm-start] 从 flat_3_final.zip 继承权重
     [      2,048 步] 回合=    8 成功率= 100.0% 摔倒率=   0.0% 均回报=  332.33 均步数= 112.0     ← ProgressCallback
     训练完成 250,000 步  412 步/秒
 [课程] <<< 'stair3' 成功率=100.0% 摔倒率=0.0% 均回报=332.3 用时=606.8s
@@ -64,6 +73,7 @@ stair15  15cm 台阶     15.0c   50c    8   1.20m    250,000    6e-05
 
 ```
 flat     平地           0.0c   50c    0   0.00m    100,000  0.00015 100.0%   0.0%    332.87   242.7s flat_final.zip
+flat_2   平地           0.0c   50c    0   0.00m    250,000  0.00015 ...
 ...
 合计 6 级, 总预算 1,350,000 步
 
@@ -150,7 +160,7 @@ runs/<名字>/
 只有最后一级是 15 cm，`checkpoints/stair9_final.zip` 是 9 cm。
 `summary.json` 的键：`stages`（六级定义）、`results`（每级实测）、`env_config`、
 `obs_config`、`reward_config`、`total_timesteps`、`wall_seconds`、`final_model`。
-（`reward_config` 是 `robotdog/reward.py` 的 `RewardConfig` 24 个字段的完整快照。）
+（`reward_config` 是 `robotdog/reward.py` 的 `RewardConfig` 全部字段的完整快照，当前 30 个。）
 **`play.py` 靠 env.json 与它恢复配置**，所以搬动权重时不要漏掉这两类文件。
 
 ---
@@ -283,6 +293,58 @@ IK（触地时记抬脚点 → 求目标踏面 → 摆动相插值到落点 → 
    去掉先验后网络要同时从零学步态与平衡，在 ±0.30 rad 里做不到。真想去掉，
    必须先把 `action_scale` 放大到接近 gait 自身的 1.0 rad —— 那是另一次实验。
 
+### 3.7 `body_collision` 降权 + 指令课程的正式训练（`runs/course1`）
+
+本轮把 `body_collision` 从 `-4.0` 降到 `-1.2`、加入横向/偏航指令（观测 46 → 48 维）
+与指令课程后，用默认 `config.yaml` 跑满 1,350,000 步（8 环境，wall 2514 s）。
+
+| 阶段 | 成功率 | 摔倒率 | 超时率 | 均步数 | 均回报 |
+| --- | --- | --- | --- | --- | --- |
+| flat | 100.0% | 0.0% | 0.0% | 114.5 | +98.2 |
+| stair3 | 44.0% | 56.0% | 0.0% | 379.7 | +900.7 |
+| stair6 | 14.0% | 86.0% | 0.0% | 396.3 | +932.2 |
+| stair9 | 0.0% | 90.0% | 10.0% | 479.0 | +665.2 |
+| stair12 | 0.0% | 10.0% | 90.0% | 946.1 | +777.9 |
+| stair15 | 0.0% | 16.0% | 84.0% | 939.2 | +877.5 |
+
+课程外评测（`play.py --mode eval`，15 cm，100 回合）：成功率 0.0%、摔倒 7.0%、
+超时 93.0%、平均前进 0.41 m、平均速度 0.02 m/s ⇒ **在 15 cm 上它选择几乎不动**。
+
+**⚠ 这一节的数字不能单种子对比 —— 3 cm 单级的跑间方差极大。** 用同一份
+`config.yaml`、只保留 3 cm 一级、跑 250,000 步，只换 `run.seed`：
+
+| 运行 | seed | 3 cm 成功率 | 摔倒率 | 均步数 |
+| --- | --- | --- | --- | --- |
+| `course1` 的 stair3 级 | 0 | 44.0% | 56.0% | 379.7 |
+| `runs/seed3cm_11` | 11 | **72.0%** | 28.0% | 376.3 |
+| `runs/seed3cm_12` | 12 | **36.0%** | 64.0% | 243.3 |
+
+⇒ 同一配置的 3 cm 成功率在 **36%~72%** 之间摆动（单级约 1,100 个回合、
+250,000 步、8 环境）。所以：
+
+1. **单次训练的 3 cm/6 cm 成功率差异（例如「80% → 44%」）不做结论。**
+   要比较两个改动，必须在同一 seed 集合上跑多次，或至少只比较同一次运行内的
+   前后级趋势。
+2. 判据应以**视觉复核**为主（`play.py --mode gif` 出 GIF 后逐帧看姿态）：
+   本轮 GIF 显示 3 cm 真的爬上去了（站在第 3~4 级踏面上、四腿交替）、
+   6 cm 跨上第一级后躯干贴踏面翻倒、9/12/15 cm 基本停在第一级立面前。
+   这与上一轮（`body_collision=-4.0`）的「撞两下就放弃」不同：**它现在会试，
+   但仍然翻不过 9 cm 以上的立面**。
+3. 想降低这个方差，只能加长每级预算或加宽环境多样性；`config.yaml` 里
+   `run.seed` 是唯一的随机源，`curriculum.timesteps` 的现实下限约 250,000。
+
+**逐帧看图的方法（本轮用的就是它）**：
+
+```powershell
+.venv\Scripts\python.exe scripts\play.py --run course1 --mode gif        # 出一档 GIF
+.venv\Scripts\python.exe .tmp\gif_batch.py course1                       # 3/6/9/12/15 cm 各一档
+.venv\Scripts\python.exe .tmp\gif_frames.py output\gifs\course1_9cm.gif --outdir .tmp\frames\9cm --n 6
+```
+
+`gif_batch.py` 把 `play.stage_height_cm` 在内存里改掉再写临时 yaml 调用 `play.py`，
+产物落在 `output/gifs/course1_<高度>cm.gif`；`gif_frames.py` 按位置均匀抽 N 帧存 PNG。
+**HUD 上的数字与画面不完全自洽（渲染节奏/回合切换导致），判据以画面姿态为准。**
+
 ---
 
 ## 4. 训练时的核对清单
@@ -290,8 +352,8 @@ IK（触地时记抬脚点 → 求目标踏面 → 摆动相插值到落点 → 
 > 改代码之前先读仓根的 [`agent.md`](agent.md)：那里有完整的验证门（5 支 `.tmp/` 校验脚本 +
 > 2 个冒烟）与「改完之后必须跑什么」。
 
-1. **观测维数**与 `summary.json` 的 `obs_config` 对得上（本仓 `history_len=1` ⇒ **46**；
-   改回 10 帧是 460，开 `gait_phase` 再加 20）。
+1. **观测维数**与 `summary.json` 的 `obs_config` 对得上（本仓 `history_len=1` ⇒ **48**；
+   改回 10 帧是 480，开 `gait_phase` 再加 20，多一条指令就是本轮加的那 2 维）。
 2. **`*_vecnormalize.pkl` 与 `*.zip` 成对**。缺了它确定性评估会从 100% 掉到 0%。
 3. **`mean|a|` 是否在增长**。停在 0.02~0.10 就是退化成纯先验，继续跑也不会好。
 4. **`train/explained_variance`**。接近 0 或负数说明 critic 没学到东西，先查奖励尺度。

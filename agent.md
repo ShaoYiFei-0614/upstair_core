@@ -58,14 +58,16 @@ robotdog/<你要改的模块>.py        代码本身（约 200~700 行，可通�
 | 台阶几何 | `robotdog/tools/terrain.py` |
 | 步态先验 | `robotdog/gait.py` + `artifacts/trot_stairs.json` |
 | 终止/成功判据 | `robotdog/env.py` 的 `_terminated()` / `_success_reached()` |
+| 指令（横向/偏航）与外部控制器接口 | `robotdog/env.py` 的 `set_commands()` / `set_command_now()` + `scripts/teleop.py` |
+| 指令跟踪的量化与演示 GIF | `scripts/cmd_demo.py`（分段恒定指令表 + 斜率/相关系数） |
 | MJCF 组装、kp/kd、执行器 | `robotdog/go2_model.py` |
 | 训练循环、产物、权重加载 | `robotdog/training.py` + `scripts/train.py` |
 | 评估与 GIF | `scripts/play.py` |
 | 读配置 | `robotdog/config.py` |
 
-**代码规模**（`README.md` §6.1 有完整表）：最大的 4 个是 `robotdog/env.py` 696、
-`robotdog/go2_model.py` 460、`robotdog/training.py` 323、`robotdog/policy.py` 323。
-最大的文件也可以直接通读。
+**代码规模**（`README.md` §6.1 有完整表）：最大的几个是 `robotdog/env.py` 895、
+`robotdog/go2_model.py` 460、`scripts/play.py` 462、`robotdog/policy.py` 341、
+`robotdog/training.py` 323。最大的文件也可以直接通读。
 
 ---
 
@@ -233,13 +235,15 @@ RESULT: ALL CHECKS PASSED
 
 ### 8.1 观测
 
-* 当前 `config.yaml`：`history_len: 1` ⇒ **46 维**（每帧 46，`base_frame_size=42` + `base_lin_vel_body` 3 + `step_height` 1）。
-* 观测是**盲走**的：46 维全部有真机出处（关节编码器 / IMU / 上一步动作 /
-  本体感觉估计）+ 一个标量任务参数 `step_height`；没有触觉、没有射线、没有接触力读数。
+* 当前 `config.yaml`：`history_len: 1` ⇒ **48 维**（每帧 `base_frame_size=42` + `base_lin_vel_body` 3 + `step_height` 1 + **指令块 2**）。
+* 观测是**盲走**的：48 维全部有真机出处（关节编码器 / IMU / 上一步动作 /
+  本体感觉估计 / 上层指令）+ 一个标量任务参数 `step_height`；没有触觉、没有射线、没有接触力读数。
   逐项出处与「哪些量是真值但只进奖励」见 §8.6。
 * **`obs.base_height` 被硬性禁止**（`ObsConfig.__post_init__` 抛 `ValueError`）：
   它含地形真值。见 §8.6。
-* **单帧（46 维）不亏**：课程内每级都不差，3 cm 62% → 92%、6 cm 0% → 22%；课程外
+* **`obs.command` 恒真**：那 2 维是 `[vy, wz]` 指令（`vx` 定值、不进观测）。PPO 的网络与
+  RolloutBuffer 维数不可变，所以**课程只能改指令范围不能开关这 2 维**。
+* **单帧（48 维）不亏**：课程内每级都不差，3 cm 62% → 92%、6 cm 0% → 22%；课程外
   3 cm / 5 cm 都是 100%（10 帧基准是 50% / 0%）。50 Hz 下相邻帧几乎相同，10 帧绝大部分冗余。
   代价是失去帧内的隐式速度信息。
 
@@ -285,19 +289,32 @@ RESULT: ALL CHECKS PASSED
   hip/thigh 用 `(30, 0.6)`、calf 用 `(45, 0.9)`；对应阻尼比 0.30 / 0.31 / 0.53。
   推导表在 `README.md` §3.1。
 * **归档 checkpoint 与新代码不兼容**：`runs/course22_ref/*` 是 660 维、
-  `runs/course22_improved/*` 是 740 维、`runs/normab_*` 是 420 维，而当前是 46 维；
+  `runs/course22_improved/*` 是 740 维、`runs/normab_*` 是 420 维，而当前是 48 维；
   且它们**都没有 `_env.json`**。**加载它们会 shape mismatch，这是预期行为，不是回归。**
   端到端评估只能用本轮自己训出来的 run（如 `runs/ab_base`、`runs/ab_hist1`）。
 * `robotdog/training.py` 的 `load_policy()` **会把 `*_vecnormalize.pkl` 装回模型自带的
   `VecNormalize`**。曾经没装，导致 `model.get_env()` 评估等于喂未归一化观测，
   与 `play.py` 结论相反。**新增任何评估路径都要走 `load_policy()`，不要自己搭。**
+* **躯干接触不再终止回合**（`_contact_fatal()` 恒 `False`；`terminate_contact_steps` 字段已删）。
+  实测那条「连续 10 步」规则最长只到 8 步、从未生效，却随时会误杀「上台架时蹭立面」。
+  `terminate_min_height` 现在是 `0.15`（躯干碰撞体最低点在 0.118 m）。
+* **`body_collision` 从 `-4.0` 降到 `-1.2`**：原值让「贴着立面蹭」比站桩还亏，GIF 复盘里
+  6/12/15 cm 的策略学会试两下就放弃。
+* **奖励里的指令跟踪项必须门控**（`if cmd.vy_max:` / `if cmd.yaw_max:`）。不加门控时
+  机器人直走就能白拿约 +1.0/步（实测 5 cm 上 125 步拿到 `lateral_vel=+139.73`），
+  **等于又造一个「原地拖延」正项**。`env.yaw_rate` 也不是 `qvel[5]`，见 `experience.md` §13。
+* **`probe_lift` 的起算线只跟策略当前能力比，不跟台阶高走。** 实测在 15 cm 立面之前
+  被阻挡时，默认步态摆动峰值只到 0.09~0.12 m，而 `action_scale=0.30` 下搜遍固定动作
+  最好也只到 0.148 m —— 原来的「`1.6 × 台阶高` = 0.24 m」门槛**不可达、梯度恒为零**。
+  现在是势函数塑形（只在被阻挡时按「峰值又提高了多少」结算，起算线 0.06 m），
+  实测梯度 9 cm 上 0.39~1.19/回合、15 cm 上 0.14~0.91/回合。见 `experience.md` §15。
 
 ### 8.6 策略能看到什么、看不到什么（信息来源清单）
 
 本仓是**盲走**的。任何人碰 `_obs_frame()` / `reward.py` / `_fall_reference_height()`
 之前，先看这张表 —— 「这个量是真机拿得到的吗」是本仓最容易悄悄搞错的一件事。
 
-**`_obs_frame()` 里的 46 维，逐项都有真机出处：**
+**`_obs_frame()` 里的 48 维，逐项都有真机出处：**
 
 | 观测块 | 维 | 真机出处 |
 |---|---|---|
@@ -307,21 +324,23 @@ RESULT: ALL CHECKS PASSED
 | `base_ang_vel_body` | 3 | IMU 陀螺 |
 | `_last_action` | 12 | 上一步自己下发的指令 |
 | `base_lin_vel_body` | 3 | 本体感觉估计（腿式里程计） |
+| `[vy, wz]` 指令 | 2 | **上层控制器下发的指令**（遥控） |
 | `step_height` | 1 | **任务参数，不是传感器读数** |
 
 `step_height` 是唯一一个非传感器项，但它是**标量任务参数**：真机上可以随任务下发
-（「现在爬 8 cm 的楼梯」），所以可接受。它**不含**「下一级立面在哪」。
+（「现在爬 8 cm 的楼梯」），所以可接受。它**不含**「下一级立面在哪」。指令那 2 维同理：
+它是别人给机器人的目标，不是机器人偷看的环境真值。
 
 **五个使用真值、但只进奖励/终止、绝不进观测的量**（这是允许的：奖励与终止本来就
 是上帝视角；**一旦写进 `_obs_frame` 就破坏盲走**）：
 
 | 量 | 真值来源 | 只被谁用 |
 |---|---|---|
-| `_contact_flags()` | MuJoCo 接触对（躯干/腿 × 地形） | `body_collision` / `leg_collision` 奖励、`_terminated` |
+| `_contact_flags()` | MuJoCo 接触对（躯干/腿 × 地形） | `body_collision` / `leg_collision` 奖励（**都不再终止回合**） |
 | `_foot_contact_mask()` | MuJoCo 接触对（足端 × 地形） | `air_time` 奖励、腾空时间统计 |
 | `_support_height()` | `stair.height_at()` 地形几何 | `_fall_reference_height()` → `_terminated` |
 | `_support_height_mean()` | 同上 | 同上（可选分支） |
-| `foot_clearance` | 足端位置 − 地形高 | `foot_lift` 奖励 |
+| `foot_clearance` | 足端位置 − 地形高 | `foot_lift` 奖励、`probe_lift` 奖励的摆动峰值 |
 
 接触类两项在真机上有标准的等价估计（关节力矩残差 / 电流尖峰 / IMU 冲击），
 属于可接受的 sim-to-real 折衷；**地形几何类三项（`foot_clearance`、两个

@@ -1,4 +1,4 @@
-# `robotdog/curriculum.py` —— 固定六级课程与报表
+# `robotdog/curriculum.py` —— 课程定义与报表
 
 ## 1. 一句话定位
 
@@ -13,8 +13,10 @@
 
 **做**：
 
-* 固定台阶高度梯度 `STAGE_HEIGHTS_CM = (0.0, 3.0, 6.0, 9.0, 12.0, 15.0)`。
-* 用 `StageSpec` 描述一级：名字、台阶高、`StairSpec` 地形、预算步数、学习率、中文标签。
+* 固定台阶高度梯度的**兜底默认** `STAGE_HEIGHTS_CM = (0.0, 0.0, 0.0, 3.0, 6.0, 9.0)`
+  （三级平地预热 + 3/6/9 cm；`config.yaml` 的 `curriculum.heights_cm` 优先）。
+* 用 `StageSpec` 描述一级：名字、台阶高、`StairSpec` 地形、预算步数、学习率、中文标签、
+  指令范围（`command_vy_max` / `command_yaw_max` / `command_vx`）、平地成功距离、奖励覆盖。
 * 用 `EpisodeStats` 在滑动窗口里统计成功率 / 摔倒率 / 均回报 / 均步数。
 * 用 `StageResult` 记录一级训练完的实测结果（含墙钟用时、模型路径、观测维度）。
 * 用 `format_curriculum` / `write_summary` / `format_seconds` 出报表。
@@ -84,7 +86,7 @@ warm-start 的方向就反了，而这种错误从训练曲线上看不出来（
 ## 4. 公开 API
 
 ```python
-STAGE_HEIGHTS_CM: tuple[float, ...] = (0.0, 3.0, 6.0, 9.0, 12.0, 15.0)
+STAGE_HEIGHTS_CM: tuple[float, ...] = (0.0, 0.0, 0.0, 3.0, 6.0, 9.0)   # 兜底默认
 DEFAULT_TREAD: float = 0.50
 DEFAULT_N_UP: int = 8
 
@@ -98,6 +100,11 @@ class StageSpec:
     learning_rate: float
     label: str = ""
     description: str = ""
+    command_vy_max: float = 0.0      # 该阶段横向指令上界 [m/s]
+    command_yaw_max: float = 0.0     # 该阶段偏航指令上界 [rad/s]
+    command_vx: float = 0.0          # 该阶段定值前进指令 [m/s]，0 = 用 env 基线
+    flat_success_distance: float = 0.0   # 平地段成功距离 [m]，0 = 用 env 基线
+    reward_overrides: dict[str, float] = field(default_factory=dict)   # 奖励课程
 
     @property
     def is_flat(self) -> bool: ...        # spec.n_up == 0 and spec.n_down == 0
@@ -193,7 +200,9 @@ def format_seconds(seconds: float) -> str: ...   # 12.3s / 4.5min / 1.20h
 阶段定义 → 训练 → 报表的完整链路（跨模块）：
 
 ```
-config.yaml (curriculum: heights_cm / tread / n_up / timesteps / learning_rate)
+config.yaml (curriculum: heights_cm / tread / n_up / timesteps / learning_rate
+                        / command_vy_max / command_yaw_max / command_vx
+                        / flat_success_distance / reward_overrides)
   → robotdog/config.py  config_to_stages()
       → flat_spec(tread=...)                    # 第 1 级
       → demo_stairs_spec(step_height=h/100, tread=..., n_up=...)   # 其余 5 级
@@ -226,7 +235,7 @@ write_summary(path, stages, results, meta)
 
 | 项 | 真实值 |
 | --- | --- |
-| `STAGE_HEIGHTS_CM` | `(0.0, 3.0, 6.0, 9.0, 12.0, 15.0)` —— 固定六档，平地 + 3/6/9/12/15 cm |
+| `STAGE_HEIGHTS_CM` | `(0.0, 0.0, 0.0, 3.0, 6.0, 9.0)` —— 兜底默认，三级平地预热 + 3/6/9 cm |
 | `DEFAULT_TREAD` | `0.50` m |
 | `DEFAULT_N_UP` | `8` |
 | `EpisodeStats.window` 默认 | `50` |
@@ -288,10 +297,13 @@ from robotdog.tools.terrain import demo_stairs_spec, flat_spec
 
 stages = [
     StageSpec(name="flat", step_height=0.0, spec=flat_spec(n_up=0, n_down=0),
-              timesteps=100_000, learning_rate=1.5e-4, label="平地"),
+              timesteps=100_000, learning_rate=1.5e-4, label="平地",
+              command_vx=0.45, flat_success_distance=2.0),
     StageSpec(name="stair3", step_height=0.03,
               spec=demo_stairs_spec(step_height=0.03, tread=0.50, n_up=8),
-              timesteps=250_000, learning_rate=1.5e-4, label="3cm"),
+              timesteps=250_000, learning_rate=1.0e-4, label="3cm",
+              command_vy_max=0.30, command_yaw_max=0.35,
+              reward_overrides={"foot_lift": 1.0, "probe_lift": 0.6}),
 ]
 
 print(format_curriculum(stages))          # 只有定义部分

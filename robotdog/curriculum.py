@@ -26,8 +26,10 @@ from robotdog.tools.terrain import StairSpec
 # 固定课程梯度
 # --------------------------------------------------------------------------- #
 
-#: 固定的台阶高度梯度 (cm): 先平地, 再 3 cm 逐级到 15 cm。
-STAGE_HEIGHTS_CM: tuple[float, ...] = (0.0, 3.0, 6.0, 9.0, 12.0, 15.0)
+#: 固定的台阶高度梯度 (cm): 三级平地预热（直走 → 小指令 → 全量程指令），
+#: 再 3 / 6 / 9 cm。`config.yaml` 的 `curriculum.heights_cm` 优先；这里只是兜底默认。
+#: 同一高度重复出现是合法的，`config_to_stages()` 会用 `_unique_name()` 去重命名。
+STAGE_HEIGHTS_CM: tuple[float, ...] = (0.0, 0.0, 0.0, 3.0, 6.0, 9.0)
 
 #: 所有台阶阶段共用的地形尺寸。
 DEFAULT_TREAD: float = 0.50
@@ -49,6 +51,16 @@ class StageSpec:
     learning_rate: float        # 该阶段 PPO 的学习率
     label: str = ""             # 中文标签, 用于日志与报表
     description: str = ""       # 一句话说明这一级在练什么
+    command_vy_max: float = 0.0     # 该阶段横向指令上界 [m/s]
+    command_yaw_max: float = 0.0    # 该阶段偏航指令上界 [rad/s]
+    command_vx: float = 0.0         # 该阶段定值前进指令 [m/s]; 0 = 用 env 基线
+    flat_success_distance: float = 0.0   # 平地段成功距离 [m]; 0 = 用 env 基线
+    # 平地段是否要求真的前进一段才算成功。原地指令课程必须关掉（改成「撑满回合」），
+    # 否则 `command_vx = 0` 时`is_success` 永远不触发，日志成功率恒为 0。
+    flat_success_needs_progress: bool = True
+    reward_overrides: dict[str, float] = field(default_factory=dict)
+    # 该阶段的奖励覆盖, 来自 ``config.yaml`` 的
+    # ``curriculum.reward_overrides``; 空 = 用 ``reward:`` 段的基线值。
 
     @property
     def is_flat(self) -> bool:
@@ -58,11 +70,23 @@ class StageSpec:
     def summary(self) -> str:
         """一行文本, 便于日志。表格请用 :func:`format_curriculum`。"""
         s = self.spec
+        cmd = ""
+        if self.command_vy_max or self.command_yaw_max:
+            cmd = (f" 指令 vy±{self.command_vy_max:g} wz±{self.command_yaw_max:g}")
+        if self.command_vx:
+            cmd += f" vx={self.command_vx:g}"
+        if self.flat_success_distance:
+            cmd += f" 成功距离={self.flat_success_distance:g}m"
+        rew = ""
+        if self.reward_overrides:
+            items = " ".join(f"{k}={v:g}" for k, v in sorted(
+                self.reward_overrides.items()))
+            rew = f" 奖励覆盖 {items}"
         return (
             f"{self.name:<8} {self.label:<10} 台阶={self.step_height * 100:5.1f}cm "
             f"踏面={s.tread * 100:4.0f}cm 级数={s.n_up:<2d} "
             f"顶端={s.crest_height:5.2f}m 预算={self.timesteps:>9,} "
-            f"lr={self.learning_rate:g}"
+            f"lr={self.learning_rate:g}{cmd}{rew}"
         )
 # --------------------------------------------------------------------------- #
 # 回合统计

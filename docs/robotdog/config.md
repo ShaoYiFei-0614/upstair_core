@@ -35,7 +35,7 @@
 `_apply()` 先取 `target.__dataclass_fields__`，把不认识的键收集起来一次性抛出：
 
 ```
-config.yaml 的 env: 无法识别的键 ['command_vx_']; 可用键 = ['action_scale', 'decimation', ...]
+config.yaml 的 env: 无法识别的键 ['command_vx_']; 可用键 = ['action_scale', 'command', 'decimation', ...]
 ```
 
 **理由**：配置文件是手写的，`forward_vel_sigma` 写成 `forward_vel_sigme`、`n_envs`
@@ -87,6 +87,24 @@ ValueError: Error: size 2 must be positive in geom
 这与 `robotdog/policy.py:stair_from_height` 的处理必须一致，否则「平地」在训练侧与
 播放侧会是两种地形。
 
+### 3.6 指令范围也走课程，而且与观测维数解耦
+
+`curriculum.command_vy_max` / `command_yaw_max` 是两条**与 `heights_cm` 等长**的数组，
+写进 `StageSpec.command_vy_max` / `command_yaw_max`，由 `scripts/train.py` 在每级建完
+环境后调 `venv.env_method("set_commands", vy, yaw)` 下发。
+
+**为什么范围可以逐级变、但观测那 2 维必须恒在**：PPO 的 `ActorCritic` 网络与
+`RolloutBuffer` 的维度在 `learn()` 开始后就固定了，中途改维数会直接崩。所以
+`ObsConfig.command` 是**恒真**的开关，课程只改**采样范围**（`vy_max` / `yaw_max`），
+不改维数。**被否决的方案**：让每一级自带一份 `EnvConfig`（维数会随级变化，网络得重建，
+warm-start 也就断了）。
+
+`env.command` 段本身是**嵌套 dataclass**（`CommandConfig`）：`vx` 是定值，
+`vy_max` / `yaw_max` 是采样范围，当前值 `[vx, vy, wz]` 存在 `_now` 里并与
+`env._command` 是**同一个 list 对象**。`config_to_env` 会先 `env.pop("command")` 再
+`_apply(cfg.command, ...)`，最后补一次 `cfg.command.__post_init__()` 把 `vx` 同步进
+当前值 —— 少了这一步，`_sample_command()` 会抽到过期的 `vx`。
+
 ## 4. 公开 API
 
 ```python
@@ -131,7 +149,7 @@ raw: dict
    │     ├── env.*      → EnvConfig 字段（_apply）
    │     ├── env.obs.*  → ObsConfig 字段（_apply）
    │     └── gait_file  → load_gait（仅 gait_prior=true 时）
-   ├── reward:      cfg.reward ← _apply（在 config_to_env 内，robotdog/config.py:163；字段定义在 robotdog/reward.py）
+   ├── reward:      cfg.reward ← _apply（在 config_to_env 内，robotdog/config.py:165；字段定义在 robotdog/reward.py）
    ├── ppo:         config_to_ppo    → dict（原样透传）
    └── play:        config_to_play   → dict（补渲染默认值）
 ```
@@ -144,14 +162,14 @@ raw: dict
 | `DEFAULT_STAGE_TIMESTEPS` | `[100_000] + [250_000] × 5` | `curriculum.timesteps` 省略时用 |
 | `DEFAULT_LR` | `1.5e-4` | `curriculum.learning_rate` 省略时用 |
 | `env.n_envs` | `8` | |
-| `run.name` / `seed` / `save_every` / `log_every` | `course1` / `0` / `50000` / `20` | |
+| `run.name` / `seed` / `save_every` / `log_every` | `course3` / `0` / `50000` / `20` | |
 | `play.episodes_gif` / `episodes_eval` | `10` / `100` | |
 | `play.camera` / `width` / `height` / `fps` / `scale` | `track` / `960` / `540` / `25` / `2` | |
 | `play.seed` | `0` | |
 | `ppo.device` | `cpu` | |
 
 默认课程（不写 `curriculum` 段时）来自 `robotdog/curriculum.py` 的
-`STAGE_HEIGHTS_CM`（`(0.0, 3.0, 6.0, 9.0, 12.0, 15.0)`）与
+`STAGE_HEIGHTS_CM`（`(0.0, 0.0, 0.0, 3.0, 6.0, 9.0)`）与
 `DEFAULT_TREAD`/`DEFAULT_N_UP`（`0.50` m / `8` 级），总预算 1,350,000 步。
 
 ## 7. 与其它模块的关系
@@ -160,7 +178,7 @@ raw: dict
   常量）、`robotdog.gait`（`load_gait`）、`robotdog.tools.terrain`（造地形）、
   `robotdog.tools.paths`（定位仓根与先验文件）、第三方 `yaml`。
   奖励字段（`reward:` 段）定义在 `robotdog/reward.py`，但本模块**不直接 import 它**：
-  靠 `robotdog/env.py:37` 的重导出，`_apply(cfg.reward, ...)`（`robotdog/config.py:163`）
+  靠 `robotdog/env.py:37` 的重导出，`_apply(cfg.reward, ...)`（`robotdog/config.py:165`）
   就能工作 —— 依赖方向仍是 `config.py → env.py → reward.py`，没有新增边。
 * **被依赖** `scripts/train.py`（`config_to_run` / `config_to_env` / `config_to_stages` /
   `config_to_ppo` / `n_envs`）与 `scripts/play.py`（`config_to_play`）。
@@ -172,7 +190,7 @@ raw: dict
 
 ## 8. 实测与经验教训
 
-* 首次跑通：`load_config()` → `frame 46 / obs 46`（`history_len=1`）、`gait_prior=True`、
+* 首次跑通：`load_config()` → `frame 48 / obs 48`（`history_len=1`，含指令那 2 维）、`gait_prior=True`、
   六级打印正确、总预算 1,350,000 步。见 `experience.md` §7 的开头。
 * `policy_arch()` 的必要性（不读配置的结构就会 `size mismatch`）见
   `experience.md` §7.1。
@@ -202,7 +220,7 @@ raw = load_config()                       # 默认 <仓根>/config.yaml
 cfg = config_to_env(raw)
 stages = config_to_stages(raw)
 
-print(cfg.obs.size)                       # 46（history_len=1）
+print(cfg.obs.size)                       # 48（history_len=1，含指令那 2 维）
 print([(s.name, s.timesteps) for s in stages])
 print(sum(s.timesteps for s in stages))   # 1350000
 ```

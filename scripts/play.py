@@ -96,6 +96,11 @@ def _resolve_model(run: str) -> Path:
     zips = sorted(root.glob("*.zip"))
     if zips:
         return zips[0]
+    # 没跑完 / 中途停掉的 run 只有阶段 checkpoint（``checkpoints/<阶段>_final.zip``）。
+    # 取最后一个阶段的，好让「先训一级看一眼」这种用法也能直接 play。
+    stage_zips = sorted((root / "checkpoints").glob("*_final.zip"))
+    if stage_zips:
+        return stage_zips[-1]
     raise SystemExit(f"{root} 下没有任何 .zip 权重")
 
 

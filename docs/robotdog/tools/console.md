@@ -62,7 +62,7 @@ if reconfigure is None:
 ### 3.5 调用点是脚本，不是 `robotdog/__init__.py`
 
 `robotdog/__init__.py:15` 只**导入**它、**从不调用**它。真实调用点是
-`scripts/train.py:235` 与 `scripts/play.py:429`，两处都在 `main()` 的第一行。
+`scripts/train.py:255` 与 `scripts/play.py:429`，两处都在 `main()` 的第一行。
 
 理由：编码必须在**任何输出发生之前**生效，而脚本的 `main()` 第一行正是这个确定位置；
 放成包导入的副作用会让「导入一个纯数据模块」改进程 I/O，范围超出合理预期（见

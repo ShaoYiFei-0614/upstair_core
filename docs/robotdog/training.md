@@ -82,12 +82,19 @@ DummyVecEnv → VecMonitor → VecNormalize
 
 * `set_terrain(venv, stair)`（`env_method("set_stair")` + `reset()` 两行）已随死代码
   清理删除（见 §9）。
-* `Go2StairsEnv.set_stair()` 本身还在（`robotdog/env.py:212`），但**零调用点**——
+* `Go2StairsEnv.set_stair()` 本身还在（`robotdog/env.py:291`），但**零调用点**——
   保留的理由见 `experience.md` §9.1。
-* 所以 **`grep env_method` 在本仓没有命中**。如果你要写「阶段内插在 rollout 中间换地形」，
-  得自己调 `venv.env_method("set_stair", stair)` + `venv.reset()`，并接受每个子环境
-  重编译 MJCF（约 250 ms × `n_envs`）的代价——这也正是当前设计选择整环境重建的原因：
-  一阶段只付一次。
+* 所以 **`grep env_method` 在本仓只有一处命中**：`scripts/train.py` 的
+  `Trainer.make_env()` 在建完这一级的环境后下发指令范围
+  `venv.env_method("set_commands", stage.command_vy_max, stage.command_yaw_max)`
+  （仅当该级的 `command_vy_max` / `command_yaw_max` 非零时调用）。如果你要写
+  「阶段内插在 rollout 中间换地形」，得自己调 `venv.env_method("set_stair", stair)` +
+  `venv.reset()`，并接受每个子环境重编译 MJCF（约 250 ms × `n_envs`）的代价 ——
+  这也正是当前设计选择整环境重建的原因：一阶段只付一次。
+
+> **指令范围与地形是两件独立的事**：地形换级必须重建环境，而上层指令**不需要** ——
+> `set_command_now()` 在每个控制步都能改当前值，`set_commands()` 改的是采样范围。
+> 这两条路径都不碰物理模型，所以外部控制器可以随时接管。
 
 ### 3.6 `save_model` 与 `save_vecnormalize` 的命名不一致（历史遗留）
 
@@ -185,8 +192,11 @@ def format_duration(seconds: float) -> str: ...      # 12.3s / 4.5min / 1.20h
 * `load_policy` 在 `set_parameters` 之后**还会调一次 `restore_vecnormalize(venv, cand)`**，
   把统计量装回模型自带的 `VecEnv`；`cand` 不存在时跳过。返回值里的 `ObsNorm`
   与模型自带包装器因此始终是同一份统计量。**注意 `cfg` 要传对**：
-  `make_env_fn(stair, None)` 会用默认 `EnvConfig`（`history_len=10` → 460 维），
-  载入 `history_len=1`（46 维）的权重时观测维度就对不上了。
+  `make_env_fn(stair, None)` 会用默认 `EnvConfig`（`history_len=10` → 480 维），
+  载入本仓 `history_len=1`（48 维）的权重时观测维度就对不上了。
+  另外 `_env.json` 里的 `command` 经 JSON 往返会变成 `dict`，`policy.py` 的
+  `_rebuild(CommandConfig, ...)` 必须先把它还原成 dataclass，否则 `set_command_now`
+  会抛 `AttributeError: 'dict' object has no attribute '_now'`。
 * `restore_vecnormalize` 只拷 5 个字段：`obs_rms`、`ret_rms`、`clip_obs`、
   `clip_reward`、`epsilon`。**不动** `training` / `norm_reward` —— 续训时
   `training=True` 由 `make_vec_env` 保证。

@@ -31,7 +31,7 @@ __all__ = ["console", "paths", "terrain"]
 
 （本文件共 18 行；导入行在 `robotdog/tools/__init__.py:16`，`__all__` 在 `:18`。）
 
-理由：包级命名空间保持成一张**稳定的名称表**，而不是第二套 API 面。全仓消费者都写精确导入 —— `robotdog/env.py:48` 写 `from robotdog.tools.terrain import StairSpec, build_terrain_xml`、`robotdog/training.py:38` 写 `from robotdog.tools.paths import RUNS_DIR`。精确导入让「这个符号来自哪个文件」在阅读时不需要跳转。
+理由：包级命名空间保持成一张**稳定的名称表**，而不是第二套 API 面。全仓消费者都写精确导入 —— `robotdog/env.py:46` 写 `from robotdog.tools.terrain import StairSpec, build_terrain_xml`、`robotdog/training.py:38` 写 `from robotdog.tools.paths import RUNS_DIR`。精确导入让「这个符号来自哪个文件」在阅读时不需要跳转。
 
 **被否决的方案**：
 
@@ -49,7 +49,7 @@ __all__ = ["console", "paths", "terrain"]
 
 ### 3.3 不在这里调用 `setup_utf8_console()`
 
-理由：编码修复必须在**任何输出发生之前**生效，而 `robotdog/tools/__init__.py` 会在 `robotdog/__init__.py:14` 的导入语句期间就被执行（导入 `robotdog.tools.console` 会先触发父包 `robotdog.tools` 的 `__init__`）。**真实调用点是脚本**（`scripts/train.py:235` / `scripts/play.py:429` 的 `main()` 第一行），因为本文件与 `robotdog/__init__.py` 都只导入、不调用 —— 「导入即修好编码」这件事从头到尾没有发生过。
+理由：编码修复必须在**任何输出发生之前**生效，而 `robotdog/tools/__init__.py` 会在 `robotdog/__init__.py:14` 的导入语句期间就被执行（导入 `robotdog.tools.console` 会先触发父包 `robotdog.tools` 的 `__init__`）。**真实调用点是脚本**（`scripts/train.py:255` / `scripts/play.py:429` 的 `main()` 第一行），因为本文件与 `robotdog/__init__.py` 都只导入、不调用 —— 「导入即修好编码」这件事从头到尾没有发生过。
 
 **被否决的方案**：在 `robotdog/tools/__init__.py` 里调用 —— 否决有两条：(1) 它让「导入一个路径常量」这种纯数据操作产生进程级副作用；(2) 顺序会变成「谁先 import 谁决定」，而 `robotdog.tools.console` 也可以被单独导入，那条路径下 `robotdog/__init__` 已经在更早的位置跑过了，重复调用虽然安全（见 `console.md` §3），但语义上变成了巧合而不是设计。
 
@@ -101,7 +101,7 @@ import robotdog
 ```
 
 **没有调用 `setup_utf8_console()` 的那一步** —— 包入口只导入它。编码修复由脚本在
-`main()` 第一行显式调用（`scripts/train.py:235` / `scripts/play.py:429`）。
+`main()` 第一行显式调用（`scripts/train.py:255` / `scripts/play.py:429`）。
 
 从任一子模块进入时，父包 `robotdog.tools` 必然先执行，所以上表对 `from robotdog.tools.paths import RUNS_DIR` 同样成立：
 
@@ -134,7 +134,7 @@ from robotdog.tools.paths import RUNS_DIR
 | `robotdog/__init__.py:15` | `from robotdog.tools.console import setup_utf8_console` |
 | `robotdog/config.py:34` | `from robotdog.tools import paths` |
 | `robotdog/config.py:35` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec` |
-| `robotdog/env.py:48` | `from robotdog.tools.terrain import StairSpec, build_terrain_xml` |
+| `robotdog/env.py:46` | `from robotdog.tools.terrain import StairSpec, build_terrain_xml` |
 | `robotdog/curriculum.py:23` | `from robotdog.tools.terrain import StairSpec, demo_stairs_spec, flat_spec` |
 | `robotdog/go2_model.py:41` | `from robotdog.tools.paths import GO2_ASSETS_DIR, GO2_XML` |
 | `robotdog/go2_model.py:42` | `from robotdog.tools.terrain import TERRAIN_GEOM_GROUP` |
@@ -164,7 +164,7 @@ from robotdog.tools.paths import RUNS_DIR
 * **`import robotdog.tools` 只加载标准库**（`sys` / `pathlib` / `dataclasses`），既不加载 `numpy`、也不加载 `mujoco`。这是删掉 `touch.py`（唯一 import mujoco 的工具模块）与 `terrain.py` 里两个射线函数（唯一 import numpy 的地方）之后的直接收益。
 * **`__all__` 只影响 `from robotdog.tools import *`**。`robotdog.tools.console` 等属性无论如何都可访问。
 * **模块名就是文件路径**。规范路径 `robotdog.tools.terrain` 对应 `robotdog/tools/terrain.py`；报错信息里的模块路径不会指向别的文件，因为顶层没有兼容层。
-* **本文件不调用 `setup_utf8_console()`**。`robotdog/__init__.py:15` 也只导入它、不调用。任何 `import robotdog.*` 都**不会**修好编码 —— 这件事只由脚本在 `main()` 第一行显式调用完成（`scripts/train.py:235` / `scripts/play.py:429`）。文档曾长期声称「导入即生效」，那是假的。
+* **本文件不调用 `setup_utf8_console()`**。`robotdog/__init__.py:15` 也只导入它、不调用。任何 `import robotdog.*` 都**不会**修好编码 —— 这件事只由脚本在 `main()` 第一行显式调用完成（`scripts/train.py:255` / `scripts/play.py:429`）。文档曾长期声称「导入即生效」，那是假的。
 
 ## 10. 示例用法
 

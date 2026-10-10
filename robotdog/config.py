@@ -31,6 +31,7 @@ from robotdog.curriculum import (
 )
 from robotdog.env import EnvConfig
 from robotdog.gait import GaitParams, load_gait
+from robotdog.reward import RewardConfig
 from robotdog.tools import paths
 from robotdog.tools.terrain import demo_stairs_spec, flat_spec
 
@@ -142,6 +143,26 @@ def _floats(value: Any, n_stages: int, *, where: str, default: float) -> list[fl
     raise SystemExit(f"{where}: 期望数字或列表，实际是 {type(value).__name__}")
 
 
+def _bools(value: Any, n_stages: int, *, where: str, default: bool) -> list[bool]:
+    """把布尔标量/列表归一化成 ``n_stages`` 个布尔（``needs_progress`` 用）。
+
+    与 :func:`_floats` 的差别：**不做线性插值**（布尔插值没有意义），列表长度
+    必须正好是级数或 1。
+    """
+    if value is None:
+        return [default] * n_stages
+    if isinstance(value, bool):
+        return [value] * n_stages
+    if isinstance(value, (list, tuple)) and value:
+        values = [bool(v) for v in value]
+        if len(values) == n_stages:
+            return values
+        if len(values) == 1:
+            return values * n_stages
+        raise SystemExit(f"{where}: 列表长度 {len(values)} 必须等于级数 {n_stages} 或为 1")
+    raise SystemExit(f"{where}: 期望布尔或列表，实际是 {type(value).__name__}")
+
+
 # --------------------------------------------------------------------------- #
 # 环境配置
 # --------------------------------------------------------------------------- #
@@ -155,12 +176,19 @@ def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
     """
     env = _section(raw, "env")
     obs_raw = env.pop("obs", None)       # 嵌套子段，单独处理
+    cmd_raw = env.pop("command", None)   # 嵌套子段，单独处理
     env.pop("n_envs", None)              # 属于运行参数，不属于 EnvConfig
     gait_file = env.pop("gait_file", None)
     cfg = EnvConfig()
 
     _apply(cfg, env, where="env")
     _apply(cfg.reward, _section(raw, "reward"), where="reward")
+
+    if cmd_raw is not None:
+        if not isinstance(cmd_raw, Mapping):
+            raise SystemExit("config.yaml 的 env.command 必须是映射")
+        _apply(cfg.command, dict(cmd_raw), where="env.command")
+        cfg.command.__post_init__()      # 把 vx 同步进当前指令
 
     if obs_raw is not None:
         if not isinstance(obs_raw, Mapping):
@@ -202,6 +230,18 @@ def _apply(target: Any, values: Mapping[str, Any], *, where: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _unique_name(base: str, seen: dict[str, int]) -> str:
+    """把重名的阶段（例如三个平地级）改成 ``flat`` / ``flat_2`` / ``flat_3``。
+
+    checkpoint 与 tensorboard 都按阶段名分目录，重名会让后一级覆盖前一级，
+    所以「同一高度出现多次」必须能生成不同的名字。
+    """
+    seen[base] = seen.get(base, 0) + 1
+    if seen[base] == 1:
+        return base
+    return f"{base}_{seen[base]}"
+
+
 def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
     """把 ``curriculum:`` 段展开成阶段表（默认就是平地 + 3/6/9/12/15 cm）。
 
@@ -228,17 +268,39 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
                          where="curriculum.timesteps")
     lrs = _floats(cur.get("learning_rate"), n,
                   where="curriculum.learning_rate", default=DEFAULT_LR)
+    vy_maxes = _floats(cur.get("command_vy_max"), n,
+                       where="curriculum.command_vy_max", default=0.0)
+    yaw_maxes = _floats(cur.get("command_yaw_max"), n,
+                        where="curriculum.command_yaw_max", default=0.0)
 
     stages: list[StageSpec] = []
-    for h_cm, steps, lr in zip(heights, budgets, lrs):
+    override_table = _reward_override_table(cur, n)
+    flat_distances = _floats(cur.get("flat_success_distance"), n,
+                             where="curriculum.flat_success_distance",
+                             default=0.0)
+    vxs = _floats(cur.get("command_vx"), n,
+                  where="curriculum.command_vx", default=0.0)
+    needs_progress = _bools(cur.get("flat_success_needs_progress"), n,
+                            where="curriculum.flat_success_needs_progress",
+                            default=True)
+    seen: dict[str, int] = {}
+    for h_cm, steps, lr, vy_max, yaw_max, row, flat_d, vx, need_prog in zip(
+        heights, budgets, lrs, vy_maxes, yaw_maxes, override_table,
+        flat_distances, vxs, needs_progress,
+    ):
         steps = int(steps)
         if h_cm <= 0.0:
             spec = flat_spec(n_up=0, n_down=0, step_height=0.0, tread=tread)
-            name, label = "flat", "平地"
+            name, label = _unique_name("flat", seen), "平地"
+            if not need_prog:
+                label = "平地（原地指令，撑满回合）"
+            elif flat_d > 0.0:
+                label = f"平地（成功距离 {flat_d:g} m）"
         else:
             spec = demo_stairs_spec(step_height=h_cm / 100.0, tread=tread, n_up=n_up)
-            name = f"stair{h_cm:g}"
+            name = _unique_name(f"stair{h_cm:g}", seen)
             label = f"{h_cm:g}cm 台阶"
+        overrides = dict(row)
         stages.append(
             StageSpec(
                 name=name,
@@ -248,9 +310,61 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
                 learning_rate=float(lr),
                 label=label,
                 description=f"{label} 上行走并到达顶层平台",
+                command_vy_max=float(vy_max),
+                command_yaw_max=float(yaw_max),
+                command_vx=float(vx),
+                flat_success_distance=float(flat_d),
+                flat_success_needs_progress=bool(need_prog),
+                reward_overrides=overrides,
             )
         )
     return stages
+
+
+def _validate_reward_keys(values: Mapping[str, Any], *, where: str) -> None:
+    """奖励字段名的合法性检查（``RewardConfig`` 是唯一真值来源）。"""
+    valid = set(RewardConfig.__dataclass_fields__)
+    unknown = sorted(k for k in values if k not in valid)
+    if unknown:
+        raise SystemExit(
+            f"config.yaml 的 {where}: 无法识别的奖励字段 {unknown}；"
+            f"可用字段 = {sorted(valid)}"
+        )
+
+
+def _reward_override_table(cur: Mapping[str, Any], n: int
+                           ) -> list[dict[str, float]]:
+    """把 ``curriculum.reward_overrides`` 展开成「每级一个 dict」。
+
+    两种写法都支持：
+
+    * 标量 —— 该字段在**每一级**都用这个值；
+    * 列表 —— 必须与 ``heights_cm`` 等长，逐级取值。
+
+    ``None`` 表示「这一级不动这个字段」。
+    """
+    raw = cur.get("reward_overrides") or {}
+    if not isinstance(raw, Mapping):
+        raise SystemExit("config.yaml 的 curriculum.reward_overrides 必须是映射")
+    _validate_reward_keys(raw, where="curriculum.reward_overrides")
+    table: list[dict[str, float]] = [{} for _ in range(n)]
+    for key, value in raw.items():
+        if isinstance(value, (list, tuple)):
+            if len(value) != n:
+                raise SystemExit(
+                    f"curriculum.reward_overrides.{key} 有 {len(value)} 项，"
+                    f"但 heights_cm 有 {n} 级"
+                )
+            for i, item in enumerate(value):
+                if item is None:
+                    continue
+                table[i][key] = float(item)
+        elif value is None:
+            continue
+        else:
+            for i in range(n):
+                table[i][key] = float(value)
+    return table
 
 
 # --------------------------------------------------------------------------- #

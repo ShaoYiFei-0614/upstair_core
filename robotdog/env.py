@@ -54,7 +54,7 @@ from robotdog.tools.terrain import StairSpec, build_terrain_xml
 class ObsConfig:
     """观测布局。
 
-    ``base_frame_size`` 始终存在（42 个本体感知量）。下面四个布尔块按声明顺序
+    ``base_frame_size`` 始终存在（42 个本体感知量）。下面几个块按声明顺序
     追加；``step_height`` 是盲走策略无法低成本推断的那一项，所以它是一个普通
     数字，而不是要机器人自己去估计的量。``README.md`` §3.2 列出了由此得到的
     维度。
@@ -65,6 +65,7 @@ class ObsConfig:
     base_height: bool = False           # 1：机身相对其正下方地形的高度
     gait_phase: bool = False            # 2：步态时钟的 sin/cos
     step_height: bool = True            # 1：本回合的楼梯高度
+    command: bool = True                # 2：横向速度指令 + 偏航角速度指令
     base_frame_size: int = 42
 
     def __post_init__(self) -> None:
@@ -87,11 +88,64 @@ class ObsConfig:
         extra += 3 if self.base_lin_vel_body else 0
         extra += 2 if self.gait_phase else 0
         extra += 1 if self.step_height else 0
+        extra += 2 if self.command else 0
         return self.base_frame_size + extra
 
     @property
     def size(self) -> int:
         return self.frame_size * self.history_len
+
+
+@dataclass
+class CommandConfig:
+    """横向 / 旋转指令：**范围**在这里，**当前值**在 ``_now`` 里。
+
+    三个指令是 ``vx``（前向 m/s）、``vy``（横向 m/s）、``wz``（偏航角速度
+    rad/s）。这就是「外部控制器」的接口：控制器每个控制步都可以调用
+    :meth:`Go2StairsEnv.set_command_now` 改写 ``vy``/``wz``，训练时则由
+    ``reset()`` 从 ``[-vy_max, +vy_max]`` / ``[-yaw_max, +yaw_max]`` 里随机采样，
+    用随机指令覆盖指令空间。
+
+    存取分离的原因：奖励要读「当前指令」，而它每步都在变；把当前值放在一个
+    长度 3 的数组里、范围放在标量字段里，两者就不会互相覆盖。
+    ``config.yaml`` 的 ``curriculum.command_vy_max`` / ``command_yaw_max`` 按阶段
+    给出范围，见 ``robotdog/config.py`` 的 ``config_to_stages``。
+
+    ``vy_max`` 与 ``yaw_max`` 都是 0 时横向/偏航指令恒为 0，于是整条奖励与观测
+    路径退化成旧的「恒速前向」，逐位一致。
+    """
+
+    vx: float = 0.55        # m/s，前向指令（定值；不随回合变化）
+    vy_max: float = 0.0     # m/s，横向指令的对称上界；0 = 关闭
+    yaw_max: float = 0.0    # rad/s，偏航指令的对称上界；0 = 关闭
+    _now: list = field(default_factory=lambda: [0.55, 0.0, 0.0], repr=False)
+
+    def __post_init__(self) -> None:
+        self._now[0] = float(self.vx)
+
+    @property
+    def has_lateral(self) -> bool:
+        """横向或旋转指令是否启用。"""
+        return bool(self.vy_max or self.yaw_max)
+
+    @property
+    def vy(self) -> float:
+        """当前横向指令（m/s）。"""
+        return float(self._now[1])
+
+    @property
+    def wz(self) -> float:
+        """当前偏航角速度指令（rad/s）。"""
+        return float(self._now[2])
+
+    def _set_now(self, vx: float | None = None, vy: float | None = None,
+                 wz: float | None = None) -> None:
+        if vx is not None:
+            self._now[0] = float(vx)
+        if vy is not None:
+            self._now[1] = float(vy)
+        if wz is not None:
+            self._now[2] = float(wz)
 
 
 @dataclass
@@ -102,7 +156,13 @@ class EnvConfig:
     decimation: int = 10                    # -> 50 Hz 控制
     episode_length_s: float = 20.0
     action_scale: float = 0.30              # rad，策略权限
-    command_vx: float = 0.55                # m/s，前向指令
+
+    # --- 指令（外部控制器接口）-------------------------------------------- #
+    # 三个量：前向 vx（定值）、横向 vy、偏航角速度 wz。横向与偏航是随机指令，
+    # 每回合从 [-max, +max] 里采样，随课程按阶段放宽（``config_to_stages``）。
+    # 它们是**盲走允许的信息**：指令由操作者/上游规划器给出，不含地形真值，
+    # 与 ``command_vx`` 同源（见 agent.md §8.6 的信息来源清单）。
+    command: CommandConfig = field(default_factory=CommandConfig)
 
     # --- 开环步态之上的残差 RL --------------------------------------------- #
     # PD 目标变为 home + gait_gain * gait.radians(t) + action_scale * action
@@ -134,10 +194,18 @@ class EnvConfig:
     # --- 成功 -------------------------------------------------------------- #
     flat_success_distance: float = 3.0      # 仅平地阶段
     spawn_back: float = 0.55                # 第一个立面前方的米数
+    # 平地阶段是否要求「真的往前走一段」才算成功。**原地学横移/扭转的课程必须
+    # 把它关掉**：那种阶段 `command.vx = 0`，要求前进就永远拿不到成功，
+    # 进度行的成功率恒为 0、看不出学习信号；关掉后平地阶段改成「整回合不摔即成功」。
+    flat_success_needs_progress: bool = True
 
     # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    # 逐级奖励覆盖：``config.yaml`` 的 ``curriculum.reward_overrides`` 会按阶段
+    # 填这里，``config_to_env`` 与 ``set_reward_overrides()`` 把它叠到 ``reward``
+    # 上。默认空 ⇒ 与没有这个机制时逐位一致。
+    reward_overrides: dict[str, float] = field(default_factory=dict)
 
     @property
     def control_dt(self) -> float:
@@ -190,9 +258,19 @@ class Go2StairsEnv(gym.Env):
         self._peak_terrain_height = 0.0
         self._reached_top = False
         self._leg_contact_streak = 0
+        # 「被阻挡 → 试探抬腿」的状态（见 reward.py 的 probe_lift）。
+        self._blocked = False
+        self._blocked_peak = 0.0
+        self._probe_count = 0
+        self._probe_best = 0.0
+        self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
 
         self._success_x = self._success_target_x()
         self.nominal_pose = float(self.meta.home_qpos[2])  # 0.27 m 站立高度
+        # 当前指令 ``[vx, vy, wz]``。**与 ``cfg.command._now`` 是同一个列表**，
+        # 所以「外部控制器改写指令」与「奖励读当前指令」看到的是同一份数据，
+        # 不存在两份状态不同步的窗口。
+        self._command = self.cfg.command._now
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
@@ -240,6 +318,91 @@ class Go2StairsEnv(gym.Env):
         self._success_x = self._success_target_x()
         self._reached_top = False
 
+    # ------------------------------------------------------------------- 指令
+
+    def _sample_command(self) -> list[float]:
+        """按当前范围抽一条指令 ``[vx, vy, wz]``。
+
+        ``vx`` 是定值；``vy``/``wz`` 在 ``[-max, +max]`` 上均匀采样。上界为 0
+        时该项恒为 0，于是这条路径与「恒速前向」逐位一致。
+        """
+        cmd = self.cfg.command
+        vy = float(self._rng.uniform(-cmd.vy_max, cmd.vy_max)) if cmd.vy_max else 0.0
+        wz = (float(self._rng.uniform(-cmd.yaw_max, cmd.yaw_max))
+              if cmd.yaw_max else 0.0)
+        # vx 取**当前值**而不是字段值：``set_command_now(vx=...)`` 可以按课程阶段
+        # 压低它，如果这里读回 ``cmd.vx``，下一次 ``reset()`` 就会把它抹掉。
+        return [float(cmd._now[0]), vy, wz]
+
+    def set_commands(self, vy_max: float | None = None,
+                     yaw_max: float | None = None) -> None:
+        """改写横向/偏航指令的采样上界，并立刻重抽一条当前指令。
+
+        **外部控制器接口**：训练时由 ``scripts/train.py`` 在每个课程阶段开始时
+        按 ``curriculum.command_vy_max`` / ``command_yaw_max`` 调用（向量环境下
+        走 ``venv.env_method("set_commands", ...)``）；评估时也可以每个控制步
+        调一次，用外部规划器给出的值覆盖 —— 这就是模拟人类遥感操控的接法，
+        见 ``scripts/teleop.py``。
+
+        ``None`` 表示该项不变。传 0 会关掉那一项（但**观测维数不会因此改变**：
+        ``ObsConfig.command`` 与 ``EnvConfig.command`` 的初始范围决定维数，
+        训练中途改动维数会让 PPO 的网络与 RolloutBuffer 对不上）。
+        """
+        cmd = self.cfg.command
+        if vy_max is not None:
+            cmd.vy_max = float(vy_max)
+        if yaw_max is not None:
+            cmd.yaw_max = float(yaw_max)
+        self._command[:] = self._sample_command()
+
+    def set_flat_success_distance(self, distance: float) -> None:
+        """改写平地阶段的成功距离 [m]，并立刻刷新成功判据的阈值。
+
+        只对平地段有意义（楼梯段的成功判据是「跨过最后一级立面并达到顶部
+        高度」）。指令课程放宽横移/旋转之后，机器人会为了跟指令而绕路，原来
+        3 m 的前进判据会把成功拖成超时，所以平地预热级要能单独调短它。
+        """
+        self.cfg.flat_success_distance = float(distance)
+        self._success_x = self._success_target_x()
+
+    def set_flat_success_needs_progress(self, needs_progress: bool) -> None:
+        """平地阶段是否要求真的前进一段才算成功。
+
+        **原地指令课程必须传 False**：那种阶段 ``command.vx = 0``，要求前进就
+        永远拿不到成功，训练日志的成功率恒为 0（看不出学习信号）。传 False 后
+        成功判据变成「撑满整个回合」，见 :meth:`_success_reached`。
+        """
+        self.cfg.flat_success_needs_progress = bool(needs_progress)
+
+    def set_command_now(self, vy: float | None = None,
+                        yaw_rate: float | None = None,
+                        vx: float | None = None) -> list[float]:
+        """**立即**写入一条指令，不重新采样（外部控制器的高频入口）。
+
+        与 :meth:`set_commands` 的分工：那个改的是「采样范围」，由课程在阶段
+        边界调用；这个改的是「这一刻的指令」，可以由控制器每个控制步调用。
+        传 ``None`` 的项保持当前值。返回改写后的 ``[vx, vy, wz]``。
+
+        传了 ``vx`` 时会**同时改写基线** ``cfg.command.vx``：否则 ``reset()``
+        重抽指令时会把课程下发的定值前进指令丢掉（这是课程里
+        ``curriculum.command_vx`` 生效的路径）。``vy`` / ``wz`` 只改当前值，
+        它们每回合本来就该重抽。
+        """
+        self.cfg.command._set_now(vx=vx, vy=vy, wz=yaw_rate)
+        if vx is not None:
+            self.cfg.command.vx = float(vx)
+        # ⭐ 刷新「已经算好、还没被取走」的那一帧观测。
+        #
+        # 时序：``step()`` 结束时把 ``_obs_frame()`` 压进 ``_hist``，下一次
+        # ``step()`` 再把它取出来返回。外部控制器是在**两次 step 之间**下指令
+        # 的（``teleop.py`` / ``cmd_demo.py`` 的循环就是这个顺序），所以如果不
+        # 刷新，策略拿到的那一帧观测里带的还是**上一步**的指令 —— 一个控制步的
+        # 滞后（50 Hz 下 20 ms）。单步看不出来，但它是「设了指令策略却没反应」
+        # 这类误判的来源之一。指令是外生输入，改它不破坏马尔可夫性。
+        if self._hist and self._hist[-1].shape == self._obs_frame().shape:
+            self._hist[-1] = self._obs_frame()
+        return list(self._command)
+
     # ------------------------------------------------------------------- 成功
 
     def _success_target_x(self) -> float:
@@ -260,6 +423,11 @@ class Go2StairsEnv(gym.Env):
                 self.base_pos[0] > self.stair.up_end_x
                 and self.terrain_height_under_base >= self.stair.crest_height - 1e-9
             )
+        if not self.cfg.flat_success_needs_progress:
+            # 原地指令课程：没有前进指令可跟，成功 = **撑满整个回合**。
+            # ⚠ 必须带 ``_step_count`` 条件：不带的话第一步就算成功，
+            # ``terminate_on_success`` 会让回合在第 1 步结束、白拿 success 奖励。
+            return bool(self._step_count >= self._max_steps - 1)
         return bool(self.base_pos[0] > self._success_x)
 
     # ------------------------------------------------------------------- 属性
@@ -316,7 +484,24 @@ class Go2StairsEnv(gym.Env):
     def yaw(self) -> float:
         return float(self.base_rpy[2])
 
-    # ------------------------------------------------------------------ 辅助
+    @property
+    def yaw_rate(self) -> float:
+        """偏航角速度，**机体系 z 轴分量**（rad/s），是偏航速率指令要跟踪的量。
+
+        为什么用机体系而不是世界系：这一项要拿去和「平稳的偏航指令」比较，而奖励
+        信号的噪声底必须远小于要跟踪的量程。世界系 z 角速度
+        ``wz + tan(pitch) * (cos(yaw) * wx + sin(yaw) * wy)`` 在数学上同样是偏航
+        速率，但四足步态下躯干以几十赫兹小幅摆动，那个 ``tan(pitch)`` 乘积项就能
+        贡献约 0.28 rad/s —— 与指令量程（±0.70）同阶，等于把一半权重扔进了策略
+        根本控制不到的通道（三种独立方法实测见 ``experience.md`` §16）。
+
+        机体系读数的抖动与 ``qvel[5]`` 同阶（≈0.16），计算更便宜，而且**更贴近
+        真机**：机载陀螺直接给的就是机体系角速度，真机不需要先做欧拉角换算。
+
+        只读陀螺与姿态，不引入任何地形信息，所以可以进奖励。
+        """
+        wx, wy, wz = quat_to_mat(self.base_quat).T @ self.data.qvel[3:6]
+        return float(wz)
 
     @property
     def foot_clearance(self) -> np.ndarray:
@@ -360,6 +545,10 @@ class Go2StairsEnv(gym.Env):
             # 楼梯信息里唯一直接告诉策略的一项。盲走仍然需要知道自己在*哪一段*
             # 楼梯上；但它不会知道下一级立面在哪里。
             parts.append(np.array([float(self.stair.step_height)]))
+        if obs_cfg.command:
+            # 横向 / 偏航指令。这是**允许进入观测**的：指令来自操作者或上游
+            # 规划器，不含地形真值（与 vx 同源，见 agent.md §8.6）。
+            parts.append(self._command[1:].copy())
         return np.concatenate(parts).astype(np.float64)
 
     def _observation(self) -> np.ndarray:
@@ -407,6 +596,86 @@ class Go2StairsEnv(gym.Env):
             foot_contact, 0.0, self._foot_air_time + self.cfg.control_dt
         )
         self._prev_foot_contact = foot_contact
+
+    def _track_swing_peak(self, foot_contact: np.ndarray) -> None:
+        """维护每只脚「本次摆动期内的最大离地间隙」，在奖励计算**之前**调用。
+
+        为什么要单独维护：落地那一帧脚已经贴回踏面，当时的间隙接近 0，所以
+        「这次摆动到底抬了多高」只能靠摆动期的峰值来判断，落地帧本身看不出
+        来。脚一落地就把峰值清零，为下一次摆动重新计。
+
+        ⚠ **清零必须发生在奖励结算之后，而不是接触的那一帧**。实测踩过这个
+        坑：如果一接触就清零，那么落地帧读到的是「上一帧的峰值」，比整个摆动
+        期的真实峰值低 0.01~0.03 m，探测项的判据会系统性偏严。做法是「落地那
+        一帧保留旧峰值，结算完再清零」。
+        """
+        clearance = self.foot_clearance
+        landed = foot_contact & ~self._prev_foot_contact
+        self._peak_swing_clearance = np.where(
+            landed, self._peak_swing_clearance,
+            np.where(foot_contact, 0.0,
+                     np.maximum(self._peak_swing_clearance, clearance)),
+        )
+
+    def _update_probe_state(self, foot_contact: np.ndarray) -> None:
+        """维护「被阻挡」状态，在物理推进之后、奖励计算**之前**调用。
+
+        判据：**有前进指令，但实测前进速度远低于指令**（比例见
+        ``reward.probe_blocked_frac``）。一旦判定为被阻挡就**锁住**，直到机身
+        下方的地形刷新了本回合的最高高度（真的上去了）或前进速度恢复为止 ——
+        因为机器人撞上立面时会前后晃，不锁住的话这个布尔量会一步一跳。
+
+        ``_blocked_peak`` 是锁住那一刻记录的地形高，用来判断「有没有上去」。
+        解除阻挡时顺带把 ``_probe_best`` 清零，让下一次被卡住可以重新累积
+        「抬高进展」（否则势函数在整条回合里只增不减，第二次卡住就没有梯度）。
+        """
+        rc = self.cfg.reward
+        cmd_vx = float(self.cfg.command.vx)
+        vx = float(self.base_lin_vel_world[0])
+        terrain = float(self.terrain_height_under_base)
+        if self._blocked:
+            recovered = terrain > self._blocked_peak + 1e-9
+            if recovered or vx > max(0.5 * cmd_vx, 0.05):
+                self._blocked = False
+                self._probe_best = 0.0
+        if not self._blocked and cmd_vx > 1e-6:
+            if vx < rc.probe_blocked_frac * cmd_vx:
+                self._blocked = True
+                self._blocked_peak = terrain
+                self._probe_best = 0.0
+
+    @property
+    def probe_target(self) -> float:
+        """「试探抬腿」的起算线 [m]（势函数塑形的地板）。
+
+        直接取 ``reward.probe_lift_target``，**不乘台阶高**。原因：实测
+        （``.tmp/calib_probe3.py``）在 15 cm 立面之前被阻挡时，默认步态的摆动
+        峰值只到 0.09~0.12 m；而 ``action_scale=0.30`` 下搜遍固定动作，最好的
+        一种也只到 0.148 m（``.tmp/calib_probe4.py``）。门槛若取
+        ``1.6 × 0.15 = 0.24 m``，梯度恒为零、这一项永远不触发。改成只跟「当前
+        策略自己抬多高」比的 0.06 m 之后，普通步态的上沿被扣掉，剩下的都是
+        真的「比平时抬得更高」。
+        """
+        return float(self.cfg.reward.probe_lift_target)
+
+    def set_reward_overrides(self, overrides: dict[str, float] | None) -> None:
+        """把一组奖励覆盖值叠到 ``cfg.reward`` 上（课程逐级调整奖励的入口）。
+
+        ``scripts/train.py`` 在每一级建完环境之后用
+        ``venv.env_method("set_reward_overrides", stage.reward_overrides)`` 调用，
+        所以**同一个进程里每一级都能有自己的一套奖励**。传 ``None`` 或 ``{}``
+        等价于「不动」。
+
+        为什么不做成「新建 RewardConfig」：那样每一级都要把所有字段抄一遍，
+        而实际上大多数级只改一两项；叠加重载让 ``config.yaml`` 里只写要改的
+        那几个键就够了。
+        """
+        for key, value in (overrides or {}).items():
+            if not hasattr(self.cfg.reward, key):
+                raise ValueError(
+                    f"未知的奖励字段：{key}；可用字段见 RewardConfig.__dataclass_fields__"
+                )
+            setattr(self.cfg.reward, key, value)
 
     def _contact_flags(self) -> tuple[bool, bool]:
         """机器人 geom 与地形接触时的 (trunk_contact, leg_contact)。
@@ -550,9 +819,15 @@ class Go2StairsEnv(gym.Env):
         self._peak_terrain_height = self.terrain_height_under_base
         self._prev_action = np.zeros(self.num_act)
         self._last_action = np.zeros(self.num_act)
+        self._command[:] = self._sample_command()
         self._step_count = 0
         self._reached_top = False
         self._leg_contact_streak = 0
+        self._blocked = False
+        self._blocked_peak = 0.0
+        self._probe_count = 0
+        self._probe_best = 0.0
+        self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = self._foot_contact_mask()
@@ -618,6 +893,11 @@ class Go2StairsEnv(gym.Env):
         self._step_count += 1
         trunk_contact, leg_contact = self._contact_flags()
         foot_contact = self._foot_contact_mask()
+        # 这两步必须在奖励计算之前：``_track_swing_peak`` 提供「本次摆动抬了
+        # 多高」，``_update_probe_state`` 提供「现在是不是撞着立面推不动」，
+        # 而 ``probe_lift`` 项要同时用到它们。
+        self._track_swing_peak(foot_contact)
+        self._update_probe_state(foot_contact)
         terminated, truncated = self._terminated(trunk_contact, leg_contact)
 
         # 目标终止。到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出
@@ -647,11 +927,16 @@ class Go2StairsEnv(gym.Env):
             "trunk_contact": float(trunk_contact),
             "leg_contact": float(leg_contact),
             "leg_contact_streak": int(self._leg_contact_streak),
+            "blocked": float(self._blocked),
+            "probe_count": int(self._probe_count),
             "base_x": float(self.base_pos[0]),
             "base_y": float(self.base_pos[1]),
             "base_z": float(self.base_pos[2]),
             "terrain_height": float(self.terrain_height_under_base),
             "forward_vel": float(self.base_lin_vel_world[0]),
+            "lateral_vel": float(self.base_lin_vel_body[1]),
+            "yaw_rate": float(self.yaw_rate),
+            "command": [float(v) for v in self._command],
             "roll": float(self.base_rpy[0]),
             "pitch": float(self.base_rpy[1]),
             "crest_height": float(self.stair.crest_height),

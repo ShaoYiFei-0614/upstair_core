@@ -29,7 +29,7 @@
 ### D1 —— 控制台修复由脚本显式调用，不做成 import 副作用
 
 本文件**只导入** `setup_utf8_console`，不调用它。真正调用它的是
-`scripts/train.py:235` 与 `scripts/play.py:429`，两处都在 `main()` 的第一行。
+`scripts/train.py:255` 与 `scripts/play.py:429`，两处都在 `main()` 的第一行。
 
 **为什么不做成 import 副作用**：`setup_utf8_console()` 会改进程级的
 `sys.stdout` / `sys.stderr`。把它挂在包导入上，意味着任何第三方
