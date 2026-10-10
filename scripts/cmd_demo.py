@@ -39,7 +39,7 @@ from play import (  # noqa: E402
     resolve_target,
     write_gif,
 )
-from robotdog.config import DEFAULT_CONFIG_PATH, load_config  # noqa: E402
+from robotdog.config import DEFAULT_CONFIG_PATH, device, load_config  # noqa: E402
 from robotdog.tools import console, paths  # noqa: E402
 
 #: 分段指令表：``(标签, vx, vy, wz)``。每段按顺序跑 ``--hold-steps`` 步。
@@ -111,6 +111,8 @@ def run_demo(env, runner, phases, *, seed: int, hold_steps: int, capture: bool,
     for label, vx, vy, wz in phases:
         # 指令在段内恒定、段间跳变 —— 这正是「指哪走哪」要考的东西。
         env.set_command_now(vy=vy, yaw_rate=wz, vx=vx)
+        # set_command_now 只刷新环境内部的那一帧，手里的 obs 还带旧指令，必须重取。
+        obs = env._observation()
         acc_vy: list[float] = []
         acc_wz: list[float] = []
         for _ in range(hold_steps):
@@ -128,6 +130,7 @@ def run_demo(env, runner, phases, *, seed: int, hold_steps: int, capture: bool,
                 # 摔倒了就重开一回合，但**继续**按原计划换指令，便于看趋势。
                 obs, _info = env.reset(seed=seed + step)
                 env.set_command_now(vy=vy, yaw_rate=wz, vx=vx)
+                obs = env._observation()
         stats.append(PhaseStat(
             label=label, steps=hold_steps, cmd_vy=vy, cmd_wz=wz,
             mean_vy=float(np.mean(acc_vy)), mean_wz=float(np.mean(acc_wz)),
@@ -137,7 +140,6 @@ def run_demo(env, runner, phases, *, seed: int, hold_steps: int, capture: bool,
 
 def main(argv: list[str] | None = None) -> int:
     console.setup_utf8_console()
-    load_config()  # 早失败：配置有问题就不要等到环境建好才发现
     parser = argparse.ArgumentParser(description="指令跟踪演示与量化")
     parser.add_argument("--run", required=True, help="运行名 / 目录 / .zip")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
@@ -148,12 +150,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gif", action="store_true")
     args = parser.parse_args(argv)
+    raw = load_config(args.config)  # 早失败：配置有问题就不要等到环境建好才发现
 
     target = resolve_target(args.run)
     from robotdog.tools.terrain import flat_spec
 
-    stair = flat_spec(tread=0.50, width=2.0, start_x=1.50)
-    runner, env, _venv = open_runner(target, stair=stair)
+    # step_height 必须显式给 0：否则 StairSpec 会留 0.05 的默认值，
+    # 观测的 step_height 槽会按「5cm 台阶」报数（地形本身没有台阶块）。
+    stair = flat_spec(tread=0.50, width=2.0, start_x=1.50, step_height=0.0)
+    runner, env, _venv = open_runner(target, stair=stair, device=device(raw))
 
     phases = INPLACE_PHASES if args.phase == "inplace" else WALK_PHASES
     # 把指令量程放开到演示表的最大幅度，否则 `set_command_now` 的指令会被

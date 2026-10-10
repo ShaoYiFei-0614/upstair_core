@@ -26,6 +26,7 @@ from __future__ import annotations
 import shutil
 import sys
 import copy
+import json
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -150,6 +151,9 @@ class Trainer:
         # 而不是「在上一次覆盖之上再叠」。这个陷阱在没有深拷贝的年代不可见
         # （因为那时所有级共享同一个被改烂的 cfg），加上深拷贝之后才暴露出来。
         self._reward_baseline = copy.deepcopy(cfg.reward)
+        # 「阶段名 → 该级实际生效的指令量程与奖励覆盖」，训练结束后写到
+        # ``runs/<run>/plan.json``。见 ``make_env`` 里的说明。
+        self.plans: dict[str, dict[str, Any]] = {}
 
     # ---- 每个阶段一个独立的向量环境（地形烘焙在编译后的 MJCF 里）----------
     def make_env(self, stage: StageSpec, *, warm_start: str | None = None):
@@ -191,6 +195,21 @@ class Trainer:
                         dict(asdict(self._reward_baseline)))
         if stage.reward_overrides:
             venv.env_method("set_reward_overrides", dict(stage.reward_overrides))
+        # 把**这一级实际生效的**设置记下来。``<阶段>_env.json`` 与
+        # ``summary.json`` 里的 ``env_config`` 都是 ``config.yaml`` 的基线，
+        # 不含课程逐级下发的量程与奖励覆盖 —— 二者只靠读那些文件无法还原
+        # （``scripts/teleop.py`` 曾因此把「横向/偏航量程为 0」的基线当成
+        # 训练时的真实设置）。
+        self.plans[stage.name] = {
+            "label": stage.label,
+            "step_height": float(stage.step_height),
+            "timesteps": int(stage.timesteps),
+            "command_vx": [float(v) for v in stage.command_vx],
+            "command_vy_max": float(stage.command_vy_max),
+            "command_yaw_max": float(stage.command_yaw_max),
+            "reward_overrides": {k: float(v)
+                                 for k, v in dict(stage.reward_overrides).items()},
+        }
         return venv
 
     def train_stage(self, stage: StageSpec, venv, *, warm_start: str | None = None,
@@ -362,6 +381,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shutil.copy2(src, dst)
 
     final_model = results[-1].model_path if results else ""
+    # 课程的实施记录：每一级实际生效的指令量程 / 奖励覆盖。``env_config`` 与
+    # ``<阶段>_env.json`` 都是 ``config.yaml`` 的基线，复现某一级时必须读这个。
+    plan_path = rundir.root / "plan.json"
+    plan_path.write_text(
+        json.dumps(trainer.plans, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     payload: dict[str, Any] = {
         "env_config": asdict(cfg),
         "obs_config": asdict(cfg.obs),

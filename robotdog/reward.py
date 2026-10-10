@@ -29,20 +29,6 @@ import numpy as np
 # 权重
 # --------------------------------------------------------------------------- #
 
-#: 前进跟踪项在**超速侧**的惩罚斜率量程 [m/s]：超速每 1 m/s 扣
-#: ``forward_vel / OVERSPEED_RANGE`` 分。取 0.45 表示「超速 0.45 m/s 就把这一项
-#: 的满分扣光」，而实测小跑的过冲正好在这一量级 —— 既留得住梯度，又不会让
-#: 超速 0.05 m/s 就吃掉整项。
-OVERSPEED_RANGE = 0.45
-
-#: ``vx`` 指令为 0 时，前进跟踪项用来归一化误差的**量程下限** [m/s]。
-#: ``vx`` 是定值基线、没有「采样上界」可借（横向/偏航有 ``vy_max``/``yaw_max``），
-#: 所以要用一个下限把分母撑开。取 0.30 的含义：vx=0 时允许 ±0.30 m/s 的余量
-#: 拿满分，超过 0.30 m/s 归零 —— 与实测「小跑步态自带 0.24 m/s 前进偏置」
-#: 同量级，足以把「别前进」这句话变成有价钱的要求。
-FORWARD_RANGE_FLOOR = 0.30
-
-
 @dataclass
 class RewardConfig:
     """奖励权重。
@@ -52,27 +38,33 @@ class RewardConfig:
     """
 
     # --- 五个要求的项 ----------------------------------------------------- #
-    # 形状是「按量程归一化的线性死区」（m11166 起），与 ``lateral_vel`` /
-    # ``yaw_rate`` 一致；量程取 ``max(|cmd.vx|, FORWARD_RANGE_FLOOR)``，超速侧
-    # 另加 ``forward_overspeed`` 的惩罚。``forward_vel_sigma`` 因此不再参与计算
-    # （保留只为兼容旧配置）。
+    # 形状是「按量程归一化的线性死区」，与 ``lateral_vel`` / ``yaw_rate``
+    # 一致；量程取 ``max(|cmd.vx|, forward_range_floor)``，超速侧另加
+    # ``forward_overspeed`` 的惩罚。
     forward_vel: float = 10.0           # [SPEC] 对 vx 指令的线性死区跟踪
-    forward_vel_sigma: float = 0.25     # m/s（历史字段，不再参与计算）
     forward_overspeed: float = 1.0      # [SPEC] 超速侧惩罚斜率（× forward_vel 量级）
+    # 超速侧惩罚的**斜率量程** [m/s]：超速每 1 m/s 扣 ``forward_vel /
+    # overspeed_range`` 分。取 0.45 表示「超速 0.45 m/s 就把这一项的满分扣光」，
+    # 而实测小跑的过冲正好在这一量级 —— 既留得住梯度，又不会让超速 0.05 m/s
+    # 就吃掉整项。
+    overspeed_range: float = 0.45
+    # ``vx`` 指令为 0 时，前进跟踪项用来归一化误差的**量程下限** [m/s]。
+    # ``vx`` 是定值基线、没有「采样上界」可借（横向/偏航有 ``vy_max``/``yaw_max``），
+    # 所以要用一个下限把分母撑开。取 0.30 的含义：vx=0 时允许 ±0.30 m/s 的余量
+    # 拿满分，超过 0.30 m/s 归零 —— 与实测「小跑步态自带 0.24 m/s 前进偏置」
+    # 同量级，足以把「别前进」这句话变成有价钱的要求。
+    forward_range_floor: float = 0.30
     orientation: float = -1.2           # [SPEC] roll^2 + pitch^2（平方和）
     torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
     foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
     body_collision: float = -1.2        # [SPEC] 躯干接触地形
 
-    # --- 横向 / 旋转指令跟踪（m08247 新增）--------------------------------- #
+    # --- 横向 / 旋转指令跟踪 ----------------------------------------------- #
     # 只在 ``EnvConfig.command`` 的范围非零时才可能非零（见 ``compute_reward`` 里的
     # ``cmd.vy_max`` / ``cmd.yaw_max`` 门），所以「只往前走」的阶段与旧行为逐位一致。
-    # 线性死区、按指令量程归一化，所以这两个权重是「完美跟踪每步得多少分」，
-    # ``*_sigma`` 不再参与计算（保留只为兼容旧配置）。
+    # 线性死区、按指令量程归一化，所以这两个权重是「完美跟踪每步得多少分」。
     lateral_vel: float = 6.0            # 对 vy 指令的线性死区跟踪
-    lateral_vel_sigma: float = 0.25     # m/s（历史字段，不再参与计算）
     yaw_rate: float = 4.0               # 对 wz 指令的线性死区跟踪
-    yaw_rate_sigma: float = 0.25        # rad/s（历史字段，不再参与计算）
 
     # --- 摆动足抬升 -------------------------------------------------------- #
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
@@ -91,8 +83,6 @@ class RewardConfig:
     # 所以起算线只跟「当前策略自己能抬多高」比 —— 见 ``env.probe_target``。
     probe_lift: float = 1.0             # 抬高进展的权重
     probe_lift_target: float = 0.06     # m，进展的起算线（普通步态峰值带的上沿）
-    probe_lift_ratio: float = 1.0       # 记录用：曾按 ratio × 台阶高 取起算线，已弃用
-    probe_lift_max: int = 12            # 记录用：势函数本身有界，不再按次数截断
     probe_blocked_frac: float = 0.30    # 实测前进速度 < 该比例 × 指令速度 ⇒ 被阻挡
 
     # --- 步态发现 ---------------------------------------------------------- #
@@ -156,13 +146,13 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 与「刚好 0.45 m/s」拿同样的分（实测指令量程 0~0.90 扫一遍，策略输出恒为
     # 1.27 m/s，完全开环）。超速是主动选择，必须一路有价钱。
     #
-    # 量程取 ``max(|cmd.vx|, FORWARD_RANGE_FLOOR)`` 把 ``vx=0`` 时的分母撑开，
-    # 否则「别前进」这个指令没有价钱。
+    # 量程取 ``max(|cmd.vx|, rc.forward_range_floor)`` 把 ``vx=0`` 时的分母撑开，
+    # 否则「别前进」这个指令没有价钱。超速惩罚的斜率量程是 ``rc.overspeed_range``。
     err = float(lin[0]) - float(cmd.vx)
-    fwd_range = max(abs(float(cmd.vx)), FORWARD_RANGE_FLOOR)
+    fwd_range = max(abs(float(cmd.vx)), float(rc.forward_range_floor))
     track = max(0.0, 1.0 - abs(err) / fwd_range)
     if err > 0.0:
-        track -= float(rc.forward_overspeed) * err / OVERSPEED_RANGE
+        track -= float(rc.forward_overspeed) * err / float(rc.overspeed_range)
     terms["forward_vel"] = rc.forward_vel * float(track)
 
     # 1b) 横向 / 偏航指令跟踪 ---------------------------------------------
@@ -224,7 +214,9 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     lift_target = max(
         rc.foot_lift_target, rc.foot_lift_step_ratio * float(env.stair.step_height)
     )
-    lift = np.clip(clearance / lift_target, 0.0, 1.0)
+    # 守卫：``foot_lift_target`` 与台阶高同时为 0 时目标为 0，除法会产生 nan
+    # 并污染整步奖励（``np.clip(nan, 0, 1)`` 仍是 nan）。
+    lift = np.clip(clearance / max(lift_target, 1e-6), 0.0, 1.0)
     terms["foot_lift"] = rc.foot_lift * float(np.mean(gate * lift))
 
     # 5) 机身碰撞惩罚 -- 躯干接触地形 -----------------------------------
@@ -293,19 +285,22 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     #      所以起算线取 0.06 m 这个「普通步态的上沿」，留出可优化的空间。
     #
     # ⭐ 这是**势函数塑形**（potential-based shaping），不是逐步固定分：
-    # ``env._probe_best`` 记住本回合「被阻挡期间达到过的最高峰值」，每一步只
-    # 结算「比历史最好还高出多少」。因此
-    #   * 总量有界：最多 ``probe_lift × (可达最高峰值 − 起算线)``；
+    # ``env._probe_best`` 逐足记住本回合「被阻挡期间达到过的最高峰值」，每一步只
+    # 结算「比该足自己的历史最好还高出多少」。因此
+    #   * 总量有界：最多 ``probe_lift × Σ(可达最高峰值 − 起算线)``；
     #   * 不可刷分：重复做同样的高度拿不到任何分；
     #   * 有梯度：每一次抬得更高都被记录，即使那一脚最终没踩上去。
+    # 逐足而不是全体取 max：四足同一步同时抬高时，标量地板会把只抬了一只脚的
+    # 那些足也算成「进展」，下一步那只脚单独再抬就再也拿不到分（实测两足同到
+    # 0.10 记 0.08，随后单独到 0.08 记 0.0）。
     # 为什么不用「落地那一刻峰值 > 门槛就给固定分」：实测那条路要么门槛太低
     # （等于奖励普通步态），要么太高（一次都不触发）。见 experience.md §15。
     if rc.probe_lift != 0.0 and env._blocked:
         peaks = env._peak_swing_clearance
-        floor = max(env._probe_best, env.probe_target)
+        floor = np.maximum(env._probe_best, env.probe_target)
         gain = float(np.sum(np.clip(peaks - floor, 0.0, None)))
         if gain > 0.0:
-            env._probe_best = float(np.max(peaks))
+            env._probe_best = np.maximum(env._probe_best, peaks)
             env._probe_count += 1
         terms["probe_lift"] = rc.probe_lift * gain
     else:

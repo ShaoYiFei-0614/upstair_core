@@ -122,6 +122,12 @@ class CommandConfig:
 
     def __post_init__(self) -> None:
         self._now[0] = float(self.vx)
+        # ``vx_max == 0`` 是「前向不采样、用 ``vx`` 定值」，此时 ``vx_min`` 无意义。
+        # 只要真的采样，区间就必须非空 —— 否则会在 ``reset()`` 里抽出 ``lo > hi``。
+        if self.vx_max and self.vx_min > self.vx_max:
+            raise ValueError(
+                f"前向指令范围为空：vx_min={self.vx_min} > vx_max={self.vx_max}"
+            )
 
     @property
     def has_lateral(self) -> bool:
@@ -406,13 +412,10 @@ class Go2StairsEnv(gym.Env):
         # 刷新「已经算好、还没被取走」的那一帧观测：控制器是在两次 ``step()``
         # 之间下指令的，不刷新的话策略拿到的那一帧还带着上一步的指令（50 Hz
         # 下 20 ms 的滞后）。指令是外生输入，改它不破坏马尔可夫性。
-        if self._hist and self._hist[-1].shape == self._obs_frame().shape:
-            self._hist[-1] = self._obs_frame()
-        return list(self._command)
-        # 时序：``step()`` 结束时把 ``_obs_frame()`` 压进 ``_hist``，下一次
-        # ``step()`` 再把它取出来返回。外部控制器是在**两次 step 之间**下指令
-        if self._hist and self._hist[-1].shape == self._obs_frame().shape:
-            self._hist[-1] = self._obs_frame()
+        if self._hist:
+            frame = self._obs_frame()
+            if self._hist[-1].shape == frame.shape:
+                self._hist[-1] = frame
         return list(self._command)
 
     # ------------------------------------------------------------------- 成功
@@ -661,7 +664,7 @@ class Go2StairsEnv(gym.Env):
         因为机器人撞上立面时会前后晃，不锁住的话这个布尔量会一步一跳。
 
         ``_blocked_peak`` 是锁住那一刻记录的地形高，用来判断「有没有上去」。
-        解除阻挡时顺带把 ``_probe_best`` 清零，让下一次被卡住可以重新累积
+        解除阻挡时顺带把逐足的 ``_probe_best`` 清零，让下一次被卡住可以重新累积
         「抬高进展」（否则势函数在整条回合里只增不减，第二次卡住就没有梯度）。
         """
         rc = self.cfg.reward
@@ -672,12 +675,12 @@ class Go2StairsEnv(gym.Env):
             recovered = terrain > self._blocked_peak + 1e-9
             if recovered or vx > max(0.5 * cmd_vx, 0.05):
                 self._blocked = False
-                self._probe_best = 0.0
+                self._probe_best[:] = 0.0
         if not self._blocked and cmd_vx > 1e-6:
             if vx < rc.probe_blocked_frac * cmd_vx:
                 self._blocked = True
                 self._blocked_peak = terrain
-                self._probe_best = 0.0
+                self._probe_best[:] = 0.0
 
     @property
     def probe_target(self) -> float:
@@ -870,7 +873,7 @@ class Go2StairsEnv(gym.Env):
         self._blocked = False
         self._blocked_peak = 0.0
         self._probe_count = 0
-        self._probe_best = 0.0
+        self._probe_best = np.zeros(len(self.meta.foot_geom_ids))
         self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))

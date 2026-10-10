@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from robotdog.config import (  # noqa: E402
     DEFAULT_CONFIG_PATH,
+    config_to_stages,
+    device,
     load_config,
 )
 from robotdog.policy import stair_from_height  # noqa: E402
@@ -50,7 +53,6 @@ from play import (  # noqa: E402
     FRAME_HEIGHT,
     FRAME_STRIDE,
     FRAME_WIDTH,
-    draw_hud,
     open_runner,
     resolve_target,
     write_gif,
@@ -76,7 +78,9 @@ def flat_spec_for(width: float = 2.0, start_x: float = 1.50):
     """一块只有平地的地形（``--hold`` 演示用）。"""
     from robotdog.tools.terrain import flat_spec
 
-    return flat_spec(tread=0.50, width=width, start_x=start_x)
+    # 显式给 step_height：flat_spec 不改它的话会留 0.05 的默认值，
+    # 而观测的 step_height 槽读的就是它（地形本身没有台阶块）。
+    return flat_spec(tread=0.50, width=width, start_x=start_x, step_height=0.0)
 
 
 class StairController:
@@ -170,6 +174,9 @@ def run_teleop(env: Go2StairsEnv, runner, controller, *, seed: int,
     while not (terminated or truncated) and step < max_steps:
         cmd = controller(env, step)
         env.set_command_now(vx=cmd.vx, vy=cmd.vy, yaw_rate=cmd.wz)
+        # set_command_now 只刷新环境内部「已算好还没被取走」的那一帧，
+        # 调用方手里的 obs 还是上一步的指令，必须重取。
+        obs = env._observation()
         sum_cmd += np.array([cmd.vx, cmd.vy, cmd.wz])
         obs, _r, terminated, truncated, info = env.step(runner.predict(obs))
         step += 1
@@ -201,9 +208,55 @@ def run_teleop(env: Go2StairsEnv, runner, controller, *, seed: int,
     return stats, frames
 
 
+#: 三级来源都查不到时的演示默认量程 ``(vy_max, yaw_max)``。
+DEFAULT_DEMO_LIMITS = (0.25, 0.35)
+
+
+def _stage_limits(path: Path, height: float) -> tuple[float, float] | None:
+    """从 ``plan.json`` / ``summary.json`` 里按台阶高取 ``(vy_max, yaw_max)``。"""
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    rows = data.get("stages") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        rows = list(data.values()) if isinstance(data, dict) else []  # plan.json
+    for row in rows:
+        if not isinstance(row, dict) or "command_vy_max" not in row:
+            continue
+        if abs(float(row.get("step_height", -1.0)) - height) < 1e-9:
+            return float(row["command_vy_max"]), float(row.get("command_yaw_max", 0.0))
+    return None
+
+
+def command_limits(stair, raw: dict, model_path) -> tuple[float, float, str]:
+    """本回合驱动的那一级的 ``(vy_max, yaw_max, 来源)``。
+
+    优先级：``plan.json``（训练**实际下发**的值）→ ``summary.json``（训练记录）
+    → 当前 ``config.yaml`` 的同名级 → 演示默认值。权重自带的 ``_env.json`` 只记
+    ``config.yaml`` 的基线（``vy_max``/``yaw_max`` 常常是 0），不能当训练量程用。
+    """
+    height = round(float(stair.step_height), 6)
+    root = Path(model_path).parent
+    if root.name == "checkpoints":  # 权重在 checkpoints/ 下，运行目录是上一层
+        root = root.parent
+    for name in ("plan.json", "summary.json"):
+        got = _stage_limits(root / name, height)
+        if got is not None:
+            return got[0], got[1], name
+    for stage in config_to_stages(raw):
+        if abs(round(float(stage.step_height), 6) - height) < 1e-9:
+            return (float(stage.command_vy_max), float(stage.command_yaw_max),
+                    "config.yaml 同名级")
+    print("⚠ 该阶段的课程量程无从查证：plan.json / summary.json 里没有这一级，")
+    print("  当前 config.yaml 里也没有同名级。")
+    return DEFAULT_DEMO_LIMITS[0], DEFAULT_DEMO_LIMITS[1], "演示默认（无记录）"
+
+
 def main(argv: list[str] | None = None) -> int:
     console.setup_utf8_console()
-    load_config()  # 早失败：配置有问题就不要等到环境建好才发现
     parser = argparse.ArgumentParser(description="外部控制器遥控策略（遥感操控）")
     parser.add_argument("--run", required=True, help="运行名 / 目录 / .zip")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
@@ -218,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                         metavar=("VX", "VY", "WZ"),
                         help="钉死一条指令跑满回合（同时默认切到平地地形）")
     args = parser.parse_args(argv)
+    raw = load_config(args.config)  # 早失败：配置有问题就不要等到环境建好才发现
 
     target = resolve_target(args.run)
     cfg = target.cfg
@@ -231,15 +285,9 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("无法确定地形：请用 --height 指定台阶高 [cm]，或加 --flat")
         terrain_label = f"台阶 {stair.step_height * 100:.1f}cm × {stair.n_up} 级"
 
-    runner, env, _venv = open_runner(target, stair=stair)
-    vy_limit = cfg.command.vy_max
-    yaw_limit = cfg.command.yaw_max
-    if vy_limit == 0.0 and yaw_limit == 0.0:
-        # 权重自带记录里范围是 0（只训过直走）。放开一个演示用的安全范围，
-        # 并明确告诉用户：策略从没见过横向/旋转指令，结果不可当性能看。
-        vy_limit, yaw_limit = 0.25, 0.35
-        print("⚠ 该权重的指令课程范围是 0（只训过直走），本次只是演示接口；")
-        print(f"  临时把范围放开到 vy±{vy_limit} wz±{yaw_limit}，策略未学过横移。")
+    vy_limit, yaw_limit, limit_src = command_limits(stair, raw, target.model_path)
+    dev = device(raw)
+    runner, env, _venv = open_runner(target, stair=stair, device=dev)
 
     if args.hold is not None:
         controller = HoldController(vx=args.hold[0], vy=args.hold[1],
@@ -251,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     print(f"[遥操作] {target.label}  {terrain_label}  "
-          f"指令上界 vy±{vy_limit:g} wz±{yaw_limit:g}")
+          f"指令上界 vy±{vy_limit:g} wz±{yaw_limit:g}（来源 {limit_src}）")
     frames: list[np.ndarray] = []
     for ep in range(args.episodes):
         stats, ep_frames = run_teleop(

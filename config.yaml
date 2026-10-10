@@ -96,7 +96,11 @@ reward:
   # 往前冲掉分。为什么必须这么改（旧的高斯写法在 vx=0 的课程级里
   # 完全不惩罚前进）见 robotdog/reward.py 第 1 节的注释与 experience.md §19。
   forward_vel: 10.0          # 对 vx 指令的线性死区跟踪
-  forward_vel_sigma: 0.25    # 历史字段，不再参与计算
+  # 冲刺（实测 vx 超出指令）额外扣分。线性死区在 |err| > 量程 之后梯度归零，
+  # 于是「冲到 1.9 m/s」与「刚好等于指令」同分 —— 超速必须一路有价钱。
+  forward_overspeed: 1.0     # 超速侧惩罚斜率（× forward_vel 量级）
+  overspeed_range: 0.45      # 超速每 1 m/s 扣 forward_vel / overspeed_range 分
+  forward_range_floor: 0.30  # vx 指令为 0 时归一化误差的量程下限 [m/s]
   # 横向 / 旋转指令跟踪。两项**求和**合成 reward_terms 里的一行 "command_follow"。
   # 指令范围全为 0 时该项恒为 0，所以「只学直走」的阶段奖励与旧版逐位一致。
   #
@@ -107,9 +111,7 @@ reward:
   # 策略在两种形状下都停在原地：前者「抖动碰巧对上」就有分，后者梯度
   # -2W(v-cmd)/range² 每单位动作只有约 1.35 分。
   lateral_vel: 6.0           # 对 vy 指令的线性死区跟踪峰值
-  lateral_vel_sigma: 0.25    # 历史字段，不再参与计算
   yaw_rate: 4.0              # 对 wz 指令的线性死区跟踪峰值（wz=0 时带基线惩罚）
-  yaw_rate_sigma: 0.25       # 历史字段，不再参与计算
   # 姿态与能耗
   orientation: -1.2          # roll² + pitch²
   torque: -1.5e-4            # Στ²
@@ -117,12 +119,11 @@ reward:
   foot_lift: 0.9
   foot_lift_target: 0.08     # 目标下限 [m]
   foot_lift_step_ratio: 1.4  # 有效目标 = max(target, ratio × 台阶高)
+  foot_lift_gate_speed: 0.25 # 摆动门控：足端三维速度达到该值才按比例给分 [m/s]
   # 被阻挡时的试探抬腿（基线为 0，靠 curriculum.reward_overrides 逐级打开）
   # 势函数塑形：只按「被阻挡期间最高摆动峰值又提高了多少」结算，总量有界、不可刷分。
   probe_lift: 0.0            # 抬高进展的权重
   probe_lift_target: 0.06    # 进展的起算线 [m]，取普通步态峰值带（0.06~0.12）的上沿
-  probe_lift_ratio: 1.0      # 未使用，保留字段（曾按 ratio × 台阶高 取起算线）
-  probe_lift_max: 12         # 未使用，保留字段
   probe_blocked_frac: 0.30   # 实测前进速度 < 该比例 × 指令速度 ⇒ 判定被阻挡
   # 支撑相 shaping
   base_height: -2.0

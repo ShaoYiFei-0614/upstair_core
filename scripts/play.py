@@ -4,7 +4,7 @@
 
 * ``--mode gif``  —— 按课程阶段**逐个**跑 ``play.episodes_gif`` 个回合（默认 10），
   逐帧渲染并叠加 HUD（**含当前速度指令**），编码成 GIF。
-  ⭐ 产物按阶段分目录：``runs/<运行名>/gifs/<批次>/<阶段>_<高度>cm.gif``。
+  ⭐ 产物按批次 / 阶段分目录：``runs/<运行名>/gifs/<批次>/<阶段>/<阶段>.gif``。
   平地级与台阶级都渲染 —— 平地那几级是判断「跟不跟横向/偏航指令」的唯一画面证据。
 * ``--mode eval`` —— 跑 ``play.episodes_eval`` 个回合（默认 100），只统计成功率 /
   摔倒率 / 超时率 / 平均前进。
@@ -48,9 +48,9 @@ from robotdog.config import (  # noqa: E402
     load_config,
 )
 from robotdog.env import EnvConfig, Go2StairsEnv  # noqa: E402
-
-if TYPE_CHECKING:  # pragma: no cover - 只为类型注解
-    from robotdog.curriculum import StageSpec
+# 运行时真的要构造它（``_spec_from_json`` 用 ``summary.json`` 的记录重建口径），
+# 所以不能只放进 TYPE_CHECKING —— 那会让 GIF 模式在读到旧 summary 时抛 NameError。
+from robotdog.curriculum import StageSpec  # noqa: E402
 
 from robotdog.policy import (  # noqa: E402
     ObsNorm,
@@ -506,7 +506,7 @@ def parse_args(argv: Sequence[str] | None = None):
                          "缺省渲染课程的全部级")
     ap.add_argument("--batch", default=None,
                     help="批次标签，覆盖 config.yaml 的 play.batch；"
-                         "产物落 runs/<run>/gifs/<阶段>_<批次>/")
+                         "产物落 runs/<run>/gifs/<批次>/<阶段>/<阶段>.gif")
     ap.add_argument("--gifs-dir", default=None,
                     help="GIF 输出根目录（覆盖 runs/<run>/gifs）")
     return ap.parse_args(argv)
@@ -580,10 +580,34 @@ def _stages_from_run(run_root: Path | None) -> list[dict[str, Any]]:
     return [st for st in (raw.get("stages", []) or []) if st.get("name")]
 
 
-def _spec_from_json(obj: Any) -> StageSpec | None:
-    """按 ``summary.json`` 里记的**逐级实测值**重建一个 :class:`StageSpec`。
+def _plan_entries(run_root: Path | None) -> dict[str, dict[str, Any]]:
+    """读 ``runs/<run>/plan.json``：**每一级实际生效的**指令量程与奖励覆盖。
 
-    只用它来查「这一级当时的下发值」（指令量程、成功口径、预算、学习率）——
+    为什么它优先于 ``summary.json``：后者记的是「这一级跑了多久、学得怎么样」，
+    逐级量程虽然也有，但它是从阶段表抄来的；``plan.json`` 是训练时真正下发到子
+    环境的实施记录，也是唯一记了逐级 ``reward_overrides`` 的地方。旧运行没有
+    这个文件，所以调用方必须能退回 ``summary.json``。读不到就返回空 dict。
+    """
+    if run_root is None:
+        return {}
+    plan = run_root / "plan.json"
+    if not plan.exists():
+        return {}
+    try:
+        raw = json.loads(plan.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if isinstance(raw, list):           # 早期形状：带 name 字段的列表
+        return {str(x["name"]): x for x in raw if isinstance(x, dict) and x.get("name")}
+    if isinstance(raw, dict):
+        return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    return {}
+
+
+def _spec_from_json(obj: Any) -> StageSpec | None:
+    """按 ``summary.json`` / ``plan.json`` 里记的**逐级下发值**重建 :class:`StageSpec`。
+
+    只用它来查「这一级当时的下发值」（指令量程、预算、学习率）——
     地形仍然由权重自带的 ``env.json`` 决定（``stair=...`` 传进环境），所以这里
     的 ``spec`` 字段只是个占位，不参与回放。
 
@@ -599,7 +623,7 @@ def _spec_from_json(obj: Any) -> StageSpec | None:
         else:
             vx_range = (float(raw_vx[0]), float(raw_vx[1]))
         return StageSpec(
-            name=str(obj["name"]),
+            name=str(obj.get("name") or obj.get("stage") or "?"),
             step_height=float(obj.get("step_height", 0.0)),
             spec=stair_from_height(float(obj.get("step_height", 0.0))),
             timesteps=int(obj.get("timesteps", 0)),
@@ -690,7 +714,17 @@ def _stage_plan(cfg: dict[str, Any], play: dict[str, Any], target: PlayTarget,
             heads = ", ".join(f"{st['name']}({float(st.get('step_height', 0.0)) * 100:g}cm)"
                               for st in trained)
             print(f"阶段来自运行目录 summary.json: {heads}")
+            # ``plan.json`` 是逐级下发值的权威记录（含 reward_overrides），
+            # 用它覆盖同名级的字段；旧运行没有这个文件，就纯用 summary.json。
+            plans = _plan_entries(run_root)
+            if plans:
+                print(f"  逐级下发值取自 plan.json（{len(plans)} 级）")
             for obj in trained:
+                if plans.get(str(obj["name"])):
+                    merged = dict(obj)
+                    merged.update({k: v for k, v in plans[str(obj["name"])].items()
+                                   if k != "stage"})
+                    obj = merged
                 name = str(obj["name"])
                 height = float(obj.get("step_height", 0.0))
                 recorded = _spec_from_json(obj)

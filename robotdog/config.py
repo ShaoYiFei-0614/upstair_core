@@ -79,6 +79,41 @@ def _section(raw: Mapping[str, Any], name: str) -> dict[str, Any]:
     return dict(value)
 
 
+#: 非 dataclass 段（``ppo:`` / ``run:`` / ``play:`` / ``curriculum:``）的合法键。
+#: 这些段是脚本自己 ``.get()`` 出来的，没有 ``_apply`` 那种「按 dataclass 字段
+#: 校验」的结构 —— 不额外查一遍的话，``net_arch`` 写成 ``net_arc`` 只会静默用上
+#: 默认值（实测：``config_to_ppo({"ppo": {"ent_coeff": 999.0}})`` 原样返回，
+#: ``config_to_stages({"curriculum": {"height_cm": [...]}})`` 静默退回默认六级）。
+#: 打错键必须当场报错，这是「config.yaml 是唯一超参入口」的前提。
+SECTION_KEYS: dict[str, frozenset[str]] = {
+    "ppo": frozenset({
+        "device", "net_arch", "n_steps", "batch_size", "n_epochs", "gamma",
+        "gae_lambda", "clip_range", "ent_coef", "vf_coef", "max_grad_norm",
+        "target_kl", "log_std_init", "learning_rate", "norm_reward",
+    }),
+    "run": frozenset({"name", "seed", "save_every", "log_every"}),
+    "play": frozenset({
+        "episodes_gif", "episodes_eval", "seed", "gif_max_frames", "stages", "batch",
+    }),
+    "curriculum": frozenset({
+        "tread", "n_up", "heights_cm", "timesteps", "learning_rate",
+        "command_vy_max", "command_yaw_max", "command_vx", "reward_overrides",
+    }),
+}
+
+
+def _check_section_keys(raw: Mapping[str, Any]) -> None:
+    """按 :data:`SECTION_KEYS` 检查四个非 dataclass 段有没有拼错的键。"""
+    for name, valid in SECTION_KEYS.items():
+        section = _section(raw, name)
+        unknown = sorted(k for k in section if k not in valid)
+        if unknown:
+            raise SystemExit(
+                f"config.yaml 的 {name}: 无法识别的键 {unknown}；"
+                f"可用键 = {sorted(valid)}"
+            )
+
+
 def _timesteps(value: Any, n_stages: int, *, where: str) -> list[int]:
     """把 ``timesteps`` 归一化成 ``n_stages`` 个正整数。
 
@@ -185,6 +220,11 @@ def _vx_ranges(value: Any, n_stages: int, *, where: str
             lo, hi = float(item[0]), float(item[1])
             if hi and lo > hi:
                 raise SystemExit(f"{where_item}: vx 区间下界 {lo} 大于上界 {hi}")
+            if not hi and lo > 0.0:
+                raise SystemExit(
+                    f"{where_item}: 上界为 0 表示「用 env.command.vx 定值」，"
+                    f"此时下界必须为 0，实际是 lo={lo} hi={hi}"
+                )
             return (lo, hi)
         raise SystemExit(f"{where_item}: 期望标量或 [lo, hi]，实际是 {item!r}")
 
@@ -208,7 +248,13 @@ def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
 
     没写的键保持 dataclass 默认值，所以配置文件只需要列出你想改的项。
     未知的键（打错的字段名）会报错并列出现有字段。
+
+    顺带把 ``ppo:`` / ``run:`` / ``play:`` / ``curriculum:`` 四个**不是 dataclass**
+    的段的键也查一遍（见 :data:`SECTION_KEYS`）—— 它们是脚本自己 ``.get()`` 的，
+    没有别的地方会拦住拼错的键。``config_to_env`` 是三个脚本共同的第一步，
+    所以校验放在这里，``robotdog/config.py`` 不必再导出第二个入口。
     """
+    _check_section_keys(raw)
     env = _section(raw, "env")
     obs_raw = env.pop("obs", None)       # 嵌套子段，单独处理
     cmd_raw = env.pop("command", None)   # 嵌套子段，单独处理
@@ -466,7 +512,7 @@ def config_to_play(raw: Mapping[str, Any]) -> dict[str, Any]:
     #: 退回当前课程的阶段表。也接受阶段名列表或高度列表（cm）。
     play.setdefault("stages", "auto")
     #: ``play.batch`` —— 这一批 GIF 的标签。用来把「不同批次训练出来的 GIF」
-    #: 分开放：产物落在 ``runs/<run>/gifs/<批次>/<阶段>.gif``。
+    #: 分开放：产物落在 ``runs/<run>/gifs/<批次>/<阶段>/<阶段>.gif``。
     play.setdefault("batch", "")
     return play
 
