@@ -29,6 +29,13 @@ import numpy as np
 # 权重
 # --------------------------------------------------------------------------- #
 
+#: ``vx`` 指令为 0 时，前进跟踪项用来归一化误差的**量程下限** [m/s]。
+#: ``vx`` 是定值基线、没有「采样上界」可借（横向/偏航有 ``vy_max``/``yaw_max``），
+#: 所以要用一个下限把分母撑开。取 0.30 的含义：vx=0 时允许 ±0.30 m/s 的余量
+#: 拿满分，超过 0.30 m/s 归零 —— 与实测「小跑步态自带 0.24 m/s 前进偏置」
+#: 同量级，足以把「别前进」这句话变成有价钱的要求。
+FORWARD_RANGE_FLOOR = 0.30
+
 
 @dataclass
 class RewardConfig:
@@ -39,8 +46,11 @@ class RewardConfig:
     """
 
     # --- 五个要求的项 ----------------------------------------------------- #
-    forward_vel: float = 2.5            # [SPEC] 对 vx 指令的高斯跟踪
-    forward_vel_sigma: float = 0.25     # m/s，高斯的标准差（**平方后作分母**）
+    # ⭐ 形状是「按量程归一化的线性死区」（m11166 起），与 ``lateral_vel`` /
+    # ``yaw_rate`` 一致；量程取 ``max(|cmd.vx|, FORWARD_RANGE_FLOOR)``。
+    # ``forward_vel_sigma`` 因此不再参与计算（保留只为兼容旧配置）。
+    forward_vel: float = 10.0           # [SPEC] 对 vx 指令的线性死区跟踪
+    forward_vel_sigma: float = 0.25     # m/s（历史字段，不再参与计算）
     orientation: float = -1.2           # [SPEC] roll^2 + pitch^2（平方和）
     torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
     foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
@@ -48,11 +58,17 @@ class RewardConfig:
 
     # --- 横向 / 旋转指令跟踪（m08247 新增）--------------------------------- #
     # 只在 ``EnvConfig.command`` 的范围非零时才可能非零（见 compute_reward 里的
-    # ``cmd.on`` 门），所以「只往前走」的阶段与旧行为逐位一致。
-    lateral_vel: float = 4.0            # 对 vy 指令的高斯跟踪
-    lateral_vel_sigma: float = 0.25     # m/s
-    yaw_rate: float = 3.0               # 对 wz 指令的高斯跟踪
-    yaw_rate_sigma: float = 0.25        # rad/s
+    # ``cmd.vy_max`` / ``cmd.yaw_max`` 门），所以「只往前走」的阶段与旧行为
+    # 逐位一致。
+    #
+    # ⭐ 形状是**线性死区**、量纲是「按指令量程归一化的相对误差」，所以下面两个
+    # 权重是「完美跟踪每步得多少分」，``*_sigma`` 不再参与计算（保留只为兼容
+    # 旧配置与文档）。为什么是这个形状、以及为什么权重必须这么大量过三次 ——
+    # 见 ``compute_reward`` 里 ``command_follow`` 那一段的 (a)(b)(c)。
+    lateral_vel: float = 6.0            # 对 vy 指令的线性死区跟踪
+    lateral_vel_sigma: float = 0.25     # m/s（历史字段，不再参与计算）
+    yaw_rate: float = 4.0               # 对 wz 指令的线性死区跟踪
+    yaw_rate_sigma: float = 0.25        # rad/s（历史字段，不再参与计算）
 
     # --- 摆动足抬升 -------------------------------------------------------- #
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
@@ -122,22 +138,41 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     ``experience.md`` §2。
     """
     rc = env.cfg.reward
+    cmd = env.cfg.command
     rpy = env.base_rpy
     lin = env.base_lin_vel_world
     target_height = env.nominal_pose
+    # 指令跟踪读滤波量还是瞬时量，由观测开关决定（两者必须一致，否则策略看到的
+    # 和它被评判的不是同一个数；见下面 1b 的说明）。
+    vel_filter = bool(env.cfg.obs.vel_filter)
 
     terms: dict[str, float] = {}
 
-    # 1) 前进速度奖励 -- 前向速度跟踪 ------------------------------------
-    # ``sigma`` 是**标准差**，所以平方后作分母：vx=0 时 err=0.55 m/s，
-    # 指数是 exp(-(0.55/0.25)^2) = exp(-4.84) ≈ 0.0079，奖励约 +0.02/步，
-    # 而不是原来写成 exp(-err^2/sigma) 时的 +0.72/步。历史那个「没平方」的
-    # 写法等于把 0.55 m/s 的偏差只按 sqrt(0.25)=0.5 m/s 折算，「站着不动」
-    # 因此白拿 +0.86/步，是「原地拖延」局部最优的第一根支柱
-    # （见 experience.md §12）。
-    err = lin[0] - env.cfg.command.vx
-    terms["forward_vel"] = (
-        rc.forward_vel * float(np.exp(-(err * err) / (rc.forward_vel_sigma ** 2)))
+    # 1) 前进速度跟踪 ------------------------------------------------------
+    # ⭐⭐ **一致性**：这一项以前是**高斯核且只拿 ``cfg.command.vx`` 当目标**，
+    # 而 ``vx`` 是**定值基线**、不随回合重抽（``_sample_command`` 返回
+    # ``[cmd._now[0], vy, wz]``）。课程里 ``command_vx = 0.0`` 的那几级因此
+    # 出现了一个致命的自相矛盾：**指令说「别前进」，但没有任何一项惩罚前进**。
+    # 实测代价（`.tmp/eval_cmd_range.py`，cmdtrack4 第 1 级，vx 指令 0）：
+    # 策略以 0.24 m/s 一路向前、13 步就走完 0.5 m；而横向指令 ±0.10 下
+    # 实测只有 ±0.02 m/s。也就是说 45 分的横向跟踪收益，被「顺着先验往前冲」
+    # 白拿的 93 分盖过去了 —— 策略当然选择不跟指令。
+    #
+    # 改成与横向/偏航**同一种形状**（按量程归一化的线性死区），三个方向就都
+    # 是「误差越小分越高、且不动拿不到高分」：
+    #   * 完美跟踪 1.0；原地不动 = 1 − |cmd|/range；
+    #   * vx 指令为 0 时，原地不动拿满分 1.0，**往前冲直接掉分** ——
+    #     「别前进」这句话第一次有了价钱。
+    #
+    # 量程取 ``max(|cmd.vx|, FORWARD_RANGE_FLOOR)``：``vx`` 是定值、没有
+    # 「采样上界」可借（横向/偏航有 ``vy_max``/``yaw_max``），所以要用一个
+    # 下限把「vx=0」时的量程撑开，否则分母为 0。
+    #
+    # ``cmd`` 在上面的取值区已经取出（``cmd = env.cfg.command``）。
+    err = lin[0] - cmd.vx
+    fwd_range = max(abs(float(cmd.vx)), FORWARD_RANGE_FLOOR)
+    terms["forward_vel"] = rc.forward_vel * float(
+        max(0.0, 1.0 - abs(err) / fwd_range)
     )
 
     # 1b) 横向 / 偏航指令跟踪 ---------------------------------------------
@@ -155,17 +190,66 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 策略于是永远学不会偏航。用一条实测确认了后果：course3 的 flat_3 检查点
     # 横向上还有微弱相关性（r=+0.661、斜率 +0.028），偏航则完全为 0
     # （r=−0.085、斜率 −0.006）。求和让两个方向各自都有梯度。
+    follow = 0.0
+    # ⭐ 形状从「高斯核」一路改成「按指令量程归一化的线性死区」，中间试过二次型
+    # （m10954 起）。三段证据缺一不可：
+    #
+    # (a) **高斯核不需要真的跟就能拿高分**。高斯只要求 ``|v - cmd| < 2 sigma``，
+    #     不要求 v 跟 cmd 相关。实测（`.tmp/diag_follow_stepwise.py`，cmdtrack2
+    #     第 1 级检查点）：指令 vy 是 ±0.4 上的均匀分布（std 0.21），策略的滤波
+    #     vy 均值 +0.017、std 0.070 —— **几乎不随指令变化**（跨指令斜率 −0.028），
+    #     但 ``command_follow`` 照样 +0.756/步。它优化的是**分布的巧合**，
+    #     不是相关性；σ 从 0.25 收到 0.08 反而让这种巧合更值钱。
+    # (b) **二次型梯度太小**。换成 ``1 - (err/range)^2`` 后，同一个检查点仍然是
+    #     「站着不动」：`scripts/cmd_demo.py --phase inplace` 实测横向斜率 +0.005、
+    #     相关系数 +0.007，而原地不动在数学上就该拿 2/3 满分（实测单步 2.66 /
+    #     满分 6.0），均回报 2659 ≈ 2.66×1000 —— 与「一动不动」逐位吻合。
+    #     算一下梯度就知道为什么：``dReward/dv = -2W(v-cmd)/range^2``，W=4、
+    #     range=0.4 时是 13.75·(cmd−v)；而 ``|a|`` 变化一个单位大约改 0.435 m/s
+    #     （`.tmp/action_authority.py` 的 scale=0.30 行），所以**每单位动作只有
+    #     约 1.35 分**，比 PPO 的探索噪声大不了多少，策略于是停在原地。
+    # (c) **线性形状把梯度提到与误差无关的常数**：``-W/range``。W=6、range=0.4
+    #     时是每 m/s 15 分 = **每单位动作约 6.5 分**（二次型的 5 倍），而且
+    #     误差很大时也不塌缩成 0（二次型在 ``|err| > range`` 后梯度为 0）。
+    #     代价是多一个折点 —— 这不重要，PPO 只吃梯度方向。
+    #
+    # 量程取**指令自己的上界**，所以它是「相对误差」而不是「绝对误差」：
+    # 完美跟踪对 ±0.4 的均匀指令平均 1.0，原地不动降到 0.5（=−|cmd|/range 的
+    # 期望），且**大指令罚得最重** —— 没有「躲在 0 附近」这条路。
+    #
+    # ``lateral_vel_sigma`` / ``yaw_rate_sigma`` 因此**不再参与计算**，只作为
+    # 历史字段保留在 ``RewardConfig`` 里（配置文件与文档仍会写它们）。
     cmd = env.cfg.command
     follow = 0.0
+    # ⭐ 读**滤波后**的量（``ObsConfig.vel_filter`` 打开时）。
+    #
+    # 起因是一条实测（`.tmp/diag_cmd_jitter.py`）：瞬时 ``yaw_rate`` 在小跑步态下
+    # ``mean = -0.027`` 而 ``std = 0.370 rad/s`` —— 机器人其实**没有转**，但瞬时
+    # 值每秒扫过指令区间几十次，``command_follow`` 照样给 +0.81/步（整回合
+    # 净位移 Δy 只有 +0.05 m）。也就是说判据当时读的是「步态摆动」，不是
+    # 「机器人在往哪走」。滤波时间常数 ``cfg.vel_filter_tau``（默认 0.2 s）压掉
+    # 一个步态周期，同时把同一个量放进观测以保持马尔可夫性。
+    #
+    # 这也是「奖励项上线前要量噪声底」（experience.md §16）的第三次翻版：
+    # 前两次是可达性（§15）与抖动的导数（§16），这一次是**被测量本身不合格** ——
+    # 物理上正确的瞬时量不一定是判据该读的量。
     if cmd.vy_max:
-        vy_err = env.base_lin_vel_body[1] - cmd.vy
+        vy = (env.filtered_lateral_vel if vel_filter else env.base_lin_vel_body[1])
         follow += rc.lateral_vel * float(
-            np.exp(-(vy_err * vy_err) / (rc.lateral_vel_sigma ** 2))
+            max(0.0, 1.0 - abs(vy - cmd.vy) / float(cmd.vy_max))
         )
     if cmd.yaw_max:
-        yaw_err = env.yaw_rate - cmd.wz
+        wz = env.filtered_yaw_rate if vel_filter else env.yaw_rate
+        yaw_err = abs(wz - cmd.wz)
+        # ⭐ 除了「跟指令」这一段，再补一个**零指令基线惩罚**（只在 ``wz=0``
+        # 时生效）。原因是实测：cmdtrack4 第 1 级只练横向（``yaw_max=0``），
+        # 策略却能以 −0.10~−0.20 rad/s 稳定自转（`cmd_demo --phase inplace`
+        # 的「站住」段实测 wz=−0.200），因为那一级**没有任何一项读 wz**。
+        # 带上这个基线后，「指令让我不转」和「指令让我转」都有价钱。
+        if cmd.wz == 0.0:
+            yaw_err = 0.5 * (yaw_err + abs(wz))
         follow += rc.yaw_rate * float(
-            np.exp(-(yaw_err * yaw_err) / (rc.yaw_rate_sigma ** 2))
+            max(0.0, 1.0 - yaw_err / float(cmd.yaw_max))
         )
     terms["command_follow"] = follow
 

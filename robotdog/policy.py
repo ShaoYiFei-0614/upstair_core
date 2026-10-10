@@ -300,7 +300,7 @@ def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
     """
     from itertools import product
 
-    flags = ("base_lin_vel_body", "gait_phase", "step_height", "command")
+    flags = ("base_lin_vel_body", "gait_phase", "step_height", "command", "vel_filter")
     for combo in product((False, True), repeat=len(flags)):
         cand = ObsConfig(history_len=history_len, **dict(zip(flags, combo)))
         if cand.size == total:

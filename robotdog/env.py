@@ -66,6 +66,7 @@ class ObsConfig:
     gait_phase: bool = False            # 2：步态时钟的 sin/cos
     step_height: bool = True            # 1：本回合的楼梯高度
     command: bool = True                # 2：横向速度指令 + 偏航角速度指令
+    vel_filter: bool = False            # 2：机身系横向速度 / 偏航角速度的**低通量**
     base_frame_size: int = 42
 
     def __post_init__(self) -> None:
@@ -89,6 +90,7 @@ class ObsConfig:
         extra += 2 if self.gait_phase else 0
         extra += 1 if self.step_height else 0
         extra += 2 if self.command else 0
+        extra += 2 if self.vel_filter else 0
         return self.base_frame_size + extra
 
     @property
@@ -163,6 +165,10 @@ class EnvConfig:
     # 它们是**盲走允许的信息**：指令由操作者/上游规划器给出，不含地形真值，
     # 与 ``command_vx`` 同源（见 agent.md §8.6 的信息来源清单）。
     command: CommandConfig = field(default_factory=CommandConfig)
+    # 横向速度 / 偏航角速度的低通时间常数 [s]。见 ``ObsConfig.vel_filter``：
+    # 小跑步态本身带 ±0.37 rad/s 的偏航摆动，瞬时量根本不是「机器人在往哪走」，
+    # 0.2 s（10 个控制步）足以压掉一个步态周期而仍能跟上指令变化。
+    vel_filter_tau: float = 0.2
 
     # --- 开环步态之上的残差 RL --------------------------------------------- #
     # PD 目标变为 home + gait_gain * gait.radians(t) + action_scale * action
@@ -264,6 +270,15 @@ class Go2StairsEnv(gym.Env):
         self._probe_count = 0
         self._probe_best = 0.0
         self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
+
+        # 低通滤波后的横向速度 / 偏航角速度（见 ``ObsConfig.vel_filter`` 与
+        # ``reward.py`` 的 ``command_follow``）。一阶 IIR：
+        # ``y += alpha * (x - y)``，``alpha = dt / tau`` 且限制在 (0, 1]。
+        # ``reset()`` 里用第一步的瞬时值做初值，避免开头几十毫秒从 0 慢慢爬。
+        tau = max(1e-6, float(self.cfg.vel_filter_tau))
+        self._vel_alpha = min(1.0, self.cfg.control_dt / tau)
+        self.filtered_lateral_vel = 0.0
+        self.filtered_yaw_rate = 0.0
 
         self._success_x = self._success_target_x()
         self.nominal_pose = float(self.meta.home_qpos[2])  # 0.27 m 站立高度
@@ -549,6 +564,17 @@ class Go2StairsEnv(gym.Env):
             # 横向 / 偏航指令。这是**允许进入观测**的：指令来自操作者或上游
             # 规划器，不含地形真值（与 vx 同源，见 agent.md §8.6）。
             parts.append(self._command[1:].copy())
+        if obs_cfg.vel_filter:
+            # ⭐ 滤波后的横向速度 / 偏航角速度（低通时间常数 ``cfg.vel_filter_tau``）。
+            #
+            # 为什么必须和奖励一起看：奖励读的是同一个量（见 reward.py 的
+            # ``command_follow``）。瞬时 ``yaw_rate`` 在小跑步态下会被步态本身
+            # 的摆动主导 —— 实测 ``mean = -0.027 rad/s`` 而 ``std = 0.370``，
+            # 也就是说「机器人其实没有转」，但瞬时值每秒扫过指令区间几十次，
+            # 判据照样每步给分（实测 ``command_follow = +0.81/步``，而净位移
+            # Δy 只有 +0.05 m）。只改奖励不改观测会把滤波器的内部状态藏起来、
+            # 破坏马尔可夫性，所以这两项必须成对出现。
+            parts.append(np.array([self.filtered_lateral_vel, self.filtered_yaw_rate]))
         return np.concatenate(parts).astype(np.float64)
 
     def _observation(self) -> np.ndarray:
@@ -836,6 +862,10 @@ class Go2StairsEnv(gym.Env):
         self._gait_t = 0.0
         self._gait_phase = 0.0
         self._hist.clear()
+        # 滤波器用「回合第一步的瞬时值」做初值：从 0 开始爬会白白浪费开头一段，
+        # 而 reset 时机器人是站在原地的，瞬时值本身就是合理的初值。
+        self.filtered_lateral_vel = float(self.base_lin_vel_body[1])
+        self.filtered_yaw_rate = float(self.yaw_rate)
         frame = self._obs_frame()
         for _ in range(self.cfg.obs.history_len):
             self._hist.append(frame.copy())
@@ -899,6 +929,13 @@ class Go2StairsEnv(gym.Env):
         self._track_swing_peak(foot_contact)
         self._update_probe_state(foot_contact)
         terminated, truncated = self._terminated(trunk_contact, leg_contact)
+
+        # 低通滤波必须在奖励之前推进：``command_follow`` 读的就是这两个量，
+        # 观测里报的也是它们（见 ``ObsConfig.vel_filter``）。
+        alpha = self._vel_alpha
+        self.filtered_lateral_vel += alpha * (
+            float(self.base_lin_vel_body[1]) - self.filtered_lateral_vel)
+        self.filtered_yaw_rate += alpha * (float(self.yaw_rate) - self.filtered_yaw_rate)
 
         # 目标终止。到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出
         # 楼梯远端摔下去。``_reached_top`` 在回合内是粘性的，所以更早某一步
