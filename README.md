@@ -127,7 +127,7 @@ upstair_core/
 | `action_scale` | 0.30 rad | 残差的权限；先验走 `GaitParams.action_scale`，**两者独立** |
 | 增益 `kp` / 阻尼 `kd` | `[30, 30, 45]` / `[0.6, 0.6, 0.9]` | 关节 PD，力矩 `tau = kp*(target-q) - kd*qd` 后按 `ctrlrange` 截断；选型依据见下 |
 
-目标角（`robotdog/env.py:893-911` 的 `_target_from_action()`）：
+目标角（`robotdog/env.py` 的 `_target_from_action()`）：
 
 ```python
 target = home + gait_gain * gait.radians(phase) + action_scale * action
@@ -141,8 +141,8 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 #### `kp` / `kd` 是怎么定的
 
 `kp` / `kd` 是**关节 PD** 的增益（`tau = kp*(target-q) - kd*qd`），每条腿三个（hip / thigh / calf）
-再 `tile(..., 4)` 成 12 维（`robotdog/env.py:253-254` 的 `self._kp` / `self._kd`；
-增益本身的定义在 `robotdog/env.py:178-179` 的 `kp` / `kd` 元组）。它们不是拍脑袋的，而是按**实测关节惯量**
+再 `tile(..., 4)` 成 12 维（`robotdog/env.py:267-268` 的 `self._kp` / `self._kd`；
+增益本身的定义在 `robotdog/env.py:187-188` 的 `kp` / `kd` 元组）。它们不是拍脑袋的，而是按**实测关节惯量**
 配到目标带宽与阻尼比上的。用 `mujoco.mj_fullM(model, data, M)`（mujoco 3.12 的签名是
 `mj_fullM(model, data, dst)`）在 `home_qpos` 姿态下取关节空间惯量的对角元 `J`：
 
@@ -220,13 +220,14 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 
 两个关键点：
 
-* **所有奖励数学都在 `robotdog/reward.py`**（纯函数 `compute_reward(env, ...)`），
-  `robotdog/env.py:585-596` 只留一个转发方法。为了便于研究与改动，单看那一个文件就够。
+* **所有奖励数学都在 `robotdog/reward.py`**（`compute_reward(env, ...)`；它会写环境的
+  三个记忆字段，见该模块 docstring），`robotdog/env.py:611-622` 的 `_compute_reward()`
+  只留一个转发方法。为了便于研究与改动，单看那一个文件就够。
 * 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
   （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
   拆解可以安全地相加。
 * **成功/终止的权重被刻意放大**（`success=+50.0` / `termination=-15.0`，都在
-  `robotdog/reward.py:106-108`）。这是实测能让 PPO 残差
+  `robotdog/reward.py:101-102`）。这是实测能让 PPO 残差
   幅度增长的最强杠杆。
 
 #### 指令跟踪项 `command_follow`
@@ -248,11 +249,11 @@ if yaw_max > 0:
 **门控 `if vy_max > 0` 是必须的，不是优化**：不加门控时，机器人直走时
 `vy_actual ≈ 0`、`wz_cmd = 0`，两项误差都只有指令量程的零头，等于**每步白拿接近满分**
 —— 实测 5 cm 上 125 步拿到 `lateral_vel=+139.73`，又是一条「原地拖延」正项。
-加门控后该阶段恒为 `+0.000e+00`（逐位精确零）。权重在 `robotdog/reward.py:68-71`：
+加门控后该阶段恒为 `+0.000e+00`（逐位精确零）。权重在 `robotdog/reward.py:68-69`：
 `lateral_vel = 6.0`、`yaw_rate = 4.0`；`lateral_vel_sigma` / `yaw_rate_sigma`（各 0.25）
-是改线性死区之前的高斯宽度，**现在不再参与计算**，只为读旧配置保留。
+是改线性死区之前的高斯宽度；这两个字段与 `forward_vel_sigma` 一起**已经全部删除**（`RewardConfig` 里不再有它们）。
 另外 `wz_cmd == 0` 时会给 `yaw_err` 补一个基线惩罚（`yaw_err = 0.5*(yaw_err + |wz|)`，
-`robotdog/reward.py:244-250`）—— 否则「命令我不许转」没有任何价钱。
+`robotdog/reward.py:189-193`）—— 否则「命令我不许转」没有任何价钱。
 
 注意 `yaw_rate` 读的是**机体系**偏航角速度 `(Rᵀ qvel[3:6])[2]`，**不是** `qvel[5]`，
 **也不是**世界系公式 `wz + tan(pitch)·(cos(yaw)·wx + sin(yaw)·wy)`。世界系公式在数学上
@@ -476,23 +477,23 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 
 | 文件 | 行数 | 说明 |
 | --- | --- | --- |
-| `robotdog/env.py` | **1066** | 环境 + 观测 + 指令 + 终止 + 渲染（奖励数学已移出） |
-| `robotdog/go2_model.py` | 460 | MJCF 组装 / 场景编译 / 元信息 |
-| `robotdog/config.py` | **443** | 读 `config.yaml`（含指令课程 / 奖励课程 / 播放阶段） |
-| `robotdog/policy.py` | 341 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
-| `robotdog/curriculum.py` | **332** | 课程数据类 + 汇总写出 |
+| `robotdog/env.py` | **1101** | 环境 + 观测 + 指令 + 终止 + 渲染（奖励数学已移出） |
+| `robotdog/go2_model.py` | 467 | MJCF 组装 / 场景编译 / 元信息 |
+| `robotdog/config.py` | **527** | 读 `config.yaml`（含指令课程 / 奖励课程 / 播放阶段） |
+| `robotdog/policy.py` | 339 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
+| `robotdog/curriculum.py` | **339** | 课程数据类 + 汇总写出 |
 | `robotdog/training.py` | 323 | 向量环境 / PPO / 运行目录 / 权重加载 |
-| `robotdog/reward.py` | **375** | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
-| `robotdog/tools/terrain.py` | 242 | 楼梯几何 |
+| `robotdog/reward.py` | **323** | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
+| `robotdog/tools/terrain.py` | 287 | 楼梯几何 |
 | `robotdog/gait.py` | 191 | 开环 trot 先验 |
 | `robotdog/tools/paths.py` | **38** | 路径常量（**没有任何函数**） |
 | `robotdog/tools/console.py` | 29 | UTF-8 控制台 |
 | `robotdog/__init__.py` / `tools/__init__.py` | 19 / 18 | 包入口 |
-| `scripts/play.py` | **665** | 评估 / GIF（按课程阶段逐个渲染 + 速度指令 HUD） |
-| `scripts/train.py` | **396** | 训练入口（CLI 只剩 `--run-name` / `--config`） |
-| `scripts/teleop.py` | **288** | 外部控制器演示（遥控操控 + 指令课程消费方） |
+| `scripts/play.py` | **856** | 评估 / GIF（按课程阶段逐个渲染 + 速度指令 HUD） |
+| `scripts/train.py` | **411** | 训练入口（CLI 只剩 `--run-name` / `--config`） |
+| `scripts/teleop.py` | **338** | 外部控制器演示（遥控操控 + 指令课程消费方） |
 | `scripts/download_go2.py` | 152 | 拉取 Go2 模型资源 |
-| `scripts/cmd_demo.py` | 192 | 指令跟踪的量化评估（`--phase inplace\|walk`） |
+| `scripts/cmd_demo.py` | 200 | 指令跟踪的量化评估（`--phase inplace\|walk`） |
 
 ### 6.2 清理掉了哪些（本轮）
 
@@ -516,22 +517,21 @@ SB3 `BaseCallback` 钩子）、文档化的公开 API（`GaitParams.static()` / 
 > 变成零调用点。但「换地形」本身是真需求（当前课程每级是 `make_vec_env` 新建环境，
 > 不是换地形），所以保留。
 
-### 6.3 `env.py` 为什么还有 895 行
+### 6.3 `env.py` 为什么还有 1101 行
 
-它不是「奖励算在里面」——奖励数学在 `robotdog/reward.py`（375 行）。`env.py` 的构成是：
+它不是「奖励算在里面」——奖励数学在 `robotdog/reward.py`（323 行）。`env.py` 的构成是：
 
 | 类别 | 行数 | 占比 |
 | --- | --- | --- |
-| 代码 | 496 | 55.4% |
-| docstring | 217 | 24.2% |
-| 注释 | 84 | 9.4% |
-| 空行 | 140 | 15.6% |
+| 代码 | 595 | 54.0% |
+| docstring | 261 | 23.7% |
+| 注释 | 137 | 12.4% |
+| 空行 | 108 | 9.8% |
 
-其中 `class Go2StairsEnv` 一个类占 **684 行**（代码 477），最大的成员是
-`step()`（68 行）、`render()`（59 行）、`__init__()`（54 行）、`reset()`（46 行）、
-`_contact_flags()`（37 行）。本轮加的指令基础设施（`CommandConfig` 49 行 +
-`_sample_command` / `set_commands` / `set_command_now` / `yaw_rate` 约 70 行）占了
-增加的近 200 行。
+其中 `class Go2StairsEnv`（`robotdog/env.py:240-1101`）一个类占 **862 行**（代码 501，docstring 213），最大的成员是
+`step()`（88 行）、`__init__()`（87 行）、`render()`（59 行）、`reset()`（55 行）、
+`_contact_flags()`（37 行）。本轮加的指令基础设施（`CommandConfig` 57 行 +
+`_sample_command` / `set_commands` / `set_command_now` / `yaw_rate` 共 79 行）在类里占了 136 行。
 
 长的原因有三条，都是**有意的**：
 
@@ -570,9 +570,10 @@ SB3 `BaseCallback` 钩子）、文档化的公开 API（`GaitParams.static()` / 
 
 `check_lines.py` **只报症状不报病因**——两个盲点：①发现不了「文档描述了一个不存在的
 API」；②发现不了「行号整体漂移但没越界」（源文件里加一段 docstring 就会造成这种情况，
-本轮就踩到了：`robotdog/env.py` 的 `set_stair` docstring 加长 5 行，全仓 14 处
-`env.py:531` / `env.py:827` 全部指到了别的函数）。`ref_truth.py` 就是为第 ② 个盲点写的：
-它把每条引用的**真实行内容**打出来，指到 `def`/`class` 就报警。所以改了公开 API 之后
-仍要人工读一遍对应文档。完整的验证流程（含训练/播放冒烟与奖励改动的等价性证明）
+本轮就踩到了：给 `robotdog/env.py` 的某个方法 docstring 加长 5 行，全仓 14 处
+`robotdog/env.py` 行号引用**全部指到了别的函数**，而它们每一行都还是合法的非空行）。
+`ref_truth.py` 就是为第 ② 个盲点写的：它**现算**每条引用指向的那一行是什么、指到
+`def`/`class` 就报警，所以不需要任何手工维护的期望值。即便有它，改了公开 API 之后
+仍要人工读一遍对应文档；完整的验证流程（含训练/播放冒烟与奖励改动的等价性证明）
 见 [`agent.md`](agent.md) §7。
 

@@ -6,6 +6,10 @@ configs/
 .generated/
 .tmp/
 
+# MuJoCo 在数值发散时往 CWD 写这个日志；它是产物不是源码，内容随时会被下次
+# 运行覆盖。以前它被误提交进版本库，带着一条 2026-10-10 的 QACC 发散警告。
+MUJOCO_LOG.TXT
+
 # 渲染中间产物；交付物 output/gifs/ 要留
 output/stills/
 output/frames/

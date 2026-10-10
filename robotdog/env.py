@@ -226,10 +226,6 @@ class EnvConfig:
     # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
-    # 逐级奖励覆盖：``config.yaml`` 的 ``curriculum.reward_overrides`` 会按阶段
-    # 填这里，``config_to_env`` 与 ``set_reward_overrides()`` 把它叠到 ``reward``
-    # 上。默认空 ⇒ 与没有这个机制时逐位一致。
-    reward_overrides: dict[str, float] = field(default_factory=dict)
 
     @property
     def control_dt(self) -> float:
@@ -276,7 +272,6 @@ class Go2StairsEnv(gym.Env):
         self._prev_action = np.zeros(self.num_act, dtype=np.float64)
         self._last_action = np.zeros(self.num_act, dtype=np.float64)
         self._step_count = 0
-        self._start_terrain_height = 0.0
         # 本回合机身正下方地形曾达到的最大高度，用于「爬升进展」的一次性
         # 结算（见 ``robotdog/reward.py`` 的 ``stair_progress``）。
         self._peak_terrain_height = 0.0
@@ -286,7 +281,7 @@ class Go2StairsEnv(gym.Env):
         self._blocked = False
         self._blocked_peak = 0.0
         self._probe_count = 0
-        self._probe_best = 0.0
+        self._probe_best = np.zeros(len(self.meta.foot_geom_ids))
         self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
 
         # 低通滤波后的横向速度 / 偏航角速度（见 ``ObsConfig.vel_filter`` 与
@@ -316,6 +311,25 @@ class Go2StairsEnv(gym.Env):
         self._render_cam = None
         self._scene_option = None
         self._render_size = None
+
+        # ``observation_space`` 在构造时就冻住了 ``cfg.obs.size``，而
+        # ``reset()`` 返回的是「``_obs_frame()`` 的真实宽度 × history_len」。两者
+        # 唯一的同步机制是 ``ObsConfig`` 的开关与 ``cfg.obs.size`` 一致 —— 一旦
+        # 有人构造完再动开关，这个错会一路拖到 PPO 内部，以
+        # ``ValueError: Observation spaces do not match`` 的形式爆出来。所以这里
+        # 就地验一次：现造一帧（``_obs_frame`` 只依赖已经初始化好的属性），拿真实
+        # 宽度直接和冻结的观测空间比。
+        frame_size = int(self._obs_frame().shape[0])
+        real_size = frame_size * int(self.cfg.obs.history_len)
+        frozen = int(self.observation_space.shape[0])
+        if real_size != frozen:
+            raise ValueError(
+                f"观测维度不自洽：observation_space 是 {frozen} 维，但按当前 obs 开关"
+                f"算出来是每帧 {frame_size} 维 × history_len="
+                f"{self.cfg.obs.history_len} = {real_size} 维。"
+                f"请用 robotdog.config.config_to_env() 构造配置，构造之后不要再改 obs 的开关。"
+            )
+
 
     # ------------------------------------------------------------------- 构建
 
@@ -819,7 +833,10 @@ class Go2StairsEnv(gym.Env):
         if mode == "support_mean":
             return self._support_height_mean()
         if mode != "support":
-            return self.terrain_height_under_base
+            raise ValueError(
+                f"未知的 terminate_height_ref {self.cfg.terminate_height_ref!r}，"
+                f"可选 'support'（四足下方最低地形，默认）或 'support_mean'。"
+            )
         return self._support_height()
 
     def _terminated(self, trunk_contact: bool, leg_contact: bool) -> tuple[bool, bool]:
@@ -861,7 +878,6 @@ class Go2StairsEnv(gym.Env):
         mujoco.mj_forward(self.model, self.data)
 
         self.nominal_pose = float(self.meta.home_qpos[2])
-        self._start_terrain_height = self.terrain_height_under_base
         self._peak_terrain_height = self.terrain_height_under_base
         self._prev_action = np.zeros(self.num_act)
         self._last_action = np.zeros(self.num_act)

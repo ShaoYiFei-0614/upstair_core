@@ -72,7 +72,7 @@ DummyVecEnv → VecMonitor → VecNormalize
 ### 3.5 换地形是**整环境重建**，不是原地替换
 
 课程每一级都新建一整套向量环境：`scripts/train.py` 调
-`trainer.make_env(stage, warm_start=warm)`（`scripts/train.py:282`），它内部走
+`trainer.make_env(stage, warm_start=warm)`（`scripts/train.py:159`），它内部走
 `make_vec_env(stair, n_envs, cfg=..., seed=...)` → `DummyVecEnv([make_env_fn(...)])`
 → `VecMonitor` → `VecNormalize`。换级时**旧的整个包装链被丢掉**（`venv.close()`），
 新链上的 `VecNormalize` 统计量要么来自权重自带的 `*_vecnormalize.pkl`

@@ -288,7 +288,7 @@ write_summary(path, stages, results, meta)
   `Path(dict)` 处抛 `TypeError`，不会静默走错分支。
 * **本模块不再有 `Curriculum` / `StageTrainer` / `default_curriculum`**。
   在旧文档或旧脚本里看到这些名字，一律是过期引用。已知残留一处：
-  `scripts/train.py:124` 的 `Trainer` docstring 仍写「实现
+  `scripts/train.py:135` 的 `Trainer` docstring 仍写「实现
   `robotdog.curriculum.StageTrainer` 协议」——该协议已删，这句是历史残留
   （Sphinx `:class:` 引用会因此解析失败），不影响运行。
 

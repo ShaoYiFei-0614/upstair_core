@@ -93,6 +93,41 @@ class StairSpec:
     rgba: str = DEFAULT_STAIR_RGBA
     name_prefix: str = "stair"
 
+    def __post_init__(self) -> None:
+        """拒绝会生成非法 MJCF 或算术上无意义的参数。
+
+        这些组合过去都不会在这里报错，而是各自以更晚、更难懂的方式失败：
+
+        * ``n_up > 0`` 且 ``step_height <= 0`` —— 生成 ``n_up`` 个**零高度**的
+          box，MuJoCo 在编译期抛 ``ValueError: size 2 must be positive in
+          geom``（错误信息里只有 geom 名字，看不到是 ``step_height`` 没给）。
+        * ``tread <= 0`` —— :meth:`height_at` 的 ``// self.tread`` 直接
+          ``ZeroDivisionError: float floor division by zero``。
+        * ``n_down > 0`` 且 ``landing <= 0`` —— 下降段与上升段重叠。
+
+        注意 ``flat_spec()`` 走的正是 ``n_up = n_down = 0``（它把两个级数设为
+        0 而不是把 ``step_height`` 设为 0），所以平地段不受这些校验影响。
+        """
+        if self.n_up > 0 and self.step_height <= 0.0:
+            raise ValueError(
+                f"step_height 必须 > 0（n_up={self.n_up}）：零高度的台阶会生成"
+                f"零高度的 box，MuJoCo 编译期会以 size 2 must be positive 失败。"
+                f"只要平地请用 flat_spec()。"
+            )
+        if self.n_down > 0 and self.step_height <= 0.0:
+            raise ValueError(
+                f"step_height 必须 > 0（n_down={self.n_down}）：同上。"
+            )
+        if self.tread <= 0.0:
+            raise ValueError(f"tread 必须 > 0，实际 {self.tread}。")
+        if self.width <= 0.0:
+            raise ValueError(f"width 必须 > 0，实际 {self.width}。")
+        if self.n_down > 0 and self.landing <= 0.0:
+            raise ValueError(
+                f"n_down > 0 时 landing 必须 > 0，实际 {self.landing}："
+                f"否则下降段会与上升段重叠。"
+            )
+
     # ---- 派生几何 -------------------------------------------------------------- #
 
     @property
@@ -211,8 +246,18 @@ class StairSpec:
 
 #: 只有平地 —— 课程的第一级。
 def flat_spec(**kw) -> StairSpec:
+    """平地。
+
+    三个字段必须一起归零：``n_up = n_down = 0`` 让 :meth:`StairSpec.step_blocks`
+    一个方块都不生成；``step_height = 0`` 则让地形观测里的台阶高读数真的是 0
+    （否则会留下 ``StairSpec`` 的 5 cm 默认值，观测里凭空多出一个台阶）。
+
+    ``top_landing`` 归零是可选的优化：``n_up = 0`` 时 :meth:`step_blocks` 的
+    收尾分支本来就被 :meth:`StairSpec.__post_init__` 之外的 ``n_up > 0`` 判据挡住。
+    """
     kw.setdefault("n_up", 0)
     kw.setdefault("n_down", 0)
+    kw.setdefault("step_height", 0.0)
     return StairSpec(**kw)
 
 

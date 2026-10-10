@@ -29,7 +29,7 @@
 ### D1 —— 控制台修复由脚本显式调用，不做成 import 副作用
 
 本文件**只导入** `setup_utf8_console`，不调用它。真正调用它的是
-`scripts/train.py:294` 与 `scripts/play.py:601`，两处都在 `main()` 的第一行。
+`scripts/train.py:303` 与 `scripts/play.py:781`，两处都在 `main()` 的第一行。
 
 **为什么不做成 import 副作用**：`setup_utf8_console()` 会改进程级的
 `sys.stdout` / `sys.stderr`。把它挂在包导入上，意味着任何第三方
@@ -80,7 +80,7 @@ Windows 上重定向到文件/管道时 `sys.stdout.encoding` 退化为 cp936，
 
 ### `setup_utf8_console() -> None`（重导出）
 
-真身在 `robotdog/tools/console.py:18`。语义、参数、异常详见
+真身在 `robotdog/tools/console.py:18` 的 `def setup_utf8_console()`。语义、参数、异常详见
 `docs/robotdog/tools/console.md`，本文不重复：它**不返回值**、**不抛异常**，
 对 `("stdout", "stderr")` 逐个执行 `reconfigure(encoding="utf-8", errors="replace")`。
 
@@ -147,7 +147,7 @@ import robotdog
 * **下游**：`robotdog.tools`（`console` / `paths` / `terrain`）。
 * **绝不指向**：`robotdog.env` 及其任何依赖（D2）。
 * **被谁触发**：任何 `import robotdog.*` 都会先执行本文件（Python 包语义）。
-* **被谁显式调用**：`scripts/train.py:294`、`scripts/play.py:601`（`setup_utf8_console()`）。
+* **被谁显式调用**：`scripts/train.py:303`、`scripts/play.py:781`（`setup_utf8_console()`）。
 
 ## 8. 实测与经验教训
 

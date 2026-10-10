@@ -161,7 +161,7 @@ raw: dict
    │     ├── env.obs.*  → ObsConfig 字段（_apply）
    │     ├── env.command.* → CommandConfig 字段（_apply + __post_init__）
    │     └── gait_file  → load_gait（仅 gait_prior=true 时）
-   ├── reward:      cfg.reward ← _apply（在 config_to_env 内，robotdog/config.py:185；字段定义在 robotdog/reward.py）
+   ├── reward:      cfg.reward ← _apply（在 config_to_env 内，robotdog/config.py:246；字段定义在 robotdog/reward.py）
    ├── ppo:         config_to_ppo    → dict（原样透传）
    └── play:        config_to_play   → dict（补渲染默认值）
 ```
@@ -197,7 +197,7 @@ raw: dict
   常量）、`robotdog.gait`（`load_gait`）、`robotdog.tools.terrain`（造地形）、
   `robotdog.tools.paths`（定位仓根与先验文件）、第三方 `yaml`。
   奖励字段（`reward:` 段）定义在 `robotdog/reward.py`，但本模块**不直接 import 它**：
-  靠 `robotdog/env.py:37` 的重导出，`_apply(cfg.reward, ...)`（`robotdog/config.py:185`）
+  靠 `robotdog/env.py:37` 的重导出，`_apply(cfg.reward, ...)`（`robotdog/config.py:296`）
   就能工作 —— 依赖方向仍是 `config.py → env.py → reward.py`，没有新增边。
 * **被依赖** `scripts/train.py`（`config_to_run` / `config_to_env` / `config_to_stages` /
   `config_to_ppo` / `n_envs`）与 `scripts/play.py`（`config_to_play`）。

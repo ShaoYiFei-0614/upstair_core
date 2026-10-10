@@ -62,7 +62,7 @@ if reconfigure is None:
 ### 3.5 调用点是脚本，不是 `robotdog/__init__.py`
 
 `robotdog/__init__.py:15` 只**导入**它、**从不调用**它。真实调用点是
-`scripts/train.py:294` 与 `scripts/play.py:601`，两处都在 `main()` 的第一行。
+`scripts/train.py:302` 与 `scripts/play.py:780`，两处都在 `main()` 的第一行。
 
 理由：编码必须在**任何输出发生之前**生效，而脚本的 `main()` 第一行正是这个确定位置；
 放成包导入的副作用会让「导入一个纯数据模块」改进程 I/O，范围超出合理预期（见
@@ -103,7 +103,7 @@ def setup_utf8_console() -> None:
             pass
 ```
 
-（`robotdog/tools/console.py:18-29`。模块 docstring 在 `:1-9`，`__all__` 在 `:15`。）
+（`robotdog/tools/console.py:15`。模块 docstring 在 `:1-9`，`__all__` 在 `:15`。）
 
 | 项 | 值 |
 | --- | --- |
@@ -124,7 +124,7 @@ def setup_utf8_console() -> None:
 
 ```
 scripts/train.py:55   from robotdog.tools import console  # noqa: E402
-scripts/train.py:294  console.setup_utf8_console()        # main() 的第一条语句
+scripts/train.py:302  console.setup_utf8_console()        # main() 的第一条语句
   → setup_utf8_console()
       → for stream_name in ("stdout", "stderr")
           → getattr(sys, stream_name, None)          # 得到 TextIOWrapper 或 None
@@ -134,12 +134,12 @@ scripts/train.py:294  console.setup_utf8_console()        # main() 的第一条�
           → except (ValueError, OSError): pass
 ```
 
-`scripts/play.py:49` 精确导入同一个模块，`scripts/play.py:601` 在 `main()` 的第一行
+`scripts/play.py:780` 精确导入同一个模块，`scripts/play.py:780` 在 `main()` 的第一行
 以同样方式调用：
 
 ```
 scripts/play.py:48    from robotdog.tools import console, paths  # noqa: E402
-scripts/play.py:601   console.setup_utf8_console()               # main() 的第一条语句
+scripts/play.py:780   console.setup_utf8_console()               # main() 的第一条语句
 ```
 
 **没有任何「靠导入触发」的路径**：`import robotdog` 只执行
@@ -167,7 +167,7 @@ scripts/play.py:601   console.setup_utf8_console()               # main() 的第
 | 位置 | 用法 | 方向理由 |
 | --- | --- | --- |
 | `robotdog/__init__.py:15` | **只导入，不调用** | 供 `from robotdog import setup_utf8_console` 使用；导入本身不产生副作用，所以 `import robotdog` 不会改进程 I/O |
-| `scripts/train.py:55, 294` | 显式导入模块并在 `main()` 首行调用 | 独立脚本可能不经 `import robotdog` 启动，所以自己兜一次（幂等） |
+| `scripts/train.py:302, 294` | 显式导入模块并在 `main()` 首行调用 | 独立脚本可能不经 `import robotdog` 启动，所以自己兜一次（幂等） |
 | `scripts/play.py:48, 449` | 同上 | 同上 |
 
 **为什么方向是「工具层被所有人依赖」**：编码修复是最底层的横切关注点，它不需要任何项目知识，因此可以放在依赖图的最底端被所有层调用；反过来它绝不 import 任何项目模块，否则就从最底端变成环的一环。

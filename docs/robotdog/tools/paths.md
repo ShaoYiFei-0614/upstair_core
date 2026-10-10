@@ -145,9 +145,9 @@ Path(__file__).resolve()                          # <ws>/robotdog/tools/paths.py
 
 ```text
 [编译场景] robotdog/go2_model.py:38 from robotdog.tools.paths import GO2_ASSETS_DIR, GO2_XML
-           robotdog/go2_model.py:405（函数内延迟导入）from robotdog.tools.paths import GENERATED_DIR
-           robotdog/go2_model.py:407 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-                                :408 dump = GENERATED_DIR / "failed_scene.xml"
+           robotdog/go2_model.py:412（函数内延迟导入）from robotdog.tools.paths import GENERATED_DIR
+           robotdog/go2_model.py:414 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+                                :415 dump = GENERATED_DIR / "failed_scene.xml"
 
 [实验产物] robotdog/training.py:37 from robotdog.tools.paths import RUNS_DIR
            robotdog/training.py:256 self.root = Path(root) if root else (RUNS_DIR / name)

@@ -328,6 +328,13 @@ def extract_meta(model: mujoco.MjModel) -> Go2Meta:
     home_qpos[qpos_joint_adr] = home_joint_angles
 
     floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    # ``mj_name2id`` 找不到名字时返回 ``-1``。不把它剔掉的话，下面 terrain_ids
+    # 会把 -1 当成「最后一个 geom」并进地形集合，于是某一条腿的碰撞 geom 被静默
+    # 当成地面，接触判定与奖励全都错。宁可在这里就炸。
+    if floor_id < 0:
+        raise RuntimeError(
+            "场景里没有名为 'floor' 的 geom；default_floor_geom() 与场景 XML 不一致。"
+        )
     stair_ids = [
         g
         for g in range(model.ngeom)

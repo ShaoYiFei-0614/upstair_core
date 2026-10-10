@@ -65,9 +65,9 @@ robotdog/<你要改的模块>.py        代码本身（约 200~1100 行，可通
 | 评估与 GIF | `scripts/play.py` |
 | 读配置 | `robotdog/config.py` |
 
-**代码规模**（`README.md` §6.1 有完整表）：最大的几个是 `robotdog/env.py` 1066、
-`scripts/play.py` 665、`robotdog/go2_model.py` 460、`robotdog/config.py` 443、
-`robotdog/policy.py` 341。最大的文件也可以直接通读。
+**代码规模**（`README.md` §6.1 有完整表）：最大的几个是 `robotdog/env.py` 1101、
+`scripts/play.py` 856、`robotdog/config.py` 527、`robotdog/go2_model.py` 467、
+`robotdog/policy.py` 339。最大的文件也可以直接通读。
 
 ---
 
@@ -191,29 +191,47 @@ cmd /c "git show HEAD:robotdog/env.py > .tmp/env_before.py"
 
 `check_lines.py` 有**两个盲点**，所以不能只靠它：①它发现不了「文档描述了一个不存在的 API」
 （表格里一行的过期它看不见）；②它发现不了「行号整体漂移但没越界」——在文件上游插一行，
-下游所有行号都会指到**别的函数**，而每一行都是合法的非空行。`ref_truth.py` 补第二个盲点。
+下游所有行号都会指到**别的函数**，而每一行都是合法的非空行。`ref_truth.py` 补第二个盲点：
+它**现算**每个 ``文件.py:行号`` 指向的那一行是什么、并对照 AST 判「这一行是不是另一个
+`def`/`class` 的定义」，所以不需要任何手工维护的符号快照（快照一旦过期，门本身就成了
+伪报的来源）。
 **改完 `robotdog/env.py`**（增删任何一行都会让 `Go2StairsEnv` 成员行号整体漂移）之后，
 顺手跑一次幂等的 `.tmp/sync_env_md_lines.py`，它按符号名把 `docs/robotdog/env.md` 里
 成员的定义行号刷成真值。
 
-全绿的样子：
+两支门都**能解析裸文件名**（`` env.py:585 `` 会按「仓根 → `robotdog/` → `scripts/` →
+`docs/` → 全仓唯一同名」找到 `robotdog/env.py`）。这一点是 2026-02 才补上的：在此之前
+它们只试 `ROOT/raw`，于是文档里几十条裸名引用**从未被检查过**。
+
+全绿的样子（数字随仓库演化，**以当前实跑为准**，别照抄历史值）：
 
 ```
-stale/blank line refs: 0
-refs checked: 210   suspicious: 0
-python blocks: 64, unparsable-skipped: 37, BROKEN: 0
+stale/blank line refs: 0   未解析的引用（可能指向已删文件）: 2
+refs checked: 329   suspicious: 0   未解析（可能指向仓外或已删文件）: 2
+python blocks: 71, unparsable-skipped: 38, BROKEN: 0
 BROKEN CROSS-REFS: none
 RESULT: ALL CHECKS PASSED
 ```
 
+唯一允许出现在「未解析」里的，是**仓外引用**（`stable_baselines3/...` 那两条）——引用
+本身正确，只是解析器不扫 `.venv`。除此之外 `check_lines.py` 与 `ref_truth.py` 都应当是
+**零条目**；文档里**不要**再出现「历史上某个错行号」那种举例，否则它会被门一直报出来。
+
 **行为回归**（改了环境/奖励/训练时必须跑）：
 
+派生配置必须**现算**，不要留快照——`config.yaml` 的字段集合一变，旧快照就会被段键校验
+拦下（实测 `无法识别的键 ['camera', 'fps', 'height', 'scale', 'width']`）。
+
 ```bat
-:: 1) 训练冒烟：六级各 2000 步，约 45 秒
+:: 0) 先生成冒烟配置（六级各 2000 步；播放只跑 5 回合，默认 100 回合太慢）
+.venv\Scripts\python.exe .tmp\mk_smoke_config.py
+.venv\Scripts\python.exe .tmp\mk_smoke_play_config.py
+
+:: 1) 训练冒烟：六级各 2000 步，约 30 秒
 .venv\Scripts\python.exe scripts\train.py --run-name smoke_cfg --config .tmp\smoke_config.yaml
 
 :: 2) 播放冒烟：自动读权重自带的 <模型>_env.json 选地形
-.venv\Scripts\python.exe scripts\play.py --run smoke_cfg --mode eval
+.venv\Scripts\python.exe scripts\play.py --run smoke_cfg --mode eval --config .tmp\smoke_play.yaml
 ```
 
 跑完**删掉** `runs/smoke_cfg` 与 `output/gifs`（`.gitignore` 不覆盖 `output/`）。
@@ -364,7 +382,8 @@ RESULT: ALL CHECKS PASSED
 * **`.tmp/` 是 gitignored 的**（`configs/`、`runs/`、`logs/`、`.generated/` 也是）：它是
   工具与备份的家（`.tmp/knob_backup/` 存着已删旧开关的术与补丁，是唯一的恢复途径），
   但**不要指望提交它能进版本库**——重要的人工结论要写进 `docs/`、`experience.md`
-  或本文，而不是留在 `.tmp/` 的脚本注释里。
+  或本文，而不是留在 `.tmp/` 的脚本注释里。（它已经攒了 570 个条目，是事实上的
+  ledger，这也是「结论必须落进文档」的原因。）
 * **`output/gifs/` 不在 `.gitignore` 里**（它是交付物），所以冒烟必须自己清干净，
   否则会把渲染中间产物当成改动提交。
 * **文档行号会随任何编辑漂移**。改完源码行数就重跑 `check_lines.py`；批量替换时用

@@ -93,7 +93,7 @@ size = ((self.top_landing + ov) / 2.0, hy, top / 2.0)
 于是 crest 的后侧面被**埋进**最后一级台阶内部，共面的那对表面消失，只剩真正的立面。
 模块 docstring 强调：实心块的**并集**不变，所以解析剖面与每一个渲染像素都完全一致。
 
-（实现见 `robotdog/tools/terrain.py:112-167` 的 `step_blocks()`。）
+（实现见 `robotdog/tools/terrain.py:147-202` 的 `step_blocks()`。）
 
 取 `1.0`（一个完整踏面）而不是「一小段 overlap」：整块踏面回伸让重叠体积足够大，避免留下
 **部分共面**的窄缝（窄缝同样会夹脚）；而且表达式保持整数倍踏面，`cx`/`size` 与
@@ -299,7 +299,7 @@ def build_terrain_xml(spec: StairSpec) -> str:               # :238
 
 ```
 StairSpec(step_height, tread, ..., name_prefix)
-  → build_terrain_xml(spec)                                  robotdog/tools/terrain.py:238-242
+  → build_terrain_xml(spec)                                  robotdog/tools/terrain.py:283-287
       → spec.n_up == 0 and spec.n_down == 0 ?  return ""
       → "\n" + spec.to_xml()
           → spec.step_blocks()
@@ -372,12 +372,12 @@ pyramid : 平地 → n_up 级上升立面 → 平的 crest → n_down 级下降�
 
 | 位置 | 使用的符号 | 依赖方向为什么是这样 |
 | --- | --- | --- |
-| `robotdog/go2_model.py:39` | `TERRAIN_GEOM_GROUP` | 生成地面 plane 时也要打同一个 group（`default_floor_geom`） |
-| `robotdog/env.py:46` | `StairSpec, build_terrain_xml` | 环境层持有 spec 并驱动编译（`_build_model()` 调 `build_terrain_xml(self.stair)`） |
+| `robotdog/go2_model.py:229` | `TERRAIN_GEOM_GROUP` | 生成地面 plane 时也要打同一个 group（`default_floor_geom`） |
+| `robotdog/env.py:322` | `StairSpec, build_terrain_xml` | 环境层持有 spec 并驱动编译（`_build_model()` 调 `build_terrain_xml(self.stair)`） |
 | `robotdog/env.py` | `height_at` | 地形高、`foot_clearance`、支撑面参照（见 §5） |
 | `robotdog/env.py` | `crest_height` | 出生点与**成功判据**（`terrain_height_under_base >= crest_height - 1e-9`） |
-| `robotdog/config.py:36` | `demo_stairs_spec, flat_spec` | `config_to_stages()` 按 `config.yaml` 造阶段表 —— **当前唯一的课程构造路径**（见 `docs/robotdog/config.md`） |
-| `robotdog/policy.py:18/319` | `StairSpec, demo_stairs_spec, flat_spec` | `stair_from_height()` 由高度造地形，服务 `play.py` |
+| `robotdog/config.py:326` | `demo_stairs_spec, flat_spec` | `config_to_stages()` 按 `config.yaml` 造阶段表 —— **当前唯一的课程构造路径**（见 `docs/robotdog/config.md`） |
+| `robotdog/policy.py:314/319` | `StairSpec, demo_stairs_spec, flat_spec` | `stair_from_height()` 由高度造地形，服务 `play.py` |
 | `robotdog/training.py:38` | `StairSpec` | 建环境/向量环境时透传 spec |
 | `scripts/play.py` | `stair.crest_height` | 评估/渲染的头部信息打印 |
 

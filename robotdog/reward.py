@@ -9,8 +9,10 @@
 本模块由两半构成：
 
 * :class:`RewardConfig` —— 全部权重与阈值（``config.yaml`` 的 ``reward`` 段）。
-* :func:`compute_reward` —— 纯函数，输入是环境状态，输出是**逐步奖励**、**逐项
-  明细**与**终止奖励**，不做任何物理推进。
+* :func:`compute_reward` —— 奖励数学本体：输入是环境状态，输出是**逐步奖励**、
+  **逐项明细**与**终止奖励**，不做任何物理推进。它**不是纯函数** —— 几个势函数
+  项要靠环境上的记忆字段（``_peak_terrain_height`` / ``_probe_best`` /
+  ``_probe_count``）做到「总量有界、不可刷分」，所以会写这几个字段。
 
 关于逐项明细：:func:`compute_reward` 返回的 ``terms`` 里，每一项**都已经乘过它的
 权重**，所以 ``sum(terms.values())`` 就是未经终止奖励的总奖励。想看「这个回合是谁
@@ -116,8 +118,13 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
                    ) -> tuple[float, dict[str, float], float]:
     """逐步奖励 + 逐项明细 + 终止奖励。
 
-    :param env: ``Go2StairsEnv``。只**读**状态（位置/速度/接触/腾空时间/地形），
-        不推进物理，也不改任何字段。
+    这个函数**不是纯函数**：它读 ``env`` 的状态，也会推进三个「势函数」用的
+    记忆字段 —— ``env._peak_terrain_height``（爬升进展的一次性结算）、
+    ``env._probe_best``（逐足的摆动峰值最好成绩）、``env._probe_count``。
+    也就是说同样的 ``(env 状态, action)`` 在不同时刻可能给出不同结果，**不能
+    为了对比而重复调用**。
+
+    :param env: ``Go2StairsEnv``。读位置/速度/接触/腾空时间/地形，也写上面那三个字段。
     :param action: 本控制步的策略动作（12 维）。
     :param trunk_contact: 躯干是否接触地形。
     :param foot_contact: 逐足接触掩码；``None`` 时现算（只在 ``air_time`` 非零时用到）。

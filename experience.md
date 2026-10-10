@@ -73,7 +73,7 @@ group 2/3。
 * `alive` 从 0.4 降到 0.12（0.4 时它占「站桩」回合回报的 49%）。
 
 > **后续（见 §12）**：`forward_progress` 那一条**实为错修**。真正的病根是
-> `forward_vel` 的高斯分母漏了平方（`forward_vel_sigma` 是标准差，却直接当分母用），
+> `forward_vel` 的高斯分母漏了平方（`forward_vel_sigma` **当时**是标准差，却**被**直接当分母用），
 > 等于按 `sqrt(0.25)=0.5 m/s` 折算，`vx = 0` 时仍白拿 `exp(-1.21) ≈ 0.30` ⇒ **+0.72/步**
 > （实测 +0.86/步）。把分母改成 `σ²` 后只剩 +0.02/步，而线性伴项在 0.55 m/s 附近
 > 反而给出 +1.1/步的超线性加成，于是连同 `forward_progress` /
@@ -499,8 +499,8 @@ mini-batches, there will be a truncated mini-batch of size 256
 | 类型 | 例子 | 为什么不能删 |
 | --- | --- | --- |
 | **字符串派发** | *（本仓目前没有实例）* | `venv.env_method("某个方法", ...)` 把名字藏在字符串里，AST 看不见。这是最容易误删的一类，改 `DummyVecEnv` 相关代码时留意 |
-| **框架回调** | `ProgressCallback._on_step`（`scripts/train.py:84`）、`CheckpointCallback._on_step`（`scripts/train.py:107`） | SB3 的 `BaseCallback` 按固定名字回调，从不被本仓代码显式调用 |
-| **文档化的公开 API** | `GaitParams.static`（`robotdog/gait.py:170`）、`GaitParams.targets`（`robotdog/gait.py:90`）、`policy.Policy`（`robotdog/policy.py:21`）、`StairSpec.down_end_x`（`robotdog/tools/terrain.py:108`）、`Go2StairsEnv.yaw`（`robotdog/env.py:448`）、`Go2StairsEnv.set_stair`（`robotdog/env.py:291`） | 设计文档把它们的签名与理由逐条写下来了，是给人用的接口面。删掉等于同时删两处文档，而它们各只有 1–5 行 |
+| **框架回调** | `ProgressCallback._on_step`（`scripts/train.py:96`）、`CheckpointCallback._on_step`（`scripts/train.py:96`） | SB3 的 `BaseCallback` 按固定名字回调，从不被本仓代码显式调用 |
+| **文档化的公开 API** | `GaitParams.static`（`robotdog/gait.py:170`）、`GaitParams.targets`（`robotdog/gait.py:90`）、`policy.Policy`（`robotdog/policy.py:21`）、`StairSpec.down_end_x`（`robotdog/tools/terrain.py:108`）、`Go2StairsEnv.yaw`（`robotdog/env.py:526-527`）、`Go2StairsEnv.set_stair`（`robotdog/env.py:353-366`） | 设计文档把它们的签名与理由逐条写下来了，是给人用的接口面。删掉等于同时删两处文档，而它们各只有 1–5 行 |
 
 **留下的判据**：`GaitParams.static()` 是文档里「怎么关掉先验」的**唯一正确写法**（`docs/robotdog/gait.md:434` 的示例直接 `off = GaitParams.static()`），所以哪怕零调用者也要留——删了文档就在教一个不存在的函数。
 
@@ -515,8 +515,8 @@ mini-batches, there will be a truncated mini-batch of size 256
 | `load_ppo(path, venv, *, device)` | `robotdog/training.py` | `load_policy` 是唯一实际入口；`load_ppo` 是 `PPO.load()` 的薄包装，没有任何调用者 |
 | `mean_abs_action(actions)` | `robotdog/training.py` | 三行的诊断量（`float(np.mean(np.abs(a)))`），训练循环从不统计它；只有临时脚本会算 |
 | `set_terrain(venv, stair)` | `robotdog/training.py` | 函数体就是 `env_method("set_stair")` + `reset()` 两行，没有任何调用者。**删它之前看过两跳**：它自己是零读者，但它是 `set_stair` 的唯一调用者，所以删完 `set_stair` 也变成了零调用点（那个保留了，见 §9.1） |
-| `GO2_SCENE_XML` | `robotdog/tools/paths.py:15` | 本仓从不用官方 `scene.xml`（场景由 `compile_scene()` 现场拼 XML）；`scene.xml` 只在 `scripts/download_go2.py:44` 的 `WANT_FILES` 里以**字符串字面量**出现 |
-| `ensure_dir(path)` | `robotdog/tools/paths.py:29` | 零调用者，且自带两个坑（传 `str` 抛 `AttributeError`、对文件路径会建出同名目录） |
+| `GO2_SCENE_XML` | `robotdog/tools/paths.py` | 本仓从不用官方 `scene.xml`（场景由 `compile_scene()` 现场拼 XML）；`scene.xml` 只在 `scripts/download_go2.py:43` 的 `WANT_FILES` 里以**字符串字面量**出现 |
+| `ensure_dir(path)` | `robotdog/tools/paths.py` | 零调用者，且自带两个坑（传 `str` 抛 `AttributeError`、对文件路径会建出同名目录） |
 | `ensure_output_dirs()` | （已删除） | 零调用者；`scripts/play.py:248` 的 `write_gif` 自己 `path.parent.mkdir(...)` |
 
 顺带删掉三个**失去全部使用者**的 import：`robotdog/training.py` 的 `numpy`（`mean_abs_action` 是唯一使用者）、`robotdog/policy.py` 的 `Sequence`、`scripts/download_go2.py` 的 `sys`（末尾写的是 `raise SystemExit(main())` 而不是 `sys.exit`）。
@@ -687,7 +687,7 @@ def _height_reference(self) -> float:
 1. `forward_vel` 的分母改成 `rc.forward_vel_sigma ** 2`：`vx = 0` 时从 +0.72/步 降到 **+0.02/步**。
 2. **删除 `forward_progress` / `forward_progress_max` / `forward_progress_min` 三个字段**及
    对应的线性项。σ 修正后高斯项在 `vx = 0` 处已经足够小；而线性项在 0.55 m/s 附近会给出
-   **+1.1/步**的超线性加成，反而扭曲速度跟踪。`RewardConfig` 字段 **24 → 21**。
+   **+1.1/步**的超线性加成，反而扭曲速度跟踪。`RewardConfig` 字段**当时从 24 减到 21**。
    （§2.2 把这条线性项当成过「站着不动」的修法，实为错修，已在 §2.2 加引用块更正。）
 3. `stair_progress` 改成**一次性结算**：
 
@@ -825,6 +825,11 @@ terms["command_follow"] = follow
 ```
 
 修后实测 `command_follow = +0.000e+00`（逐位精确 0）。
+
+> **后续**：这两项最终**又改成了线性死区**（连同 `command_follow` 合并成一个键），高斯宽度
+> `lateral_vel_sigma` / `yaw_rate_sigma` 也随之从 `RewardConfig` **删除**——`robotdog/reward.py`
+> 里现在只有 `lateral_vel = 6.0` / `yaw_rate = 4.0` 两个权重。当前形式见 `README.md` §3.3。
+> 上面的代码块是**当时**的样子，不要再照它写。
 
 ### 13.4 第二个坑：`yaw_rate` 不是 `qvel[5]`
 
