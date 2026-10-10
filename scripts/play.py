@@ -593,6 +593,11 @@ def _spec_from_json(obj: Any) -> StageSpec | None:
     if "command_vy_max" not in obj:
         return None
     try:
+        raw_vx = obj.get("command_vx", (0.0, 0.0))
+        if isinstance(raw_vx, (int, float)):
+            vx_range = (0.0, float(raw_vx))
+        else:
+            vx_range = (float(raw_vx[0]), float(raw_vx[1]))
         return StageSpec(
             name=str(obj["name"]),
             step_height=float(obj.get("step_height", 0.0)),
@@ -602,24 +607,19 @@ def _spec_from_json(obj: Any) -> StageSpec | None:
             label=str(obj.get("label", "")),
             command_vy_max=float(obj.get("command_vy_max", 0.0)),
             command_yaw_max=float(obj.get("command_yaw_max", 0.0)),
-            command_vx=float(obj.get("command_vx", 0.0)),
-            flat_success_distance=float(obj.get("flat_success_distance", 0.0)),
-            flat_success_needs_progress=bool(
-                obj.get("flat_success_needs_progress", True)),
+            command_vx=vx_range,
         )
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, IndexError):
         return None
 
 
 def _same_command(a: StageSpec | None, b: StageSpec) -> bool:
-    """两级的「回放口径」是否一致（指令量程 + 平地成功口径）。"""
+    """两级的「回放口径」是否一致（三轴指令量程）。"""
     if a is None:
         return False
     return (abs(a.command_vy_max - b.command_vy_max) < 1e-9
             and abs(a.command_yaw_max - b.command_yaw_max) < 1e-9
-            and abs(a.command_vx - b.command_vx) < 1e-9
-            and abs(a.flat_success_distance - b.flat_success_distance) < 1e-9
-            and a.flat_success_needs_progress == b.flat_success_needs_progress)
+            and all(abs(x - y) < 1e-9 for x, y in zip(a.command_vx, b.command_vx)))
 
 
 def _stage_plan(cfg: dict[str, Any], play: dict[str, Any], target: PlayTarget,
@@ -641,12 +641,12 @@ def _stage_plan(cfg: dict[str, Any], play: dict[str, Any], target: PlayTarget,
     其他
         阶段名列表，或高度列表（cm）。
 
-    ⭐ **回放口径必须来自训练记录**：``command_vy_max`` / ``command_yaw_max`` /
-    ``command_vx`` / ``flat_success_distance`` / ``flat_success_needs_progress``
-    都是**课程逐级下发**的，不是全局配置。拿 ``config.yaml`` 的当前值去评老运行，
-    判出来的成功/失败与训练时不是同一件事 —— 实测踩过：cmdtrack6 前两级的训练口径是
-    「``vx=0`` 原地、撑满回合算成功」，而当前 ``config.yaml`` 给的是「``vx=0.45``、
-    前进 2 m 算成功」，于是 GIF 上凭「没走够 2 米」给一个明明在跟指令的级判 20% 成功率。
+    ⭐ **回放口径必须来自训练记录**：``command_vx`` / ``command_vy_max`` /
+    ``command_yaw_max`` 都是**课程逐级下发**的，不是全局配置。拿 ``config.yaml``
+    的当前值去评老运行，判出来的成功/失败与训练时不是同一件事 —— 实测踩过：
+    cmdtrack6 前两级的训练口径是「``vx=0`` 原地、撑满回合算成功」，而当前
+    ``config.yaml`` 给的是「``vx=0.45``、前进 2 m 算成功」，于是 GIF 上凭
+    「没走够 2 米」给一个明明在跟指令的级判 20% 成功率。
     2026-06 之后 ``summary.json`` 会记这些字段；更早的运行只能退回当前课程并打印 ⚠。
     """
     stages = config_to_stages(cfg)
@@ -703,14 +703,12 @@ def _stage_plan(cfg: dict[str, Any], play: dict[str, Any], target: PlayTarget,
                         print(f"  ⚠ {name}: 当前 config.yaml 的口径与训练记录不同"
                               f"（训练 vy±{recorded.command_vy_max:g}"
                               f"/wz±{recorded.command_yaw_max:g}"
-                              f"/vx{recorded.command_vx:g}"
-                              f"/成功距离{recorded.flat_success_distance:g}m"
-                              f"/需前进={recorded.flat_success_needs_progress}；"
+                              f"/vx{recorded.command_vx[0]:g}~"
+                              f"{recorded.command_vx[1]:g}；"
                               f"配置 vy±{ref.command_vy_max:g}"
                               f"/wz±{ref.command_yaw_max:g}"
-                              f"/vx{ref.command_vx:g}"
-                              f"/成功距离{ref.flat_success_distance:g}m"
-                              f"/需前进={ref.flat_success_needs_progress}）"
+                              f"/vx{ref.command_vx[0]:g}~"
+                              f"{ref.command_vx[1]:g}）"
                               f" —— **以训练记录为准**")
                         picked.append((name, height, recorded, "训练记录（同上级）"))
                 else:
@@ -804,16 +802,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             # ⭐ 把这一级的**训练口径**装回环境：指令量程与平地成功判据都是课程逐级
             # 下发的，不回灌的话回放会拿 config.yaml 的基线去判成功/失败，GIF 的
-            # 结局标签就是假的（曾把「原地撑满回合」的级按「前进 N 米」评成 20%）。
+            # 结局标签就是假的（曾把「跟指令」的级按「前进 N 米」评成 20%）。
             if stage.spec is not None:
                 env.set_commands(vy_max=stage.spec.command_vy_max,
-                                 yaw_max=stage.spec.command_yaw_max)
-                if stage.spec.command_vx:
-                    env.cfg.command.vx = float(stage.spec.command_vx)
-                if stage.spec.flat_success_distance:
-                    env.set_flat_success_distance(stage.spec.flat_success_distance)
-                env.set_flat_success_needs_progress(
-                    bool(stage.spec.flat_success_needs_progress))
+                                 yaw_max=stage.spec.command_yaw_max,
+                                 vx_min=stage.spec.command_vx[0],
+                                 vx_max=stage.spec.command_vx[1])
             print(f"  观测: {env.observation_space.shape}  动作: {env.action_space.shape}")
             failed += mode_gif(env, policy, episodes=episodes, seed=seed,
                                name=stage.label, play=play, gif_dir=gif_dir,

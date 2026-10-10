@@ -53,11 +53,9 @@ class StageSpec:
     description: str = ""       # 一句话说明这一级在练什么
     command_vy_max: float = 0.0     # 该阶段横向指令上界 [m/s]
     command_yaw_max: float = 0.0    # 该阶段偏航指令上界 [rad/s]
-    command_vx: float = 0.0         # 该阶段定值前进指令 [m/s]; 0 = 用 env 基线
-    flat_success_distance: float = 0.0   # 平地段成功距离 [m]; 0 = 用 env 基线
-    # 平地段是否要求真的前进一段才算成功。原地指令课程必须关掉（改成「撑满回合」），
-    # 否则 `command_vx = 0` 时`is_success` 永远不触发，日志成功率恒为 0。
-    flat_success_needs_progress: bool = True
+    # 该阶段前向指令的采样区间 ``(vx_min, vx_max)`` [m/s]；``(0, 0)`` = 用 env 的
+    # 定值基线 ``env.command.vx``。
+    command_vx: tuple[float, float] = (0.0, 0.0)
     reward_overrides: dict[str, float] = field(default_factory=dict)
     # 该阶段的奖励覆盖, 来自 ``config.yaml`` 的
     # ``curriculum.reward_overrides``; 空 = 用 ``reward:`` 段的基线值。
@@ -73,10 +71,10 @@ class StageSpec:
         cmd = ""
         if self.command_vy_max or self.command_yaw_max:
             cmd = (f" 指令 vy±{self.command_vy_max:g} wz±{self.command_yaw_max:g}")
-        if self.command_vx:
-            cmd += f" vx={self.command_vx:g}"
-        if self.flat_success_distance:
-            cmd += f" 成功距离={self.flat_success_distance:g}m"
+        vx_lo, vx_hi = self.command_vx
+        if vx_hi:
+            cmd += (f" vx={vx_lo:g}" if vx_lo == vx_hi
+                    else f" vx=[{vx_lo:g},{vx_hi:g}]")
         rew = ""
         if self.reward_overrides:
             items = " ".join(f"{k}={v:g}" for k, v in sorted(
@@ -283,11 +281,10 @@ def write_summary(
     ``total_timesteps`` 三个由本函数计算的键。
 
     ``stages`` 里每一级除了地形与预算，还**逐级**记下该级的指令量程
-    （``command_vy_max`` / ``command_yaw_max`` / ``command_vx``）与平地成功口径
-    （``flat_success_distance`` / ``flat_success_needs_progress``）。这些是**课程
+    （``command_vx`` / ``command_vy_max`` / ``command_yaw_max``）。这些是**课程
     逐级下发的值**，``env.json`` 里只有 ``config.yaml`` 的基线（``vy_max=0``），
     回放时如果拿基线去评，判出来的成功/失败与训练时不是同一件事 —— 曾经因此把
-    「原地撑满回合」的级按「前进 N 米」去评，GIF 上打出一堆假的「摔倒/超时」。
+    「指令跟随」的级按「前进 N 米」去评，GIF 上打出一堆假的「摔倒/超时」。
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -300,11 +297,9 @@ def write_summary(
             "timesteps": int(s.timesteps),
             "learning_rate": float(s.learning_rate),
             "is_flat": bool(s.is_flat),
+            "command_vx": [float(v) for v in s.command_vx],
             "command_vy_max": float(s.command_vy_max),
             "command_yaw_max": float(s.command_yaw_max),
-            "command_vx": float(s.command_vx),
-            "flat_success_distance": float(s.flat_success_distance),
-            "flat_success_needs_progress": bool(s.flat_success_needs_progress),
             "spec": _spec_as_dict(s.spec),
         }
         for s in stages

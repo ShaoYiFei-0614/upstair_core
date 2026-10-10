@@ -32,15 +32,14 @@ curriculum:
   learning_rate: [1.5e-4, 1.5e-4, 1.2e-4, 1.0e-4, 8e-5, 6e-5]
   # 每级的横向 / 偏航指令上界（指令课程）；都必须与 heights_cm 等长。
   # 阶段边界上由 scripts/train.py 调 venv.env_method("set_commands", ...) 下发。
-  # ⚠ 课程只能改**范围**，不能开关那 2 维观测 —— 观测维数在整条课程里必须恒定，
+  # ⚠ 课程只能改**范围**，不能开关那 3 维观测 —— 观测维数在整条课程里必须恒定，
   # 否则 PPO 的网络与 RolloutBuffer 会对不上。
   command_vy_max: [0.0, 0.15, 0.35, 0.30, 0.35, 0.40]
   command_yaw_max: [0.0, 0.15, 0.50, 0.35, 0.55, 0.70]
-  # 每级的定值前进指令 [m/s]；0 = 沿用 env.command.vx。前两级压低，先站稳再提速。
-  command_vx: [0.45, 0.45, 0.45, 0.0, 0.0, 0.0]
-  # 平地段专用的成功距离 [m]；0 = 沿用 env.flat_success_distance（3.0）。
-  # 指令一放宽就会绕路，长判据会把成功拖成超时。
-  flat_success_distance: [2.0, 2.0, 2.5, 0.0, 0.0, 0.0]
+  # 前向指令的**采样区间** [m/s]（两元素 = 所有级别共用一个范围；也可以写成
+  # 与 heights_cm 等长的嵌套列表，每级给一对）。每一回合在区间内均匀采样。
+  # 冲刺（超出指令）由 reward.forward_overspeed 额外扣分，不靠这里设上限。
+  command_vx: [0.2, 0.6]
   # 每级的奖励覆盖（奖励课程）：叠在下面 reward: 段的基线值之上，由
   # scripts/train.py 在阶段边界调 venv.env_method("set_reward_overrides", ...)
   # 下发。两种写法：标量 = 每一级都用它；列表 = 必须与 heights_cm 等长。
@@ -56,10 +55,10 @@ env:
   n_envs: 8                  # 向量环境数；单进程 DummyVecEnv
   episode_length_s: 20.0
   action_scale: 0.30         # 残差动作上限 [rad]，策略的权限
-  # 指令（外部控制器接口）。vx 是定值；vy/yaw 的范围由上面的指令课程按级放宽，
-  # 每回合在 [-max, +max] 里采样。评估时可用 scripts/teleop.py 逐步写入。
+  # 指令（外部控制器接口）。三轴的**采样范围**由上面的指令课程按级下发，每回合
+  # 在范围内均匀采样。评估时可用 scripts/teleop.py 逐步写入当前值。
   command:
-    vx: 0.55                 # 前进速度指令 [m/s]
+    vx: 0.45                 # vx 指令的范围为 0 时的回退定值 [m/s]
   # 摔倒判据：机身高度（base_z 减参照面）低于 terminate_min_height 就判摔倒。
   # 躯干碰撞体最低点在 0.118 m，所以 0.15 留了 3.2 cm 余量。
   # 注意：躯干「接触地形」本身**不再**终止回合（旧 terminate_contact_steps
@@ -68,9 +67,9 @@ env:
   gait_prior: true           # 在 trot 开环先验之上学残差。**别关**：关掉后六级全 0
                              # （原地站到超时，|a|≈0.09），见 train.md §3.6
   gait_file: artifacts/trot_stairs.json
-  # 观测开关；history_len=1 时每帧 42 + 3 + 1 + 2 = 48 维，即观测总量 48 维。
-  # （最后 2 维是横向 / 偏航指令 [vy, wz]，由下面的 command 段与指令课程给出。）
-  # 48 维每一项都有真机出处（编码器 / IMU / 上一步动作 / 本体感觉估计 / 上层指令），
+  # 观测开关；history_len=1 时每帧 42 + 3 + 1 + 3 = 49 维（打开 vel_filter 则 51 维）。
+  # （3 维是三轴速度指令 [vx, vy, wz]，由下面的 command 段与指令课程给出。）
+  # 每一项都有真机出处（编码器 / IMU / 上一步动作 / 本体感觉估计 / 上层指令），
   # 加上一个标量任务参数 step_height。信息来源清单见 agent.md §8.6。
   obs:
     base_lin_vel_body: true
@@ -79,9 +78,13 @@ env:
     base_height: false
     gait_phase: false
     step_height: true
-    # 历史帧数。实测 1 帧（48 维）**不亏**：课程内每一级都不差、3cm/6cm
-    # 还更好（92% vs 62%、22% vs 0%），课程外 3/5cm 都是 100%。50 Hz 下
-    # 相邻帧几乎相同，10 帧绝大部分是冗余（10 帧 = 480 维）。见 train.md §3.6。
+    # 指令跟随读**滤波后**的横向速度 / 偏航角速度。必须打开：瞬时 yaw_rate 在小跑
+    # 步态下 std 可达 0.37 rad/s，奖励和成功判据都会变成「在判步态相位」。这两个量
+    # 同时进观测以保持马尔可夫性（奖励读的就是它们）。
+    vel_filter: true
+    # 历史帧数。实测 1 帧**不亏**：课程内每一级都不差、3cm/6cm 还更好
+    # （92% vs 62%、22% vs 0%），课程外 3/5cm 都是 100%。50 Hz 下相邻帧几乎
+    # 相同，10 帧绝大部分是冗余（10 帧 = 500 维）。见 train.md §3.6。
     history_len: 1
 
 

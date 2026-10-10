@@ -197,16 +197,14 @@ def env_config_for_model(model_path: str | Path) -> EnvConfig:
 
     首选模型同目录的 ``summary.json``（精确）。没有时按 ``.zip`` 里保存的观测
     维度反推是哪几个观测块（会打一行提示）。必须有这条退路，是因为
-    三条路径，按精确度降序：模型同目录的 ``summary.json``（精确）→
-    ``<stem>_env.json``（精确，``train.py`` 每个 checkpoint 各存一份）→
-    按 ``.zip`` 里保存的观测维度反推是哪几个观测块（**启发式**，会打一行提示）。
-
-    ``EnvConfig()`` 的默认观测是 10 帧 × 48 维 = 480 维，而本仓 ``config.yaml``
-    用 ``history_len: 1`` 只有 48 维；直接用默认配置加载本仓权重会抛
-    ``ValueError: Observation spaces do not match``，所以反推这条退路必须保留。
+    ``EnvConfig()`` 的默认观测是 10 帧 × 49 维 = 490 维，而本仓 ``config.yaml``
+    用 ``history_len: 1``；直接用默认配置加载本仓权重会抛
+    ``ValueError: Observation spaces do not match``。
+    ``train.py`` 每个 checkpoint 都会存一份 ``<stem>_env.json``，正常路径不会走到
+    反推。
 
     反推**不可能**打开 ``obs.base_height``：那个开关在 :class:`ObsConfig` 里
-    被硬性禁止（含地形真值，破坏盲走），所以 460/474 这类旧维度要么被无歧义
+    被硬性禁止（含地形真值，破坏盲走），所以旧架构那些维度要么被无歧义
     还原，要么走 :meth:`_obs_config_for_dim` 返回 ``None`` 的报错分支。
     """
     model_path = Path(model_path)
@@ -289,13 +287,13 @@ def step_height_from_model(model_path: str | Path) -> float | None:
 def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
     """反推是哪几个观测块拼出了 ``total`` 维。
 
-    ``base_lin_vel_body``(3) / ``gait_phase``(2) / ``step_height``(1) / ``command``(2)
-    四个开关组合不多，直接枚举。``base_lin_vel_body`` 与 ``command`` 默认开，所以
-    枚举顺序把它们放前面，使最简配置优先命中。
+    ``base_lin_vel_body``(3) / ``gait_phase``(2) / ``step_height``(1) / ``command``(3)
+    / ``vel_filter``(2) 五个开关组合不多，直接枚举。``base_lin_vel_body`` 与
+    ``command`` 默认开，所以枚举顺序把它们放前面，使最简配置优先命中。
 
     **``base_height`` 故意不在枚举里**：它在 :class:`ObsConfig` 的 ``__post_init__``
     里被硬性禁止（含地形真值，会破坏盲走），所以任何会打开它的组合都不可构造。
-    归档 checkpoint 里那些 460/474 维的权重本来就与本仓 46 维观测不兼容，
+    归档 checkpoint 里那些 460/474 维的权重本来就与本仓观测不兼容，
     不必为它们保留反推能力。
     """
     from itertools import product

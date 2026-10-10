@@ -163,6 +163,41 @@ def _bools(value: Any, n_stages: int, *, where: str, default: bool) -> list[bool
     raise SystemExit(f"{where}: 期望布尔或列表，实际是 {type(value).__name__}")
 
 
+def _vx_ranges(value: Any, n_stages: int, *, where: str
+               ) -> list[tuple[float, float]]:
+    """把 ``curriculum.command_vx`` 归一化成每级一对 ``(vx_min, vx_max)``。
+
+    三种写法：``None``（每级都不采样）、``[lo, hi]``（所有级共用这个区间）、
+    ``[[lo, hi], ...]``（每级一对，长度必须等于级数）。``hi <= 0`` 表示该级
+    用 ``env.command.vx`` 定值；``hi < lo`` 直接报错，否则会在 ``reset()`` 里
+    抽出一个 ``lo > hi`` 的空区间。
+    """
+    if value is None:
+        return [(0.0, 0.0)] * n_stages
+    if not isinstance(value, (list, tuple)) or not value:
+        raise SystemExit(f"{where}: 期望 [lo, hi] 或 [[lo, hi], ...]")
+
+    def _pair(item: Any, where_item: str) -> tuple[float, float]:
+        if isinstance(item, (int, float)):
+            # 标量 = 定值
+            return (0.0, float(item))
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            lo, hi = float(item[0]), float(item[1])
+            if hi and lo > hi:
+                raise SystemExit(f"{where_item}: vx 区间下界 {lo} 大于上界 {hi}")
+            return (lo, hi)
+        raise SystemExit(f"{where_item}: 期望标量或 [lo, hi]，实际是 {item!r}")
+
+    if isinstance(value[0], (int, float)):
+        return [_pair(value, where)] * n_stages
+    pairs = [_pair(item, f"{where}[{i}]") for i, item in enumerate(value)]
+    if len(pairs) == n_stages:
+        return pairs
+    if len(pairs) == 1:
+        return pairs * n_stages
+    raise SystemExit(f"{where}: 列表长度 {len(pairs)} 必须等于级数 {n_stages} 或为 1")
+
+
 # --------------------------------------------------------------------------- #
 # 环境配置
 # --------------------------------------------------------------------------- #
@@ -275,27 +310,16 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
 
     stages: list[StageSpec] = []
     override_table = _reward_override_table(cur, n)
-    flat_distances = _floats(cur.get("flat_success_distance"), n,
-                             where="curriculum.flat_success_distance",
-                             default=0.0)
-    vxs = _floats(cur.get("command_vx"), n,
-                  where="curriculum.command_vx", default=0.0)
-    needs_progress = _bools(cur.get("flat_success_needs_progress"), n,
-                            where="curriculum.flat_success_needs_progress",
-                            default=True)
+    vx_ranges = _vx_ranges(cur.get("command_vx"), n,
+                           where="curriculum.command_vx")
     seen: dict[str, int] = {}
-    for h_cm, steps, lr, vy_max, yaw_max, row, flat_d, vx, need_prog in zip(
-        heights, budgets, lrs, vy_maxes, yaw_maxes, override_table,
-        flat_distances, vxs, needs_progress,
+    for h_cm, steps, lr, vy_max, yaw_max, row, vx_range in zip(
+        heights, budgets, lrs, vy_maxes, yaw_maxes, override_table, vx_ranges,
     ):
         steps = int(steps)
         if h_cm <= 0.0:
             spec = flat_spec(n_up=0, n_down=0, step_height=0.0, tread=tread)
-            name, label = _unique_name("flat", seen), "平地"
-            if not need_prog:
-                label = "平地（原地指令，撑满回合）"
-            elif flat_d > 0.0:
-                label = f"平地（成功距离 {flat_d:g} m）"
+            name, label = _unique_name("flat", seen), "平地（指令跟随）"
         else:
             spec = demo_stairs_spec(step_height=h_cm / 100.0, tread=tread, n_up=n_up)
             name = _unique_name(f"stair{h_cm:g}", seen)
@@ -312,9 +336,7 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
                 description=f"{label} 上行走并到达顶层平台",
                 command_vy_max=float(vy_max),
                 command_yaw_max=float(yaw_max),
-                command_vx=float(vx),
-                flat_success_distance=float(flat_d),
-                flat_success_needs_progress=bool(need_prog),
+                command_vx=vx_range,
                 reward_overrides=overrides,
             )
         )
@@ -344,9 +366,14 @@ def command_for_stage(stage: StageSpec, *, frac: float = PLAY_COMMAND_FRAC,
     「跟一个你从没见过的指令」，看画面会误判成「策略不会横移」。
 
     规则：量程为 0 的方向给 0（该级本来就不练这个方向）；有量程的方向给
-    ``frac × 量程``。``vx`` 显式给定时覆盖阶段的前进指令。
+    ``frac × 量程``。``vx`` 显式给定时覆盖阶段的前进指令；否则取该级采样区间的
+    中点 —— 回放要的是一条「落在训练分布中央」的典型指令，而不是某一个端点。
     """
-    out_vx = float(stage.command_vx if vx is None else vx)
+    if vx is None:
+        lo, hi = stage.command_vx
+        out_vx = float((lo + hi) / 2.0) if hi else 0.0
+    else:
+        out_vx = float(vx)
     vy = float(stage.command_vy_max) * frac if stage.command_vy_max else 0.0
     yaw = float(stage.command_yaw_max) * frac if stage.command_yaw_max else 0.0
     return out_vx, round(vy, 4), round(yaw, 4)

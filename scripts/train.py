@@ -68,18 +68,10 @@ MIN_STAGE_STEPS = 1
 def kw_call(venv, method: str, **kwargs):
     """用**关键字**调用子环境方法（``venv.env_method`` 的薄封装）。
 
-    ⭐ 存在的唯一理由是堵住一个真事故：``env_method`` 是
-    ``(*method_args, **method_kwargs)`` 原样透传
-    （``stable_baselines3/common/vec_env/dummy_vec_env.py:127``），所以位置实参
-    完全按**形参顺序**绑定。``set_command_now(vy, yaw_rate, vx)`` 曾写成
-    ``env_method("set_command_now", None, None, vx)``，三个实参正好落到
-    ``(vy, yaw_rate, vx)`` —— 类型全对（两个 ``float|None`` + 一个 float），
-    静态检查、smoke、日志全绿，而 ``vx`` 永远收到 ``None``，
-    ``cfg.command.vx`` 一直是 ``config.yaml`` 的 0.55，课程里所有
-    ``command_vx=0.0`` 的级别一个都没生效。
-
-    教训：凡是「多个同类型可选参数」的方法，调用点一律走关键字，
-    让「参数名对不上」变成 ``TypeError`` 而不是静默的错值。
+    ``env_method`` 是 ``(*method_args, **method_kwargs)`` 原样透传
+    （``stable_baselines3/common/vec_env/dummy_vec_env.py:127``），位置实参按
+    **形参顺序**绑定。凡是「多个同类型可选参数」的子环境方法，调用点一律走这里，
+    让「参数名对不上」变成 ``TypeError`` 而不是静默传错值。
     """
     return venv.env_method(method, **kwargs)
 
@@ -161,20 +153,13 @@ class Trainer:
 
     # ---- 每个阶段一个独立的向量环境（地形烘焙在编译后的 MJCF 里）----------
     def make_env(self, stage: StageSpec, *, warm_start: str | None = None):
-        # ⭐⭐ **每一级必须是自己的 ``EnvConfig`` 副本。**
+        # ⭐ **每一级必须是自己的 ``EnvConfig`` 副本。**
         #
-        # ``make_vec_env`` 只是把传进去的 cfg **原样绑**到每个子环境上
-        # （实测 ``env.cfg is 传入的 cfg`` 为 True），它不做拷贝。而下面那一串
-        # 下发全是**就地改写**：``set_commands`` 写 ``cfg.command.vy_max/yaw_max``、
-        # ``set_command_now`` 写 ``cfg.command.vx``、
-        # ``set_reward_overrides`` 用 ``setattr`` 写 ``cfg.reward.*``、
-        # ``set_flat_success_distance`` 写 ``cfg.flat_success_distance``。
-        #
-        # 于是如果直接传 ``self.cfg``，这些设置会**跨阶段累积**：某一级放宽过的
-        # 量程 / 压低过的 vx / 叠上去的奖励覆盖，会一路带到后面每一级，而且
-        # 顺序敏感（``command_vx=0.0`` 的级因为走 falsy 分支不会把它压回来，
-        # 结果楼梯段一直在用平地最后一级的 vx=0.45）。深拷贝一份，让每一级
-        # 都从 ``config.yaml`` 的基线出发。
+        # ``make_vec_env`` 把传进去的 cfg **原样绑**到每个子环境上，不做拷贝，
+        # 而下面那一串下发全是**就地改写**：``set_commands`` 写
+        # ``cfg.command.*``、``set_reward_overrides`` 用 ``setattr`` 写
+        # ``cfg.reward.*``。直接传 ``self.cfg`` 会让这些设置**跨阶段累积**，
+        # 顺序敏感。深拷贝一份，让每一级都从 ``config.yaml`` 的基线出发。
         stage_cfg = copy.deepcopy(self.cfg)
         venv = make_vec_env(
             stage.spec,
@@ -183,44 +168,17 @@ class Trainer:
             seed=int(self.run["seed"]),
             norm_reward=bool(self.ppo.get("norm_reward", True)),
         )
-        # 指令课程：把这一级的横向 / 偏航指令范围下发给每一个子环境。
-        # 阶段内不再改动 —— 观测的那 2 维在整个课程里恒定，PPO 的网络与
-        # RolloutBuffer 才不用重建。
+        # 指令课程：把这一级的指令**采样范围**下发给每一个子环境。阶段内不再改动
+        # —— 观测的那 3 维在整个课程里恒定，PPO 的网络与 RolloutBuffer 才不用重建。
         #
-        # ⚠ 这里**不能**用 ``if stage.command_vy_max or stage.command_yaw_max:``
-        # 之类的守卫：量程为 0 是**有意义的设置**（这一级不练这个方向），
-        # 跳过下发只会让这一级继承上一级的范围。无条件下发。
-        venv.env_method("set_commands",
-                        vy_max=stage.command_vy_max,
-                        yaw_max=stage.command_yaw_max)
-        # 平地指令预热的头几级还会（可选地）压低前进指令、缩短成功距离：
-        # 指令一放宽，机器人为了跟横移/旋转指令会绕路，原来的 3 m 判据会把
-        # 成功拖成超时，而超时回合里学不到「跟踪」这件事。
-        #
-        # ⚠ ``command_vx`` 同样**无条件**下发。0.0 是「这一级别前进」的正常
-        # 设置，而 ``if stage.command_vx:`` 会把 0.0 当假值跳过 —— 楼梯段的
-        # vx=0 因此从来没被下发过，机器人一直用着平地级的 0.45。
-        #
-        # ⭐⭐ **必须走关键字**（``kw_call``），不能写成
-        # ``env_method("set_command_now", None, None, vx)``。SB3 的
-        # ``env_method`` 是 ``(*method_args, **method_kwargs)`` 原样透传
-        # （``dummy_vec_env.py:127``），于是三个位置实参会**按形参顺序**落到
-        # ``(vy, yaw_rate, vx)`` 上：``None`` 落到 ``vy``、``None`` 落到
-        # ``yaw_rate``、那个 float 落到 **``vx`` 之外的位置**——
-        # 实测结果是 ``vx=None`` 分支不执行，``cfg.command.vx`` 永远是
-        # ``config.yaml`` 的 0.55，楼梯段的 ``command_vx=0.0`` 一级都没生效
-        # （机器人带着 0.55 的前进指令去爬墙）。这种「参数名对不上但类型都能过」
-        # 的错误在静态检查与 smoke 里都不报，只能在数值上抓。
-        kw_call(venv, "set_command_now", vy=None, yaw_rate=None,
-                vx=float(stage.command_vx))
-        if stage.flat_success_distance:
-            venv.env_method("set_flat_success_distance",
-                            distance=stage.flat_success_distance)
-        # ⚠ 这一项**无条件**下发（不放在上面的 if 里）：它是「粘性」的，
-        # 原地指令课程把它设成 False 之后，若不主动恢复，后面的楼梯阶段会
-        # 继续用「撑满回合即成功」的判据 —— 那样墙上永远爬不上去也照样算成功。
-        venv.env_method("set_flat_success_needs_progress",
-                        needs_progress=bool(stage.flat_success_needs_progress))
+        # ⚠ 这里**不能**用 ``if stage.command_vy_max:`` 之类的守卫：量程为 0 是
+        # **有意义的设置**（这一级不练这个方向），跳过下发只会让这一级继承上一级
+        # 的范围。无条件下发，且**必须走关键字**（见 ``kw_call``）。
+        kw_call(venv, "set_commands",
+                vy_max=stage.command_vy_max,
+                yaw_max=stage.command_yaw_max,
+                vx_min=stage.command_vx[0],
+                vx_max=stage.command_vx[1])
         # 奖励课程：这一级的奖励覆盖（``curriculum.reward_overrides``）叠到
         # ``reward:`` 段的基线值上。常见的用法是「台阶越高，越需要抬腿试探」，
         # 于是逐级放大 ``foot_lift`` / ``probe_lift`` 这类成形项。
@@ -350,8 +308,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[动作] 残差模式, action_scale={cfg.action_scale} rad, "
           f"步态先验={'开' if cfg.gait_prior else '关'}")
     cmd = cfg.command
-    print(f"[指令] 基线 vx={cmd.vx:g} m/s；实际 vx 与 vy/yaw 范围由指令课程按级下发"
-          f"（观测里的那 2 维恒在）")
+    print(f"[指令] 基线 vx={cmd.vx:g} m/s；实际三轴范围由指令课程按级下发"
+          f"（观测里的那 3 维恒在）")
     if cfg.gait_prior:
         print(f"[步态] {cfg.gait.summary()}")
     print(f"[奖励] forward_vel={cfg.reward.forward_vel} "
