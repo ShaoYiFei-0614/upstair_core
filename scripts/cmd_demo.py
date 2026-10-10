@@ -31,12 +31,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from play import (  # noqa: E402
+    CAMERA_GIF,
+    FRAME_HEIGHT,
     FRAME_STRIDE,
+    FRAME_WIDTH,
     open_runner,
     resolve_target,
     write_gif,
 )
-from robotdog.config import DEFAULT_CONFIG_PATH, config_to_play, load_config  # noqa: E402
+from robotdog.config import DEFAULT_CONFIG_PATH, load_config  # noqa: E402
 from robotdog.tools import console, paths  # noqa: E402
 
 #: 分段指令表：``(标签, vx, vy, wz)``。每段按顺序跑 ``--hold-steps`` 步。
@@ -134,7 +137,7 @@ def run_demo(env, runner, phases, *, seed: int, hold_steps: int, capture: bool,
 
 def main(argv: list[str] | None = None) -> int:
     console.setup_utf8_console()
-    play = config_to_play(load_config())
+    load_config()  # 早失败：配置有问题就不要等到环境建好才发现
     parser = argparse.ArgumentParser(description="指令跟踪演示与量化")
     parser.add_argument("--run", required=True, help="运行名 / 目录 / .zip")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
@@ -164,8 +167,8 @@ def main(argv: list[str] | None = None) -> int:
           f"量程 vy±{vy_limit:g} wz±{wz_limit:g}")
     stats, frames, trace = run_demo(
         env, runner, phases, seed=args.seed, hold_steps=args.hold_steps,
-        capture=args.gif, camera=str(play["camera"]),
-        width=int(play["width"]), height=int(play["height"]),
+        capture=args.gif, camera=CAMERA_GIF,
+        width=FRAME_WIDTH, height=FRAME_HEIGHT,
     )
 
     print(f"{'指令段':<18}{'指令 vy':>9}{'实测 vy':>9}{'指令 wz':>9}{'实测 wz':>9}")
@@ -183,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.gif and frames:
         out = paths.OUTPUT_GIFS_DIR / f"{target.label}_cmd_{args.phase}.gif"
-        write_gif(out, frames, fps=int(play["fps"]), scale=int(play["scale"]))
+        write_gif(out, frames)
         print(f"  GIF: {out}")
     return 0
 

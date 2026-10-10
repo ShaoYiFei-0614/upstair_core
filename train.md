@@ -153,6 +153,7 @@ runs/<名字>/
   model_final_vecnormalize.pkl                 与它成对的观测/奖励归一化统计
   model_final_env.json                         地形记录（play 默认按它选楼梯）
   summary.json                                 课程定义 + 每级结果 + 全部配置
+  gifs/<批次>/<阶段>/<阶段>.gif                  play --mode gif 的产物（见 §2.1）
   tensorboard/
 ```
 
@@ -162,6 +163,41 @@ runs/<名字>/
 `obs_config`、`reward_config`、`total_timesteps`、`wall_seconds`、`final_model`。
 （`reward_config` 是 `robotdog/reward.py` 的 `RewardConfig` 全部字段的完整快照，当前 30 个。）
 **`play.py` 靠 env.json 与它恢复配置**，所以搬动权重时不要漏掉这两类文件。
+
+### 2.1 用 GIF 判成果（而不是只看日志里的成功率）
+
+**判据以画面姿态为主**：日志里的成功率含动作噪声，`mean_return` 更是可以靠
+「站着不动」刷出来（见 §3.4）。一次 `--mode gif` 会把**课程里的每个阶段**各渲染成
+一个 GIF，平地级与台阶级都在内 —— 平地那几级是判断「跟不跟横向/偏航指令」的
+唯一画面证据：
+
+```bat
+.venv\Scripts\python.exe scripts\play.py --run <名字> --mode gif --batch <批次>
+```
+
+* 产物落 `runs/<名字>/gifs/<批次>/<阶段>/<阶段>.gif`。**批次目录是必须的**：同一个
+  运行名重训一次就会得到一套新 GIF，平铺在一个目录里分不清是哪次训练的；阶段再分
+  一层子目录，则是因为一次就出十来张（地形 × 指令），铺平了同样认不出谁是谁。
+* **HUD 的第 3 行是本回合钉住的速度指令**（`vx` / `vy` / `wz`）以及回合末的
+  滤波实测值。没有这一行，看画面的人分不清「它站着不动」和「指令本来就是 0」。
+  平地段 HUD 第 2 行打「地形 平地（无台阶）」，因为 `台阶 0.0cm × 0 级` 是噪声。
+* 每个阶段用**该级量程内**的一条指令（`robotdog.config.command_for_stage`，取量程的
+  0.8 倍）；量程为 0 的方向就是 0，所以 `flat` 那一级是纯直走。
+* `play.stages` 决定渲染哪些阶段。`auto`（缺省）**优先读运行目录的
+  `summary.json`** —— 里面记着训练时真正跑过哪几级、每级多高，所以「改了课程再回看
+  老运行」不会静默漏掉几级（实测：cmdtrack6 是按 6 级全平地的临时课程训的，若只按
+  当前课程名去对 checkpoint，就只剩 3 级能被渲染）。没有 `summary.json` 时才退回
+  「当前课程里能对上 `checkpoints/<阶段>_final.zip` 的那几级」，再退到全部级。
+  ⚠ 每级的**指令量程**只能按名字从**当前** `config.yaml` 查：训练量程没有存进权重
+  （`env.json` 与 `summary.json` 里都只有基线 `vy_max=0`），脚本对查不到的级会打印
+  `⚠ <阶段>: 无（指令取 0）`。
+* 相机 / 分辨率 / 帧率 / 缩放是 `scripts/play.py` 的**模块常量**（`CAMERA_GIF` /
+  `FRAME_WIDTH` / `FRAME_HEIGHT` / `GIF_FPS` / `GIF_SCALE`），不在 yaml 里。
+  `play.gif_max_frames`（默认 300）限制单回合写入帧数：一帧 960×540 的 uint8 约
+  1.5 MB，回合可能拖过 500 步，不限就会在渲染中途 `MemoryError`（真的发生过）。
+
+读 GIF 的关键画面：脚跟**落在踏面上**还是踢在立面上；跨上第一级后是**站着**还是
+**趴着蹭**；下坡/落地时有没有把机身摔出去。这三件事日志都看不出来。
 
 ---
 
@@ -363,4 +399,11 @@ IK（触地时记抬脚点 → 求目标踏面 → 摆动相插值到落点 → 
 7. 看产品权重在**没训练过的台阶高**上的表现（泛化）比看训练台阶更有信息量。
 8. **并发上限是 2 臂**（本机 15.7 GB）。4 臂 × 8 env 会报
    `engine error: Could not allocate memory`，那是内存不足，**不是地形几何问题**。
+9. **判成果要落到画面上**（§2.1）：先 `--mode gif --batch <批次>` 逐阶段渲染，再看
+   `runs/<名字>/gifs/<批次>/` 里的 GIF。日志里成功率涨、画面上趴着蹭，就是没学会。
+10. **单次训练的成功率差在 ±18 个百分点以内不做结论**：同配置同步数、只换
+    `run.seed`，3 cm 成功率实测在 36%~72% 之间（`experience.md` §14）。
+
+> `scripts/train.py` 写完日志后，`post_process` 之类的旧入口**已删除**；渲染是
+> 独立的一步（`scripts/play.py`），不要在训练脚本里夹带渲染。
 

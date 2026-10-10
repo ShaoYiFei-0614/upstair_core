@@ -62,7 +62,7 @@ OUTPUT_GIFS_DIR: Path = OUTPUT_DIR / "gifs"
 
 | 目录 | 谁建 | 代码位置 |
 | --- | --- | --- |
-| `output/` + `output/gifs/` | `scripts/play.py` 的 `write_gif`，保存前建父目录 | `scripts/play.py:220` `path.parent.mkdir(parents=True, exist_ok=True)` |
+| `output/` + `output/gifs/` | `scripts/play.py` 的 `write_gif`，保存前建父目录 | `scripts/play.py:248` `path.parent.mkdir(parents=True, exist_ok=True)` |
 | `runs/<名字>/` 及其子目录 | `robotdog/training.py` 的 `RunDir.ensure()` | `robotdog/training.py:264` |
 | `.generated/` | `robotdog/go2_model.py` 的 `compile_scene`（编译失败才建） | `robotdog/go2_model.py:405-408` |
 
@@ -114,7 +114,7 @@ GENERATED_DIR: Path = WORKSPACE / ".generated"
 | `GO2_ASSETS_DIR` | `models/unitree_go2/assets` | mesh/纹理目录，编译 MJCF 时的 `meshdir` | `robotdog/go2_model.py:38` |
 | `RUNS_DIR` | `runs/` | 每次训练 run 的子目录 | `robotdog/training.py:37` |
 | `OUTPUT_DIR` | `output/` | 给人看的产物根 | `scripts/play.py`（经 `write_gif` 建父目录） |
-| `OUTPUT_GIFS_DIR` | `output/gifs/` | **交付物**：动画 GIF | `scripts/play.py:362` |
+| `OUTPUT_GIFS_DIR` | `output/gifs/` | **交付物**：动画 GIF | `scripts/play.py:438`（`mode_gif` 里给 `write_gif` 定落点） |
 | `GENERATED_DIR` | `.generated/` | 调试用生成的 MJCF | `robotdog/go2_model.py:405` |
 
 `__all__`（`robotdog/tools/paths.py:28-38`）与上表逐字一致，9 项。
@@ -154,7 +154,7 @@ Path(__file__).resolve()                          # <ws>/robotdog/tools/paths.py
            robotdog/training.py:264 def ensure(self) -> Path: （真正 mkdir 的地方）
 
 [交付 GIF] scripts/play.py:48 from robotdog.tools import console, paths  # noqa: E402
-           scripts/play.py:220 path.parent.mkdir(parents=True, exist_ok=True)（在 write_gif 内）
+           scripts/play.py:248 path.parent.mkdir(parents=True, exist_ok=True)（在 write_gif 内）
            scripts/play.py:362 gif = paths.OUTPUT_GIFS_DIR / f"{name}.gif"
 ```
 

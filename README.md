@@ -369,6 +369,7 @@ checkpoints/<阶段>_final_env.json           该权重训练时的地形（台�
 checkpoints/<阶段>/<阶段>_<步数>_steps.zip  周期检查点
 model_final.zip / _vecnormalize.pkl / _env.json   最后一级的交付权重（三件套）
 summary.json                                课程定义 + 每级结果 + 完整 env/obs/reward 配置
+gifs/<批次>/<阶段>/<阶段>.gif                  play --mode gif 的产物（见 §4.3）
 tensorboard/
 ```
 
@@ -387,21 +388,45 @@ tensorboard/
 
 **地形默认取权重自带的记录**：`<模型>_env.json` 里写了这个 checkpoint 训练时的台阶高，
 所以 `checkpoints/stair9_final.zip` 会自动在 9 cm 上评估。想强制换成别的楼梯，把
-`play.stage_height_cm` 取消注释（`0` = 平地）。
+`play.stage_height_cm` 取消注释（`0` = 平地）。（渲染参数不在 yaml 里：
+相机 / 分辨率 / 帧率 / 缩放固定为 `scripts/play.py` 的模块常量。）
 
 结束时打印成功率、摔倒率、超时率、平均前进/爬升/速度/步数。
 
 ⚠ **至少跑 40 个回合**。10 个回合能给出 ±15 个百分点的错觉。
 
-### 4.3 评估：渲染 GIF
+### 4.3 评估：渲染 GIF（按课程阶段逐个渲染）
 
 ```bat
-.venv\Scripts\python.exe scripts\play.py --run walk1 --mode gif
+.venv\Scripts\python.exe scripts\play.py --run walk1 --mode gif --batch batch1
 ```
 
-在 `output/gifs/<模型名>.gif` 出一个**连续 10 回合**的 GIF（默认每 2 个控制步取一帧 =
-25 fps，左上角有 HUD）。相机固定为 `track`；分辨率、fps、缩放、回合数都在
-`config.yaml` 的 `play` 段。
+**判据以画面姿态为主**，所以 `--mode gif` 会把**课程里的每个阶段**各渲染成一个
+GIF（平地级 + 台阶级），产物落：
+
+```
+runs/<运行名>/gifs/<批次>/<阶段>/<阶段>.gif
+```
+
+* **`--batch` 是给「不同批次的训练」分家的**：同一个运行名重训一次就得到一套新
+  GIF，平铺在一个目录里根本分不清哪张是哪次训练的。不传时从 `config.yaml` 的
+  `play.batch` 取；`play.batch` 也为空就直接落
+  `runs/<运行名>/gifs/<阶段>/<阶段>.gif`。
+* **HUD 第 3 行是本回合钉住的速度指令**（`vx` / `vy` / `wz`）加回合末的滤波实测值。
+  没有这一行，看画面的人分不清「它站着不动」和「指令本来就是 0」。
+* 每个阶段用**该级量程内**的一条指令（`robotdog.config.command_for_stage`，量程的 0.8 倍）；
+  量程为 0 的方向就是 0。渲染哪些阶段由 `play.stages` 决定：`auto`（缺省）优先
+  读运行目录 `summary.json` 里**训练时真正跑过的阶段**（改过课程再看老运行也不会
+  漏渲染），没有它才退回「当前课程里能对上 `checkpoints/<阶段>_final.zip` 的那几级」；
+  `curriculum` 强制渲染当前课程全部级；也可以直接给阶段名或高度列表。
+  `--stage <名字或高度>` 只渲染一个。
+* `--gifs-dir` 直接指定输出根目录（覆盖 `runs/<运行名>/gifs`，批次目录仍会拼上）。
+
+每个 GIF 是**连续 10 回合**，每 2 个控制步取一帧（25 fps，左上角有 HUD）。
+**渲染参数是固定的模块常量**（`scripts/play.py` 的 `CAMERA_GIF = "track"`、
+`FRAME_WIDTH/HEIGHT = 960/540`、`GIF_FPS = 25`、`GIF_SCALE = 2`）—— 相机、分辨率、
+帧率、缩放都是「看画面」的事，不是训练行为，留成 yaml 旋钮只会让人以为改它有意义。
+`play` 段只留真正有语义的开关：回合数、seed、`gif_max_frames`、`stages`、`batch`。
 
 GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mosaic 做中位切分量化，
 再逐帧套用），否则回合之间的色块会闪。
@@ -433,7 +458,7 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
   `env.set_stair(stair)`。
 * 地形由**权重自带的 `<模型>_env.json`** 决定；老权重（在本轮配置化之前训的）没有这个
   文件，会退回 `stair_from_height` 的默认 3 cm，需要手动在 `config.yaml` 里写
-  `play.stage_height_cm`。
+  `play.stage_height_cm`。相机/分辨率/帧率/缩放则**没有** yaml 开关，见 §4.3。
 * **本仓的课程是固定六级**，没有自动晋级/回退、没有域随机化、没有高度带混合。
 * **单次训练的成功率不可当结论用**。同一份 `config.yaml` 只换 `run.seed`，3 cm 单级
   的 250,000 步训练在 **36%~72%** 之间摆动（三次运行的实测，见 `experience.md` §14）。
@@ -453,7 +478,7 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 | --- | --- | --- |
 | `robotdog/env.py` | **1066** | 环境 + 观测 + 指令 + 终止 + 渲染（奖励数学已移出） |
 | `robotdog/go2_model.py` | 460 | MJCF 组装 / 场景编译 / 元信息 |
-| `robotdog/config.py` | **411** | 读 `config.yaml`（含指令课程 / 奖励课程） |
+| `robotdog/config.py` | **443** | 读 `config.yaml`（含指令课程 / 奖励课程 / 播放阶段） |
 | `robotdog/policy.py` | 341 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
 | `robotdog/curriculum.py` | **332** | 课程数据类 + 汇总写出 |
 | `robotdog/training.py` | 323 | 向量环境 / PPO / 运行目录 / 权重加载 |
@@ -463,7 +488,7 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 | `robotdog/tools/paths.py` | **38** | 路径常量（**没有任何函数**） |
 | `robotdog/tools/console.py` | 29 | UTF-8 控制台 |
 | `robotdog/__init__.py` / `tools/__init__.py` | 19 / 18 | 包入口 |
-| `scripts/play.py` | **482** | 评估 / GIF（CLI 只剩 `--run` / `--mode` / `--config`） |
+| `scripts/play.py` | **665** | 评估 / GIF（按课程阶段逐个渲染 + 速度指令 HUD） |
 | `scripts/train.py` | **396** | 训练入口（CLI 只剩 `--run-name` / `--config`） |
 | `scripts/teleop.py` | **288** | 外部控制器演示（遥控操控 + 指令课程消费方） |
 | `scripts/download_go2.py` | 152 | 拉取 Go2 模型资源 |

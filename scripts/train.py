@@ -65,6 +65,25 @@ from robotdog.training import (  # noqa: E402
 MIN_STAGE_STEPS = 1
 
 
+def kw_call(venv, method: str, **kwargs):
+    """用**关键字**调用子环境方法（``venv.env_method`` 的薄封装）。
+
+    ⭐ 存在的唯一理由是堵住一个真事故：``env_method`` 是
+    ``(*method_args, **method_kwargs)`` 原样透传
+    （``stable_baselines3/common/vec_env/dummy_vec_env.py:127``），所以位置实参
+    完全按**形参顺序**绑定。``set_command_now(vy, yaw_rate, vx)`` 曾写成
+    ``env_method("set_command_now", None, None, vx)``，三个实参正好落到
+    ``(vy, yaw_rate, vx)`` —— 类型全对（两个 ``float|None`` + 一个 float），
+    静态检查、smoke、日志全绿，而 ``vx`` 永远收到 ``None``，
+    ``cfg.command.vx`` 一直是 ``config.yaml`` 的 0.55，课程里所有
+    ``command_vx=0.0`` 的级别一个都没生效。
+
+    教训：凡是「多个同类型可选参数」的方法，调用点一律走关键字，
+    让「参数名对不上」变成 ``TypeError`` 而不是静默的错值。
+    """
+    return venv.env_method(method, **kwargs)
+
+
 # --------------------------------------------------------------------------- #
 # 回调
 # --------------------------------------------------------------------------- #
@@ -171,8 +190,9 @@ class Trainer:
         # ⚠ 这里**不能**用 ``if stage.command_vy_max or stage.command_yaw_max:``
         # 之类的守卫：量程为 0 是**有意义的设置**（这一级不练这个方向），
         # 跳过下发只会让这一级继承上一级的范围。无条件下发。
-        venv.env_method("set_commands", stage.command_vy_max,
-                        stage.command_yaw_max)
+        venv.env_method("set_commands",
+                        vy_max=stage.command_vy_max,
+                        yaw_max=stage.command_yaw_max)
         # 平地指令预热的头几级还会（可选地）压低前进指令、缩短成功距离：
         # 指令一放宽，机器人为了跟横移/旋转指令会绕路，原来的 3 m 判据会把
         # 成功拖成超时，而超时回合里学不到「跟踪」这件事。
@@ -180,15 +200,27 @@ class Trainer:
         # ⚠ ``command_vx`` 同样**无条件**下发。0.0 是「这一级别前进」的正常
         # 设置，而 ``if stage.command_vx:`` 会把 0.0 当假值跳过 —— 楼梯段的
         # vx=0 因此从来没被下发过，机器人一直用着平地级的 0.45。
-        venv.env_method("set_command_now", None, None, float(stage.command_vx))
+        #
+        # ⭐⭐ **必须走关键字**（``kw_call``），不能写成
+        # ``env_method("set_command_now", None, None, vx)``。SB3 的
+        # ``env_method`` 是 ``(*method_args, **method_kwargs)`` 原样透传
+        # （``dummy_vec_env.py:127``），于是三个位置实参会**按形参顺序**落到
+        # ``(vy, yaw_rate, vx)`` 上：``None`` 落到 ``vy``、``None`` 落到
+        # ``yaw_rate``、那个 float 落到 **``vx`` 之外的位置**——
+        # 实测结果是 ``vx=None`` 分支不执行，``cfg.command.vx`` 永远是
+        # ``config.yaml`` 的 0.55，楼梯段的 ``command_vx=0.0`` 一级都没生效
+        # （机器人带着 0.55 的前进指令去爬墙）。这种「参数名对不上但类型都能过」
+        # 的错误在静态检查与 smoke 里都不报，只能在数值上抓。
+        kw_call(venv, "set_command_now", vy=None, yaw_rate=None,
+                vx=float(stage.command_vx))
         if stage.flat_success_distance:
             venv.env_method("set_flat_success_distance",
-                            stage.flat_success_distance)
+                            distance=stage.flat_success_distance)
         # ⚠ 这一项**无条件**下发（不放在上面的 if 里）：它是「粘性」的，
         # 原地指令课程把它设成 False 之后，若不主动恢复，后面的楼梯阶段会
         # 继续用「撑满回合即成功」的判据 —— 那样墙上永远爬不上去也照样算成功。
         venv.env_method("set_flat_success_needs_progress",
-                        bool(stage.flat_success_needs_progress))
+                        needs_progress=bool(stage.flat_success_needs_progress))
         # 奖励课程：这一级的奖励覆盖（``curriculum.reward_overrides``）叠到
         # ``reward:`` 段的基线值上。常见的用法是「台阶越高，越需要抬腿试探」，
         # 于是逐级放大 ``foot_lift`` / ``probe_lift`` 这类成形项。

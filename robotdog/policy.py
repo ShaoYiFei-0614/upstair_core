@@ -171,7 +171,7 @@ def policy_arch(model_path: str | Path) -> tuple[int, ...] | None:
     ``(512, 256)`` 建网再 ``set_parameters``，一个用 ``(64, 64)`` 训出来的权重会
     直接 ``RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy: size
     mismatch for mlp_extractor.policy_net.0.weight: copying a param with shape
-    torch.Size([64, 460]) ... the shape in current model is torch.Size([512, 460])``。
+    torch.Size([64, 480]) ... the shape in current model is torch.Size([512, 480])``。
     ``policy_kwargs.net_arch`` 是普通 JSON（``{"pi": [...], "vf": [...]}``），不需要
     解 pickle。
     """
@@ -201,8 +201,8 @@ def env_config_for_model(model_path: str | Path) -> EnvConfig:
     ``<stem>_env.json``（精确，``train.py`` 每个 checkpoint 各存一份）→
     按 ``.zip`` 里保存的观测维度反推是哪几个观测块（**启发式**，会打一行提示）。
 
-    ``EnvConfig()`` 的默认观测是 10 帧 × 46 维 = 460 维，而本仓 ``config.yaml``
-    用 ``history_len: 1`` 只有 46 维；直接用默认配置加载本仓权重会抛
+    ``EnvConfig()`` 的默认观测是 10 帧 × 48 维 = 480 维，而本仓 ``config.yaml``
+    用 ``history_len: 1`` 只有 48 维；直接用默认配置加载本仓权重会抛
     ``ValueError: Observation spaces do not match``，所以反推这条退路必须保留。
 
     反推**不可能**打开 ``obs.base_height``：那个开关在 :class:`ObsConfig` 里

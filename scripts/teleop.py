@@ -40,14 +40,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from robotdog.config import (  # noqa: E402
     DEFAULT_CONFIG_PATH,
-    config_to_play,
     load_config,
 )
 from robotdog.policy import stair_from_height  # noqa: E402
 from robotdog.tools import console, paths  # noqa: E402
 
 from play import (  # noqa: E402
+    CAMERA_GIF,
+    FRAME_HEIGHT,
     FRAME_STRIDE,
+    FRAME_WIDTH,
     draw_hud,
     open_runner,
     resolve_target,
@@ -201,7 +203,7 @@ def run_teleop(env: Go2StairsEnv, runner, controller, *, seed: int,
 
 def main(argv: list[str] | None = None) -> int:
     console.setup_utf8_console()
-    play = config_to_play(load_config())
+    load_config()  # 早失败：配置有问题就不要等到环境建好才发现
     parser = argparse.ArgumentParser(description="外部控制器遥控策略（遥感操控）")
     parser.add_argument("--run", required=True, help="运行名 / 目录 / .zip")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
@@ -254,8 +256,8 @@ def main(argv: list[str] | None = None) -> int:
     for ep in range(args.episodes):
         stats, ep_frames = run_teleop(
             env, runner, controller, seed=args.seed + ep, capture=args.gif,
-            camera=str(play["camera"]), width=int(play["width"]),
-            height=int(play["height"]),
+            camera=CAMERA_GIF, width=FRAME_WIDTH,
+            height=FRAME_HEIGHT,
         )
         frames.extend(ep_frames)
         print(f"  回合 {ep + 1}/{args.episodes}  "
@@ -268,7 +270,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.gif and frames:
         out = paths.OUTPUT_GIFS_DIR / f"{target.label}_teleop.gif"
-        write_gif(out, frames, fps=int(play["fps"]), scale=int(play["scale"]))
+        write_gif(out, frames)
         print(f"  GIF: {out}")
     return 0
 

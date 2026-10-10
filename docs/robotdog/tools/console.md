@@ -62,7 +62,7 @@ if reconfigure is None:
 ### 3.5 调用点是脚本，不是 `robotdog/__init__.py`
 
 `robotdog/__init__.py:15` 只**导入**它、**从不调用**它。真实调用点是
-`scripts/train.py:294` 与 `scripts/play.py:449`，两处都在 `main()` 的第一行。
+`scripts/train.py:294` 与 `scripts/play.py:601`，两处都在 `main()` 的第一行。
 
 理由：编码必须在**任何输出发生之前**生效，而脚本的 `main()` 第一行正是这个确定位置；
 放成包导入的副作用会让「导入一个纯数据模块」改进程 I/O，范围超出合理预期（见
@@ -71,7 +71,7 @@ if reconfigure is None:
 
 **被否决的方案**：在 `console.py` 模块层直接调用自己 —— 否决，因为那样连
 `from robotdog.tools.console import setup_utf8_console` 都会改进程 I/O，而这个函数
-**需要**能被显式调用（`scripts/train.py:294` / `scripts/play.py:449` 正是这么用的），
+**需要**能被显式调用（`scripts/train.py:294` / `scripts/play.py:601` 正是这么用的），
 显式与隐式两条路径会叠加。
 
 **历史腐坏**：本文档与 `robotdog/__init__.py`、`robotdog/tools/console.py` 三处曾一致声称
@@ -134,12 +134,12 @@ scripts/train.py:294  console.setup_utf8_console()        # main() 的第一条�
           → except (ValueError, OSError): pass
 ```
 
-`scripts/play.py:48` 精确导入同一个模块，`scripts/play.py:449` 在 `main()` 的第一行
+`scripts/play.py:49` 精确导入同一个模块，`scripts/play.py:601` 在 `main()` 的第一行
 以同样方式调用：
 
 ```
 scripts/play.py:48    from robotdog.tools import console, paths  # noqa: E402
-scripts/play.py:449   console.setup_utf8_console()               # main() 的第一条语句
+scripts/play.py:601   console.setup_utf8_console()               # main() 的第一条语句
 ```
 
 **没有任何「靠导入触发」的路径**：`import robotdog` 只执行

@@ -109,6 +109,7 @@ warm-start 也就断了）。
 
 ```python
 DEFAULT_CONFIG_PATH: Path = paths.WORKSPACE / "config.yaml"
+PLAY_COMMAND_FRAC: float = 0.8
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]
 def config_to_env(raw: Mapping[str, Any]) -> EnvConfig
@@ -116,6 +117,8 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]
 def config_to_ppo(raw: Mapping[str, Any]) -> dict[str, Any]
 def config_to_run(raw: Mapping[str, Any]) -> dict[str, Any]
 def config_to_play(raw: Mapping[str, Any]) -> dict[str, Any]
+def command_for_stage(stage: StageSpec, *, frac: float = PLAY_COMMAND_FRAC,
+                      vx: float | None = None) -> tuple[float, float, float]
 def n_envs(raw: Mapping[str, Any]) -> int          # env.n_envs, 缺省 8
 def device(raw: Mapping[str, Any]) -> str          # ppo.device, 缺省 "cpu"
 ```
@@ -136,6 +139,12 @@ def _load_gait(gait_file) -> GaitParams
 `config_to_env` 会**弹出**四个键再交给 `_apply`：`obs` 与 `command`（嵌套子段，
 各自单独 `_apply` 到 `cfg.obs` / `cfg.command`）、`n_envs`（属于运行参数，不属于
 `EnvConfig`）、`gait_file`（只有开了 `gait_prior` 才真的读文件）。
+
+`command_for_stage(stage)` 是**播放侧**用的：给一个课程阶段，返回一条「落在该级
+指令量程内」的 `(vx, vy, yaw_rate)` —— 量程为 0 的方向给 0，有量程的给
+`frac × 量程`，`vx` 显式传入则覆盖阶段的前进指令。为什么要它：逐阶段渲染 GIF 时
+必须钉一条**该级真能执行**的指令，否则（例如）在 `flat` 那一级（`vy_max = 0`）
+钉一条 ±0.3 的横移指令，看画面的人会以为策略不会横移，其实是量程本来就没放开。
 
 ## 5. 内部结构与数据流
 
@@ -167,9 +176,16 @@ raw: dict
 | `env.n_envs` | `8` | |
 | `run.name` / `seed` / `save_every` / `log_every` | `course1` / `0` / `50000` / `20` | 代码缺省是 `course1`（`robotdog/config.py:380-387`）；`config.yaml` 现值是 `course3` |
 | `play.episodes_gif` / `episodes_eval` | `10` / `100` | |
-| `play.camera` / `width` / `height` / `fps` / `scale` | `track` / `960` / `540` / `25` / `2` | |
-| `play.seed` | `0` | |
+| `play.gif_max_frames` | `300`（`PLAY_GIF_MAX_FRAMES`） | 单回合最多写入 GIF 的帧数；防渲染中途 `MemoryError` |
+| `play.seed` / `stages` / `batch` | `0` / `auto` / `""` | `stages`：`auto`/`curriculum`/阶段名或高度列表 |
 | `ppo.device` | `cpu` | |
+
+> `play.camera` / `width` / `height` / `fps` / `scale` **已经不在 `config_to_play` 里**
+> （2026-06 移出）：它们改成 `scripts/play.py` 的模块常量 `CAMERA_GIF = "track"`、
+> `FRAME_WIDTH = 960`、`FRAME_HEIGHT = 540`、`GIF_FPS = 25`、`GIF_SCALE = 2`。
+> 理由：相机与编码参数是「看画面」的事，不是训练行为，留成 yaml 旋钮只会让人以为
+> 调它有意义（用户明确要求「相机和 GIF 渲染参数完全可以固定」）。
+> `play.py` 的 `write_gif()` 也随之不再收 `fps` / `scale` 参数。
 
 默认课程（不写 `curriculum` 段时）来自 `robotdog/curriculum.py` 的
 `STAGE_HEIGHTS_CM`（`(0.0, 0.0, 0.0, 3.0, 6.0, 9.0)`）与

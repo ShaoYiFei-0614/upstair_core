@@ -159,14 +159,26 @@ ppo:
 
 
 # --- 播放 / 评估 ----------------------------------------------------------
-# 渲染参数固定在这里，命令行不再暴露。
+# 播放参数：只留「渲染哪些东西」的开关；相机 / 分辨率 / 帧率 / 缩放固定在
+# scripts/play.py 的模块常量里（CAMERA_GIF / FRAME_WIDTH / FRAME_HEIGHT /
+# GIF_FPS / GIF_SCALE），写在这里也没有人会去调。
 play:
   episodes_gif: 10           # 模式 1：连续渲染多少个回合
   episodes_eval: 100         # 模式 2：跑多少个回合统计成功率
   seed: 0
-  camera: track              # 相机固定
-  width: 960
-  height: 540
-  fps: 25
-  scale: 2                   # GIF 编码前的整数缩小倍数
+  # 单个回合最多写进 GIF 多少帧。渲染帧是 960×540 的 uint8（一帧约 1.5 MB），
+  # 而回合可能拖到 500 步以上；逐阶段累积不加限会 MemoryError（曾经真的崩过）。
+  # 上限一到就按当前预算反算步幅、稀疏取帧 —— 宁可 GIF 短一点，也不能中途崩。
+  gif_max_frames: 300
+  # gif 模式渲染哪些**课程阶段**（地形 × 指令）。平地级与台阶级都会渲染：
+  # 平地那几级是判断「跟不跟横向/偏航指令」的唯一画面证据。
+  #   auto（缺省） = 运行目录里有 checkpoints/<阶段>_final.zip 时只渲染那些阶段，
+  #                  否则渲染下面 curriculum 的全部级
+  #   curriculum   = 强制渲染全部级
+  #   [flat, flat_2, stair3cm] 或 [0, 0, 3] = 只渲染列出的阶段
+  stages: auto
+  # 这一批 GIF 的标签，用来把**不同批次训练**的产物分开：
+  # 落在 runs/<run>/gifs/<batch>/<阶段>/<阶段>.gif；留空则直接落
+  # runs/<run>/gifs/<阶段>/<阶段>.gif。也接受命令行 --batch 覆盖。
+  batch: ""
   # stage_height_cm: 5.0     # 取消注释可覆盖楼梯高度（0 = 平地），否则用权重自带的地形

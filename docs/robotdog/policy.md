@@ -100,8 +100,8 @@ JSON 往返会把元组变成 list。`EnvConfig.kp` / `kd` 和 `GaitParams` 里�
 ```
 RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy:
     size mismatch for mlp_extractor.policy_net.0.weight: copying a param with shape
-    torch.Size([64, 460]) from checkpoint, the shape in current model is
-    torch.Size([512, 460]).
+    torch.Size([64, 480]) from checkpoint, the shape in current model is
+    torch.Size([512, 480]).
     size mismatch for action_net.weight: copying a param with shape torch.Size([12, 64])
     from checkpoint, the shape in current model is torch.Size([12, 256]).
 ```
@@ -110,6 +110,11 @@ RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy:
 `load_policy()` 用 `arch = policy_arch(model_path) or DEFAULT_NET_ARCH`。
 **这条是「超参搬进 `config.yaml`」之后才暴露的**：结构以前写死在两处、恰好一致，
 现在配置能改它，两处就必须真的对齐（见 `experience.md` §7.1）。
+
+> 上面 traceback 里的 `480` 来自 `EnvConfig()` 的默认观测（`history_len=10` ×
+> `frame_size=48`）；本仓 `config.yaml` 用 `history_len: 1`，所以现役权重是 48 维。
+> 一份**归档** checkpoint 里还能看到 `460`／`474`（`frame_size=46` 时代），那类权重
+> 与现役观测不兼容，`_obs_config_for_dim` 反推不出来时会直接报错而不是静默降级。
 
 ### 3.7 每个 checkpoint 各记一份地形，而不是只记整条课程
 

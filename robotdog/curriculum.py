@@ -281,6 +281,13 @@ def write_summary(
 
     ``meta`` 里的键会**平铺到顶层**，再补上 ``stages`` / ``results`` /
     ``total_timesteps`` 三个由本函数计算的键。
+
+    ``stages`` 里每一级除了地形与预算，还**逐级**记下该级的指令量程
+    （``command_vy_max`` / ``command_yaw_max`` / ``command_vx``）与平地成功口径
+    （``flat_success_distance`` / ``flat_success_needs_progress``）。这些是**课程
+    逐级下发的值**，``env.json`` 里只有 ``config.yaml`` 的基线（``vy_max=0``），
+    回放时如果拿基线去评，判出来的成功/失败与训练时不是同一件事 —— 曾经因此把
+    「原地撑满回合」的级按「前进 N 米」去评，GIF 上打出一堆假的「摔倒/超时」。
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -293,6 +300,11 @@ def write_summary(
             "timesteps": int(s.timesteps),
             "learning_rate": float(s.learning_rate),
             "is_flat": bool(s.is_flat),
+            "command_vy_max": float(s.command_vy_max),
+            "command_yaw_max": float(s.command_yaw_max),
+            "command_vx": float(s.command_vx),
+            "flat_success_distance": float(s.flat_success_distance),
+            "flat_success_needs_progress": bool(s.flat_success_needs_progress),
             "spec": _spec_as_dict(s.spec),
         }
         for s in stages

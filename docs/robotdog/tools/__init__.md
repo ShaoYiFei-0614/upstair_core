@@ -101,7 +101,7 @@ import robotdog
 ```
 
 **没有调用 `setup_utf8_console()` 的那一步** —— 包入口只导入它。编码修复由脚本在
-`main()` 第一行显式调用（`scripts/train.py:294` / `scripts/play.py:449`）。
+`main()` 第一行显式调用（`scripts/train.py:294` / `scripts/play.py:601`）。
 
 从任一子模块进入时，父包 `robotdog.tools` 必然先执行，所以上表对 `from robotdog.tools.paths import RUNS_DIR` 同样成立：
 

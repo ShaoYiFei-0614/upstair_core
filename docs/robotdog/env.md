@@ -596,10 +596,10 @@ class Go2StairsEnv(gym.Env):
 
 | 成员 | 定义 | 谁在调它 |
 | --- | --- | --- |
-| `__init__(stair=None, cfg=None, *, seed=None)` | `:231` | `scripts/train.py:144` 的 `Trainer.make_env()`、`scripts/play.py:157` |
-| `reset(*, seed=None, options=None)` | `:827` | SB3 自动调；`scripts/play.py:295` 手动调（每回合带新 seed）。`set_stair()` 里**不**调它 |
-| `step(action)` | `:913` | SB3 自动调；`scripts/play.py:308` 手动调（**注意**：`env.py` 里那条 `def step` 上方的 docstring 是说明，不是调用） |
-| `render(camera="side", *, width, height)` | `:1001` | 只有 `scripts/play.py:311`（GIF 与静帧） |
+| `__init__(stair=None, cfg=None, *, seed=None)` | `:231` | `scripts/train.py:144` 的 `Trainer.make_env()`、`scripts/play.py:176` 的 `open_runner()` |
+| `reset(*, seed=None, options=None)` | `:827` | SB3 自动调；`scripts/play.py:343` 手动调（每回合带新 seed）。`set_stair()` 里**不**调它 |
+| `step(action)` | `:913` | SB3 自动调；`scripts/play.py:358` 手动调（**注意**：`env.py` 里那条 `def step` 上方的 docstring 是说明，不是调用） |
+| `render(camera="side", *, width, height)` | `:1001` | 只有 `scripts/play.py:321`（GIF 与静帧） |
 | `close()` | `:1061` | `scripts/play.py:478`、`scripts/train.py:352` |
 | `set_stair(stair)` | `:320` | **当前没有任何调用点**（唯一调用者 `training.set_terrain()` 已删）。唯一调用者 `training.set_terrain()` 已在本轮清理中删除；课程每一级走 `make_vec_env` 新建环境，而不是换地形。保留是因为「换地形」是真需求且文档把它当公开 API |
 
@@ -933,8 +933,11 @@ robotdog.env
    在 trot 步态下的振荡幅度与指令量程相当，会让「跟指令」这一项变成噪声。
 7. **`obs.size` 一定是 `history_len × frame_size`**：`frame_size` 由 42 加上各开关
    （见 §6），`history_len` 是 `config.yaml` 的 `env.obs.history_len`（`ObsConfig` dataclass
-   默认 10，**本仓现值 1**，见 §3.2）。`robotdog/policy.py` 的
-   docstring 拿「474 维」举例，那个数**不是** `10 × frame_size` 能凑出来的（474/10 = 47.4）；
+   默认 10，**本仓现值 1**，见 §3.2）。§6 表里的 `size`（`history_len=10`）列只是
+   **假设默认历史长度**时的值，别把它当成现役维数：本仓 `history_len=1` ⇒
+   现役 **48 维**（`docs/robotdog/policy.md` 的 traceback 写 `480`，那是默认 10 帧）。
+   `robotdog/policy.py` 的 docstring 历史版本曾拿「474 维」举例，那个数**不是**
+   `10 × frame_size` 能凑出来的（474/10 = 47.4）；
    `_obs_config_for_dim(total, history_len=10)`（该函数的默认值仍是 10）因此也永远无法反推出它；
    反推本仓权重时要显式传 `history_len=1`，或者更稳妥地用权重自带的 `_env.json`。
 8. **`step()` 的 `info` 有 22 个键**：`reward_terms` / `trunk_contact` / `leg_contact` /

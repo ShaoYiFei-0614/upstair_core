@@ -2,19 +2,23 @@
 
 两种模式（渲染参数固定，不再由命令行暴露）：
 
-* ``--mode gif``  —— 连续跑 ``play.episodes_gif`` 个回合（默认 10），逐帧渲染并叠加
-  HUD，最后编码成一个 GIF，落在 ``output/gifs/<名字>.gif``。
+* ``--mode gif``  —— 按课程阶段**逐个**跑 ``play.episodes_gif`` 个回合（默认 10），
+  逐帧渲染并叠加 HUD（**含当前速度指令**），编码成 GIF。
+  ⭐ 产物按阶段分目录：``runs/<运行名>/gifs/<批次>/<阶段>_<高度>cm.gif``。
+  平地级与台阶级都渲染 —— 平地那几级是判断「跟不跟横向/偏航指令」的唯一画面证据。
 * ``--mode eval`` —— 跑 ``play.episodes_eval`` 个回合（默认 100），只统计成功率 /
   摔倒率 / 超时率 / 平均前进。
 
 用法::
 
-    .venv\\Scripts\\python.exe scripts\\play.py --run course1 --mode eval
-    .venv\\Scripts\\python.exe scripts\\play.py --run course1 --mode gif
+    .venv\\Scripts\\python.exe scripts\\play.py --run cmdtrack --mode eval
+    .venv\\Scripts\\python.exe scripts\\play.py --run cmdtrack --mode gif --batch batch1
+    .venv\\Scripts\\python.exe scripts\\play.py --run cmdtrack --mode gif --stage stair9cm
 
 ``--run`` 可以是运行名、运行目录，或者直接的 ``.zip`` 路径。同名目录下的
 ``*_vecnormalize.pkl`` 会被自动加载；没有它时按原始观测推理（会提示）。
-想换楼梯高度或相机，改 ``config.yaml`` 的 ``play:`` 段，不加命令行参数。
+相机等渲染参数改 ``config.yaml`` 的 ``play:`` 段；要渲染哪些阶段用
+``play.stages``（``auto`` | ``curriculum`` | 阶段名或高度列表）配 ``--stage``。
 
 评估至少跑 40 回合，10 回合能给出 ±15 个百分点的错觉。
 """
@@ -23,11 +27,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
+from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 
@@ -35,10 +41,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from robotdog.config import (  # noqa: E402
     DEFAULT_CONFIG_PATH,
+    command_for_stage,
     config_to_play,
+    config_to_stages,
+    device,
     load_config,
 )
 from robotdog.env import EnvConfig, Go2StairsEnv  # noqa: E402
+
+if TYPE_CHECKING:  # pragma: no cover - 只为类型注解
+    from robotdog.curriculum import StageSpec
+
 from robotdog.policy import (  # noqa: E402
     ObsNorm,
     env_config_for_model,
@@ -53,8 +66,19 @@ from stable_baselines3.common.vec_env import VecEnv  # noqa: E402
 FRAME_STRIDE = 2
 
 #: 评估模式用的相机（固定，不暴露到命令行）。
-#: GIF 模式的相机不在这里 —— 它来自 ``config.yaml`` 的 ``play.camera``。
 CAMERA_EVAL = "side"
+
+# 渲染参数**固定**，不经 ``config.yaml``（相机、分辨率、帧率、缩放都是「看画面」
+# 的事，不是「训练行为」的事，留成旋钮只会让人以为改它们有意义）：
+#: GIF 用的相机：沿 x 跟随机器人的侧视图。
+CAMERA_GIF = "track"
+#: 渲染分辨率（mujoco 离屏渲染），GIF 编码前按 :data:`GIF_SCALE` 整数缩小。
+FRAME_WIDTH = 960
+FRAME_HEIGHT = 540
+#: GIF 帧率（也是 HUD 里「帧 i/n」的基准）。
+GIF_FPS = 25
+#: GIF 编码前的整数缩小倍数；2 表示 960×540 → 480×270。
+GIF_SCALE = 2
 
 #: 字体候选（HUD 用），按顺序取第一个存在的。
 _FONT_CANDIDATES = (
@@ -206,30 +230,34 @@ def draw_hud(frame: np.ndarray, lines: Sequence[str]) -> np.ndarray:
     return np.asarray(img)
 
 
-def write_gif(path: Path, frames: Sequence[np.ndarray], *, fps: int,
-              scale: int) -> Path:
-    """把 RGB 帧编码成 GIF，全片共用一套调色板。
+def write_gif(path: Path, frames: Sequence[np.ndarray]) -> Path:
+    """把 RGB 帧编码成 GIF（帧率 :data:`GIF_FPS`、缩小 :data:`GIF_SCALE`），全片共用一套调色板。
 
     先取若干帧拼成缩略 mosaic 求全局调色板，再逐帧用它量化。逐帧各自
     ``quantize()`` 会让同一只狗在不同帧里换颜色（GIF 只有 256 色，必须共用）。
+
+    内存上**不能**先把所有帧转成 RGB 一起留着：一回合 200 帧 × 1920×1080 的
+    RGB 就是约 6 GB（曾因此 ``MemoryError``）。所以按「逐帧转 → 立刻量化成 P 模式
+    → 丢掉 RGB」的流式做法，峰值只有单帧成本，而调色板只从抽样的 16 帧缩略图求。
     """
     if not frames:
         raise ValueError("没有帧可以写入 GIF")
     from PIL import Image
 
+    scale = GIF_SCALE
     path.parent.mkdir(parents=True, exist_ok=True)
-    rgb = []
-    for frame in frames:
+
+    def to_small(frame: np.ndarray) -> "Image.Image":
         img = Image.fromarray(np.ascontiguousarray(frame)).convert("RGB")
         if scale > 1:
             img = img.resize(
                 (max(1, img.width // scale), max(1, img.height // scale)), Image.BOX
             )
-        rgb.append(img)
+        return img
 
-    sample = min(16, len(rgb))
-    idx = np.linspace(0, len(rgb) - 1, sample).round().astype(int)
-    picks = [rgb[int(i)] for i in idx]
+    sample = min(16, len(frames))
+    idx = np.linspace(0, len(frames) - 1, sample).round().astype(int)
+    picks = [to_small(frames[int(i)]) for i in np.unique(idx)]
     cols = 4
     rows = (len(picks) + cols - 1) // cols
     tw, th = max(1, picks[0].width // 4), max(1, picks[0].height // 4)
@@ -237,13 +265,15 @@ def write_gif(path: Path, frames: Sequence[np.ndarray], *, fps: int,
     for i, img in enumerate(picks):
         mosaic.paste(img.resize((tw, th), Image.BOX), ((i % cols) * tw, (i // cols) * th))
     palette = mosaic.quantize(colors=256, method=Image.MEDIANCUT)
+    del picks, mosaic
 
-    images = [img.quantize(palette=palette, dither=Image.FLOYDSTEINBERG) for img in rgb]
+    images = [to_small(frame).quantize(palette=palette, dither=Image.FLOYDSTEINBERG)
+              for frame in frames]
     images[0].save(
         path,
         save_all=True,
         append_images=images[1:],
-        duration=max(20, int(round(1000.0 / max(1, fps)))),
+        duration=max(20, int(round(1000.0 / max(1, GIF_FPS)))),
         loop=0,
         optimize=True,
         disposal=2,
@@ -269,6 +299,14 @@ class EpisodeOutcome:
     success: bool = False
     fell: bool = False
     timeout: bool = False
+    #: 本回合**钉住**的那条指令（GIF 的 HUD 要显示它，否则看画面的人无法判断
+    #: 「它没动」是策略的问题还是指令本来就是 0）。
+    cmd_vx: float = 0.0
+    cmd_vy: float = 0.0
+    cmd_yaw: float = 0.0
+    #: 回合末的滤波实测值（与奖励里用的同一个量，见 ``robotdog/reward.py``）。
+    act_vy: float = 0.0
+    act_yaw: float = 0.0
     frames: list[np.ndarray] = field(default_factory=list)
 
     @property
@@ -279,27 +317,40 @@ class EpisodeOutcome:
 
 
 def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
-                capture: bool, camera: str, width: int, height: int) -> EpisodeOutcome:
+                capture: bool, camera: str, width: int, height: int,
+                command: tuple[float, float, float] | None = None,
+                max_frames: int = 0) -> EpisodeOutcome:
     """跑一个回合；``capture=True`` 时每 ``FRAME_STRIDE`` 步取一帧。
 
-    ⭐ 回合开始后**必须把指令钉成** ``cfg.command`` 里的那一条，而且
-    :meth:`Go2StairsEnv.set_command_now` 要在 ``reset()`` **之后**调 —— ``reset()``
-    会按 ``command_vy_max`` / ``command_yaw_max`` 重抽指令，把之前写进去的覆盖掉。
-    不钉的话，同一个权重每次回放的指令都不一样，GIF 里机器人一会儿横着走一会儿
-    转圈，看的人会误以为它「不听指挥」；钉住之后回放是确定的，也与
-    ``.tmp/eval_run.py`` 的评估口径一致。
+    ``max_frames`` 给定时先按它反算一个「至少 ``FRAME_STRIDE`` 的步幅」，只到那时
+    才取帧。渲染帧是 960×540 的 uint8（一帧约 1.5 MB），回合可能拖到 500 步以上，
+    而一回合只占 GIF 里的一小段 —— 不设上限时逐阶段累积会把内存吃光（曾因此
+    ``MemoryError``）。``0`` 表示不限制（``cmd_demo`` / ``teleop`` 那种单个短片用）。
+
+    ⭐ 回合开始后**必须把指令钉住**，而且 :meth:`Go2StairsEnv.set_command_now`
+    要在 ``reset()`` **之后**调 —— ``reset()`` 会按 ``command_vy_max`` /
+    ``command_yaw_max`` 重抽指令，把之前写进去的覆盖掉。不钉的话，同一个权重
+    每次回放的指令都不一样，GIF 里机器人一会儿横着走一会儿转圈，看的人会误以为
+    它「不听指挥」；钉住之后回放是确定的，也与 ``.tmp/eval_run.py`` 的评估口径一致。
+
+    ``command`` 给定时用它（顺序 ``vx, vy, yaw_rate``），否则沿用 ``cfg.command``
+    当前那一条。**每个课程阶段的量程不同**，所以调用方应当用
+    :func:`robotdog.config.command_for_stage` 挑一条该级量程内的指令。
 
     ``reset()`` 返回的 ``obs`` 是在钉指令**之前**算出来的，所以要用
     :meth:`Go2StairsEnv._observation` 重取一份。
     """
     obs, _ = env.reset(seed=seed)
     cmd = env.cfg.command
-    env.set_command_now(vx=float(cmd.vx), vy=float(cmd._now[1]),
-                        yaw_rate=float(cmd._now[2]))
+    vx, vy, yaw = (command if command is not None
+                   else (float(cmd.vx), float(cmd._now[1]), float(cmd._now[2])))
+    env.set_command_now(vx=float(vx), vy=float(vy), yaw_rate=float(yaw))
     obs = env._observation()
     x0, z0 = float(env.base_pos[0]), float(env.base_pos[2])
     max_steps = int(env.cfg.episode_length_s / env.cfg.control_dt)
-    out = EpisodeOutcome(episode=episode, steps=0)
+    take = max(FRAME_STRIDE, -(-max_steps // max_frames)) if max_frames > 0 else FRAME_STRIDE
+    out = EpisodeOutcome(episode=episode, steps=0, cmd_vx=float(vx),
+                         cmd_vy=float(vy), cmd_yaw=float(yaw))
     info: dict[str, Any] = {}
     terminated = truncated = False
 
@@ -307,7 +358,7 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
     while not (terminated or truncated) and step < max_steps:
         obs, _r, terminated, truncated, info = env.step(policy.predict(obs))
         step += 1
-        if capture and step % FRAME_STRIDE == 0:
+        if capture and step % take == 0:
             out.frames.append(env.render(camera, width=width, height=height).copy())
 
     dt = step * env.cfg.control_dt
@@ -316,6 +367,8 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
     out.height_gain = round(float(env.base_pos[2]) - z0, 3)
     out.speed = round(out.distance / dt, 3) if dt > 0 else 0.0
     out.final_x = round(float(env.base_pos[0]), 3)
+    out.act_vy = round(float(env.filtered_lateral_vel), 3)
+    out.act_yaw = round(float(env.filtered_yaw_rate), 3)
     out.success = bool(info.get("is_success", False))
     out.fell = bool(terminated) and not out.success
     out.timeout = bool(truncated) and not out.success
@@ -324,11 +377,25 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
 
 def hud_for(out: EpisodeOutcome, total: int, stair, *, frame_index: int,
             frame_total: int) -> list[str]:
-    """生成一帧上的 HUD 文本。"""
+    """生成一帧上的 HUD 文本。
+
+    指令那一行是**必须**的：没有它，看 GIF 的人无法区分「它站着不动」和
+    「指令本来就是 0」，也无法判断横移/自转跟得准不准。括号里是回合**末**的
+    滤波实测值（回合内的瞬时值会跳，写在 HUD 上反而误导）。
+
+    平地阶段（``stair.step_height == 0``）打 ``台阶 0.0cm × 0 级`` 是纯噪声，
+    所以那一行换成地形名。
+    """
+    if stair is None or float(stair.step_height) <= 0.0:
+        terrain = "地形 平地（无台阶）  踏面 50cm"
+    else:
+        terrain = (f"台阶 {stair.step_height * 100:.1f}cm × {stair.n_up} 级"
+                   f"  踏面 {stair.tread * 100:.0f}cm  顶端 {stair.crest_height:.2f}m")
     return [
         f"回合 {out.episode + 1}/{total}  {out.status}",
-        f"台阶 {stair.step_height * 100:.1f}cm × {stair.n_up} 级"
-        f"  踏面 {stair.tread * 100:.0f}cm  顶端 {stair.crest_height:.2f}m",
+        terrain,
+        f">指令 vx {out.cmd_vx:+.2f}  vy {out.cmd_vy:+.2f}  wz {out.cmd_yaw:+.2f} m/s, rad/s"
+        f"（实测 vy {out.act_vy:+.2f}  wz {out.act_yaw:+.2f}）",
         f"前进 {out.distance:+.2f}m  速度 {out.speed:.2f}m/s  帧 {frame_index}/{frame_total}",
     ]
 
@@ -339,17 +406,24 @@ def hud_for(out: EpisodeOutcome, total: int, stair, *, frame_index: int,
 
 
 def mode_gif(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
-             name: str, play: dict[str, Any]) -> int:
-    """模式 1：连续渲染 ``episodes`` 个回合，合成一个 GIF。"""
-    camera = str(play["camera"])
-    width, height = int(play["width"]), int(play["height"])
-    fps, scale = int(play["fps"]), int(play["scale"])
+             name: str, play: dict[str, Any], gif_dir: Path | None = None,
+             command: tuple[float, float, float] | None = None) -> int:
+    """模式 1：连续渲染 ``episodes`` 个回合，合成一个 GIF。
+
+    ``gif_dir`` 决定产物落点。**每个课程阶段一个子目录**（默认
+    ``runs/<run>/gifs/<批次>/<阶段>/<阶段>.gif``）—— 批次在外层把两次训练分开，
+    阶段在内层，否则十来个「地形 × 指令」的 GIF 平铺在一起根本认不出哪个是哪个。
+    """
+    camera = CAMERA_GIF
+    width, height = FRAME_WIDTH, FRAME_HEIGHT
+    max_frames = int(play.get("gif_max_frames", 0) or 0)
 
     frames: list[np.ndarray] = []
     outcomes: list[EpisodeOutcome] = []
     for ep in range(episodes):
         out = run_episode(env, policy, episode=ep, seed=seed + ep, capture=True,
-                          camera=camera, width=width, height=height)
+                          camera=camera, width=width, height=height,
+                          command=command, max_frames=max_frames)
         outcomes.append(out)
         total = len(out.frames)
         for i, frame in enumerate(out.frames):
@@ -357,13 +431,15 @@ def mode_gif(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
                                                   frame_index=i + 1,
                                                   frame_total=total)))
         print(f"  回合 {ep + 1:>2}/{episodes}  {out.status}  "
-              f"{out.steps:>4} 步  前进 {out.distance:+.2f}m  帧 {total}", flush=True)
+              f"{out.steps:>4} 步  前进 {out.distance:+.2f}m  帧 {total}  "
+              f"指令 vx{out.cmd_vx:+.2f}/vy{out.cmd_vy:+.2f}/wz{out.cmd_yaw:+.2f}  "
+              f"实测 vy{out.act_vy:+.2f}/wz{out.act_yaw:+.2f}", flush=True)
 
-    gif = paths.OUTPUT_GIFS_DIR / f"{name}.gif"
-    write_gif(gif, frames, fps=fps, scale=scale)
+    gif = (gif_dir or paths.OUTPUT_GIFS_DIR) / f"{name}.gif"
+    write_gif(gif, frames)
     ok = sum(o.success for o in outcomes)
     size_mb = gif.stat().st_size / 1e6
-    print(f"\nGIF: {gif}  ({len(frames)} 帧, {size_mb:.1f} MB, {fps} fps)")
+    print(f"\nGIF: {gif}  ({len(frames)} 帧, {size_mb:.1f} MB, {GIF_FPS} fps)")
     print(f"成功率: {ok}/{episodes} = {100.0 * ok / max(1, episodes):.1f}%")
     return 0
 
@@ -425,6 +501,14 @@ def parse_args(argv: Sequence[str] | None = None):
     ap.add_argument("--mode", choices=("gif", "eval"), default="gif")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG_PATH),
                     help="配置文件路径（渲染参数从这里读）")
+    ap.add_argument("--stage", default=None,
+                    help="gif 模式只渲染这一个课程阶段（名字或高度 cm）；"
+                         "缺省渲染课程的全部级")
+    ap.add_argument("--batch", default=None,
+                    help="批次标签，覆盖 config.yaml 的 play.batch；"
+                         "产物落 runs/<run>/gifs/<阶段>_<批次>/")
+    ap.add_argument("--gifs-dir", default=None,
+                    help="GIF 输出根目录（覆盖 runs/<run>/gifs）")
     return ap.parse_args(argv)
 
 
@@ -445,37 +529,299 @@ def _default_height_cm(play: dict[str, Any], target: PlayTarget) -> float | None
     return None
 
 
+#: 渲染一个阶段所需的一切。``label`` 用来给产物目录命名，所以必须是文件系统
+#: 友好且人类可读的。
+RenderStage = namedtuple("RenderStage", "name label height_cm command spec")
+#: ``spec`` 是**训练记录里的那一级**（``summary.json`` 的逐级下发值），用来把该级的
+#: 指令量程与平地成功判据装回环境；``None`` = 没有记录，只能沿用 config.yaml 的基线。
+
+
+def _run_root(run: str, target: PlayTarget) -> Path | None:
+    """``--run`` 指向的那个运行目录（找不到返回 ``None``）。"""
+    cand = Path(run)
+    if cand.is_dir():
+        return cand
+    if cand.is_absolute() or "/" in run or "\\" in run:
+        return cand if cand.is_dir() else None
+    got = paths.RUNS_DIR / run
+    return got if got.is_dir() else None
+
+
+def _gif_dir_for(gifs_root: Path, stage: RenderStage) -> Path:
+    """一个阶段一个子目录，阶段名就是 GIF 文件名。
+
+    目录结构是 ``gifs/<批次>/<阶段>/<阶段>.gif``：**批次在外层**，这样两次训练
+    的产物天然分开、可以并排比较；阶段在内层，避免十来个「地形 × 指令」的 GIF
+    平铺在一个目录里认不出哪个是哪个。
+    """
+    return gifs_root / stage.label
+
+
+def _stages_from_run(run_root: Path | None) -> list[dict[str, Any]]:
+    """从运行目录的 ``summary.json`` 读「训练时真正跑过哪些阶段、每级什么口径」。
+
+    为什么需要它：``auto`` 原来只按**当前** ``config.yaml`` 的课程名去对
+    ``checkpoints/<名字>_final.zip``，于是「改过课程再去看老运行」会静默漏渲染
+    （cmdtrack6 是按 6 级全平地的临时课程训的，用当前课程的 6 级名去对只剩 3 个能对上，
+    另外 3 级的 GIF 无声消失）。这里直接读训练记录，名字、高度、**逐级指令量程与
+    成功口径**都是当时的真值。
+
+    返回原始 dict 列表（缺字段由调用方兜底），读不到就返回空列表。
+    """
+    if run_root is None:
+        return []
+    summary = run_root / "summary.json"
+    if not summary.exists():
+        return []
+    try:
+        raw = json.loads(summary.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [st for st in (raw.get("stages", []) or []) if st.get("name")]
+
+
+def _spec_from_json(obj: Any) -> StageSpec | None:
+    """按 ``summary.json`` 里记的**逐级实测值**重建一个 :class:`StageSpec`。
+
+    只用它来查「这一级当时的下发值」（指令量程、成功口径、预算、学习率）——
+    地形仍然由权重自带的 ``env.json`` 决定（``stair=...`` 传进环境），所以这里
+    的 ``spec`` 字段只是个占位，不参与回放。
+
+    返回 ``None`` 表示这份记录还没有这些字段（本仓 2026-06 之前的运行都没有），
+    调用方应当退回 ``config.yaml`` 的同名级，并**明确告诉用户**这是推断值。
+    """
+    if "command_vy_max" not in obj:
+        return None
+    try:
+        return StageSpec(
+            name=str(obj["name"]),
+            step_height=float(obj.get("step_height", 0.0)),
+            spec=stair_from_height(float(obj.get("step_height", 0.0))),
+            timesteps=int(obj.get("timesteps", 0)),
+            learning_rate=float(obj.get("learning_rate", 0.0)),
+            label=str(obj.get("label", "")),
+            command_vy_max=float(obj.get("command_vy_max", 0.0)),
+            command_yaw_max=float(obj.get("command_yaw_max", 0.0)),
+            command_vx=float(obj.get("command_vx", 0.0)),
+            flat_success_distance=float(obj.get("flat_success_distance", 0.0)),
+            flat_success_needs_progress=bool(
+                obj.get("flat_success_needs_progress", True)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _same_command(a: StageSpec | None, b: StageSpec) -> bool:
+    """两级的「回放口径」是否一致（指令量程 + 平地成功口径）。"""
+    if a is None:
+        return False
+    return (abs(a.command_vy_max - b.command_vy_max) < 1e-9
+            and abs(a.command_yaw_max - b.command_yaw_max) < 1e-9
+            and abs(a.command_vx - b.command_vx) < 1e-9
+            and abs(a.flat_success_distance - b.flat_success_distance) < 1e-9
+            and a.flat_success_needs_progress == b.flat_success_needs_progress)
+
+
+def _stage_plan(cfg: dict[str, Any], play: dict[str, Any], target: PlayTarget,
+                run: str, only: str | None) -> list[RenderStage]:
+    """``gif`` 模式要渲染哪些阶段（地形 × 指令）。
+
+    ⭐ **平地级必须也在内**：``config_to_stages`` 前几级就是平地（``flat`` /
+    ``flat_2`` …），它们带横向/偏航指令，是判断「跟不跟指令」的唯一画面证据；
+    只渲染台阶段会看不到指令跟踪这一半的能力。
+
+    ``play.stages``：
+
+    ``"auto"``（缺省）
+        运行目录里有 ``summary.json`` 就用它记的**训练阶段**（名字、高度、逐级指令
+        量程与成功口径都是当时的真值），否则退回「当前课程里能对上
+        ``checkpoints/<阶段>_final.zip`` 的那几级」，再退到当前课程全部级。
+    ``"curriculum"``
+        强制渲染当前配置课程的全部级。
+    其他
+        阶段名列表，或高度列表（cm）。
+
+    ⭐ **回放口径必须来自训练记录**：``command_vy_max`` / ``command_yaw_max`` /
+    ``command_vx`` / ``flat_success_distance`` / ``flat_success_needs_progress``
+    都是**课程逐级下发**的，不是全局配置。拿 ``config.yaml`` 的当前值去评老运行，
+    判出来的成功/失败与训练时不是同一件事 —— 实测踩过：cmdtrack6 前两级的训练口径是
+    「``vx=0`` 原地、撑满回合算成功」，而当前 ``config.yaml`` 给的是「``vx=0.45``、
+    前进 2 m 算成功」，于是 GIF 上凭「没走够 2 米」给一个明明在跟指令的级判 20% 成功率。
+    2026-06 之后 ``summary.json`` 会记这些字段；更早的运行只能退回当前课程并打印 ⚠。
+    """
+    stages = config_to_stages(cfg)
+    by_name = {st.name: st for st in stages}
+    by_height: dict[float, StageSpec] = {}
+    for st in stages:
+        by_height.setdefault(round(st.step_height, 6), st)
+    spec = play.get("stages", "auto")
+
+    # 每一级：(名字, 台阶高 m, 用于取口径的 StageSpec 或 None, 口径来源说明)
+    picked: list[tuple[str, float, StageSpec | None, str]] = []
+
+    def pick_one(key: str) -> tuple[str, float, StageSpec | None, str] | None:
+        key = key.strip()
+        for st in stages:
+            if st.name == key or f"{st.step_height * 100:g}" == key:
+                return (st.name, st.step_height, st, "当前课程同名级")
+        if key.startswith("flat"):
+            return (key, 0.0, None, "无（当前课程没有这一级，指令取 0）")
+        got = re.fullmatch(r"(?:stair)?(\d+(?:\.\d+)?)", key)
+        if got:
+            h = float(got.group(1)) / 100.0
+            return (key, h, None, "无（高度取自阶段名，指令取 0）")
+        return None
+
+    if only:
+        hit = pick_one(only)
+        if hit is None:
+            raise SystemExit(f"--stage {only!r} 不在课程里；可选: "
+                             + ", ".join(st.name for st in stages))
+        picked = [hit]
+    elif spec == "curriculum":
+        picked = [(st.name, st.step_height, st, "当前课程") for st in stages]
+    elif spec == "auto":
+        run_root = _run_root(run, target)
+        trained = _stages_from_run(run_root)
+        have = [st for st in stages
+                if run_root is not None
+                and (run_root / "checkpoints" / f"{st.name}_final.zip").exists()]
+        if trained:
+            heads = ", ".join(f"{st['name']}({float(st.get('step_height', 0.0)) * 100:g}cm)"
+                              for st in trained)
+            print(f"阶段来自运行目录 summary.json: {heads}")
+            for obj in trained:
+                name = str(obj["name"])
+                height = float(obj.get("step_height", 0.0))
+                recorded = _spec_from_json(obj)
+                ref = by_name.get(name) or by_height.get(round(height, 6))
+                if recorded is not None:
+                    if _same_command(recorded, ref) if ref is not None else True:
+                        picked.append((name, height, recorded,
+                                       "训练记录（summary.json 逐级下发值）"))
+                    else:
+                        print(f"  ⚠ {name}: 当前 config.yaml 的口径与训练记录不同"
+                              f"（训练 vy±{recorded.command_vy_max:g}"
+                              f"/wz±{recorded.command_yaw_max:g}"
+                              f"/vx{recorded.command_vx:g}"
+                              f"/成功距离{recorded.flat_success_distance:g}m"
+                              f"/需前进={recorded.flat_success_needs_progress}；"
+                              f"配置 vy±{ref.command_vy_max:g}"
+                              f"/wz±{ref.command_yaw_max:g}"
+                              f"/vx{ref.command_vx:g}"
+                              f"/成功距离{ref.flat_success_distance:g}m"
+                              f"/需前进={ref.flat_success_needs_progress}）"
+                              f" —— **以训练记录为准**")
+                        picked.append((name, height, recorded, "训练记录（同上级）"))
+                else:
+                    src = ("当前课程同名级（旧运行没有记口径）" if ref is not None
+                           else "无（指令取 0）")
+                    picked.append((name, height, ref, src))
+        elif have:
+            print("阶段来自运行目录的检查点: " + ", ".join(st.name for st in have))
+            picked = [(st.name, st.step_height, st, "当前课程同名级") for st in have]
+        else:
+            picked = [(st.name, st.step_height, st, "当前课程") for st in stages]
+    else:
+        wanted = [str(x) for x in spec] if isinstance(spec, (list, tuple)) else [str(spec)]
+        missing: list[str] = []
+        for w in wanted:
+            hit = pick_one(w)
+            if hit is None:
+                missing.append(w)
+            else:
+                picked.append(hit)
+        if missing:
+            raise SystemExit("play.stages 里有课程中不存在的阶段: " + ", ".join(missing))
+
+    out: list[RenderStage] = []
+    for name, height, ref, src in picked:
+        # 逐级用该级自己的量程挑一条指令（量程为 0 的方向就是 0）。
+        vx, vy, wz = command_for_stage(ref) if ref is not None else (0.0, 0.0, 0.0)
+        label = name if height <= 0.0 else f"{name}_{height * 100:g}cm"
+        if ref is None:
+            print(f"  ⚠ {name}: {src}")
+        out.append(RenderStage(name, label, height * 100.0, (vx, vy, wz), ref))
+    return out
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     console.setup_utf8_console()
     args = parse_args(argv)
-    play = config_to_play(load_config(args.config))
+    cfg = load_config(args.config)
+    play = config_to_play(cfg)
     target = resolve_target(args.run)
+    # 设备取自 ppo.device（与训练同一个入口），不是 play 段 —— play 段没有这个键。
+    dev = device(cfg)
     print(f"模型: {target.model_path}")
     print(f"归一化: {target.norm_path or '（无）'}")
 
-    stair = stair_from_height(_default_height_cm(play, target))
-    policy, env, _venv = open_runner(target, stair=stair, device=str(play.get("device", "cpu")))
-    try:
-        print(f"地形: 台阶 {env.stair.step_height * 100:.1f}cm × {env.stair.n_up} 级"
-              f"  踏面 {env.stair.tread * 100:.0f}cm")
-        print(f"观测: {env.observation_space.shape}  动作: {env.action_space.shape}")
-
-        if args.mode == "gif":
-            return mode_gif(
+    if args.mode != "gif":
+        stair = stair_from_height(_default_height_cm(play, target))
+        policy, env, _venv = open_runner(target, stair=stair, device=dev)
+        try:
+            print(f"地形: 台阶 {env.stair.step_height * 100:.1f}cm × {env.stair.n_up} 级"
+                  f"  踏面 {env.stair.tread * 100:.0f}cm")
+            print(f"观测: {env.observation_space.shape}  动作: {env.action_space.shape}")
+            return mode_eval(
                 env, policy,
-                episodes=int(play["episodes_gif"]),
+                episodes=int(play["episodes_eval"]),
                 seed=int(play["seed"]),
-                name=target.label,
-                play=play,
+                model_path=target.model_path,
             )
-        return mode_eval(
-            env, policy,
-            episodes=int(play["episodes_eval"]),
-            seed=int(play["seed"]),
-            model_path=target.model_path,
-        )
-    finally:
-        env.close()
+        finally:
+            env.close()
+
+    # ---- gif：一个批次一个根目录、一个阶段一个文件 ------------------------- #
+    batch = (args.batch if args.batch is not None else str(play.get("batch", ""))).strip()
+    batch = re.sub(r"[^0-9A-Za-z_.\-\u4e00-\u9fff]", "_", batch)
+    if args.gifs_dir:
+        gifs_root = Path(args.gifs_dir)
+        if batch:
+            gifs_root = gifs_root / batch
+    else:
+        run_root = _run_root(args.run, target)
+        gifs_root = (run_root / "gifs") if run_root else paths.OUTPUT_GIFS_DIR
+        if batch:
+            gifs_root = gifs_root / batch
+    if batch:
+        print(f"批次: {batch}")
+
+    plan = _stage_plan(cfg, play, target, args.run, args.stage)
+    print(f"阶段: {len(plan)} 个 —— "
+          + ", ".join(f"{s.name}({s.height_cm:g}cm)" for s in plan))
+    episodes = int(play["episodes_gif"])
+    seed = int(play["seed"])
+    failed = 0
+    for i, stage in enumerate(plan):
+        gif_dir = _gif_dir_for(gifs_root, stage)
+        print(f"\n[{i + 1}/{len(plan)}] {stage.label}  "
+              f"台阶 {stage.height_cm:g}cm  "
+              f"指令 vx{stage.command[0]:+.2f}/vy{stage.command[1]:+.2f}"
+              f"/wz{stage.command[2]:+.2f}")
+        stair = stair_from_height(stage.height_cm)
+        policy, env, _venv = open_runner(target, stair=stair, device=dev)
+        try:
+            # ⭐ 把这一级的**训练口径**装回环境：指令量程与平地成功判据都是课程逐级
+            # 下发的，不回灌的话回放会拿 config.yaml 的基线去判成功/失败，GIF 的
+            # 结局标签就是假的（曾把「原地撑满回合」的级按「前进 N 米」评成 20%）。
+            if stage.spec is not None:
+                env.set_commands(vy_max=stage.spec.command_vy_max,
+                                 yaw_max=stage.spec.command_yaw_max)
+                if stage.spec.command_vx:
+                    env.cfg.command.vx = float(stage.spec.command_vx)
+                if stage.spec.flat_success_distance:
+                    env.set_flat_success_distance(stage.spec.flat_success_distance)
+                env.set_flat_success_needs_progress(
+                    bool(stage.spec.flat_success_needs_progress))
+            print(f"  观测: {env.observation_space.shape}  动作: {env.action_space.shape}")
+            failed += mode_gif(env, policy, episodes=episodes, seed=seed,
+                               name=stage.label, play=play, gif_dir=gif_dir,
+                               command=stage.command)
+        finally:
+            env.close()
+    print(f"\n全部 GIF 输出到: {gifs_root}")
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":

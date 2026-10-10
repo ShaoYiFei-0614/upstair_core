@@ -321,6 +321,37 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
     return stages
 
 
+#: 回放时横向/偏航指令取量程的哪个比例。
+#: 用满量程（``1.0``）能看出「能不能跟上极限指令」，但早期课程的量程很小、
+#: 满量程反而接近噪声；取 ``0.8`` 是「几乎拉满但仍留一点余量」的折中。
+PLAY_COMMAND_FRAC: float = 0.8
+
+#: 每个回合最多写进 GIF 多少帧。渲染帧是 960×540 的 uint8（一帧约 1.5 MB），
+#: 训练和渲染同时跑时内存很紧：一回合 500 步按 ``FRAME_STRIDE=2`` 就是 250 帧，
+#: 但摔倒前若一直站着，回合能拖到 500 帧以上，逐阶段累积就会 ``MemoryError``。
+#: 上限一到就按当前帧数反算步幅、稀疏取帧 —— 宁可 GIF 短一点，也不能在
+#: 渲染中途崩掉（2026 年 6 月那次 ``MemoryError`` 就是没有这个上限）。
+PLAY_GIF_MAX_FRAMES: int = 300
+
+
+def command_for_stage(stage: StageSpec, *, frac: float = PLAY_COMMAND_FRAC,
+                      vx: float | None = None) -> tuple[float, float, float]:
+    """给一个课程阶段挑一条**有代表性**的回放指令 ``(vx, vy, yaw_rate)``。
+
+    为什么要按阶段挑：课程里每一级的指令量程不同（平地预热级从
+    ``vy_max=0.1`` 逐级放到 ``0.4``，楼梯级全是 0），同一个固定指令在不同级
+    上含义完全不同 —— 拿 ``vy=0.4`` 去播放只要量程 0.1 的第 1 级，等于问它
+    「跟一个你从没见过的指令」，看画面会误判成「策略不会横移」。
+
+    规则：量程为 0 的方向给 0（该级本来就不练这个方向）；有量程的方向给
+    ``frac × 量程``。``vx`` 显式给定时覆盖阶段的前进指令。
+    """
+    out_vx = float(stage.command_vx if vx is None else vx)
+    vy = float(stage.command_vy_max) * frac if stage.command_vy_max else 0.0
+    yaw = float(stage.command_yaw_max) * frac if stage.command_yaw_max else 0.0
+    return out_vx, round(vy, 4), round(yaw, 4)
+
+
 def _validate_reward_keys(values: Mapping[str, Any], *, where: str) -> None:
     """奖励字段名的合法性检查（``RewardConfig`` 是唯一真值来源）。"""
     valid = set(RewardConfig.__dataclass_fields__)
@@ -388,16 +419,28 @@ def config_to_run(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def config_to_play(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """``play:`` 段，补上渲染默认值。"""
+    """``play:`` 段，补上渲染默认值。
+
+    ⚠ 这里**没有**相机/分辨率/帧率/缩放那四个键：渲染参数固定在
+    ``scripts/play.py`` 的模块常量里（``CAMERA_GIF`` / ``FRAME_WIDTH`` /
+    ``FRAME_HEIGHT`` / ``GIF_FPS`` / ``GIF_SCALE``），写进 yaml 只会让人以为
+    调它有意义。所以 ``config.yaml`` 的 ``play:`` 段若残留这四个键，
+    ``_section`` / ``_apply`` 那套「未知键报错」会在别处先炸 —— 直接删掉即可。
+    """
     play = _section(raw, "play")
     play.setdefault("episodes_gif", 10)
     play.setdefault("episodes_eval", 100)
     play.setdefault("seed", 0)
-    play.setdefault("camera", "track")
-    play.setdefault("width", 960)
-    play.setdefault("height", 540)
-    play.setdefault("fps", 25)
-    play.setdefault("scale", 2)
+    #: ``play.gif_max_frames`` —— 单回合最多写进 GIF 的帧数（见 ``PLAY_GIF_MAX_FRAMES``）。
+    play.setdefault("gif_max_frames", PLAY_GIF_MAX_FRAMES)
+    #: ``play.stages`` —— ``gif`` 模式要渲染哪些课程阶段（地形 × 指令）。
+    #: ``"curriculum"`` = 配置里 ``curriculum:`` 段的全部级；``"auto"``（缺省）
+    #: 在运行目录里有 ``checkpoints/<阶段>_final.zip`` 时按检查点定级、否则
+    #: 退回当前课程的阶段表。也接受阶段名列表或高度列表（cm）。
+    play.setdefault("stages", "auto")
+    #: ``play.batch`` —— 这一批 GIF 的标签。用来把「不同批次训练出来的 GIF」
+    #: 分开放：产物落在 ``runs/<run>/gifs/<批次>/<阶段>.gif``。
+    play.setdefault("batch", "")
     return play
 
 
