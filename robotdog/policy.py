@@ -207,6 +207,14 @@ def env_config_for_model(model_path: str | Path) -> EnvConfig:
     反推**不可能**打开 ``obs.base_height``：那个开关在 :class:`ObsConfig` 里
     被硬性禁止（含地形真值，破坏盲走），所以旧架构那些维度要么被无歧义
     还原，要么走 :meth:`_obs_config_for_dim` 返回 ``None`` 的报错分支。
+
+    ⚠ **反推回来的配置只有观测块是对的，其余全是 dataclass 默认值。**
+    ``gait_prior``（默认 ``False``）与 ``action_scale``（默认 ``0.30``）之类
+    的字段**不进观测**，任何按维度反推的方案在结构上都不可能恢复它们 ——
+    ``train.py`` 的每个中间检查点现在都写 ``_env.json`` 就是为了让这条退路
+    不被用到。用错的配置回放权重会得到**相反**的结论：同一个检查点，
+    ``gait_prior=False / action_scale=0.30`` 下测得 vx 指令响应斜率
+    ``−0.0001``，而训练时那套（``True / 0.60``）下是 ``+0.667``。
     """
     model_path = Path(model_path)
     env_kw = _config_from_env_json(model_path)

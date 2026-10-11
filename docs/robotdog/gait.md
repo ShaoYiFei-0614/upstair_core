@@ -313,7 +313,7 @@ config.yaml: env.gait_prior / env.gait_file                    # robotdog/config
       → GaitParams.from_search_json(PATH)                      # 有 "top" 键时
         → from_dict(entry["gait"] | action_scale=entry["action_scale"])
   → cfg.gait_prior = True; cfg.gait = gait
-  → play.py 打印 f"[步态] {cfg.gait.summary()}"                 # scripts/train.py:333 的启动横幅
+  → play.py 打印 f"[步态] {cfg.gait.summary()}"                 # scripts/train.py:354 的启动横幅
 ```
 
 ## 6. 关键常量与默认值

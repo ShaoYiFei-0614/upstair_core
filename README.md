@@ -523,7 +523,7 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 | `robotdog/env.py` | **1253** | 环境 + 观测 + 指令 + 终止 + 渲染（奖励数学已移出） |
 | `robotdog/go2_model.py` | 467 | MJCF 组装 / 场景编译 / 元信息 |
 | `robotdog/config.py` | **534** | 读 `config.yaml`（含指令课程 / 奖励课程 / 播放阶段） |
-| `robotdog/policy.py` | 344 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
+| `robotdog/policy.py` | 352 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
 | `robotdog/curriculum.py` | **339** | 课程数据类 + 汇总写出 |
 | `robotdog/training.py` | 323 | 向量环境 / PPO / 运行目录 / 权重加载 |
 | `robotdog/reward.py` | **395** | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
@@ -533,7 +533,7 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 | `robotdog/tools/console.py` | 29 | UTF-8 控制台 |
 | `robotdog/__init__.py` / `tools/__init__.py` | 19 / 18 | 包入口 |
 | `scripts/play.py` | **856** | 评估 / GIF（按课程阶段逐个渲染 + 速度指令 HUD） |
-| `scripts/train.py` | **411** | 训练入口（CLI 只剩 `--run-name` / `--config`） |
+| `scripts/train.py` | **432** | 训练入口（CLI 只剩 `--run-name` / `--config`） |
 | `scripts/teleop.py` | **338** | 外部控制器演示（遥控操控 + 指令课程消费方） |
 | `scripts/download_go2.py` | 152 | 拉取 Go2 模型资源 |
 | `scripts/cmd_demo.py` | 200 | 指令跟踪的量化评估（`--phase inplace\|walk`） |

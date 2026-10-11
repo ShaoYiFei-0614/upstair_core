@@ -319,7 +319,7 @@ robotdog/env.py:1114  reward, terms = ...；_advance_foot_air_time(foot_contact)
 * `robotdog/policy.py:17` `from robotdog.env import CommandConfig, EnvConfig, ObsConfig, RewardConfig`
   —— `reward_config` 会随每个 checkpoint 的 `_env.json` 一起存盘（`policy.py:95`
   用 `_rebuild(RewardConfig, ...)` 还原），所以历史权重的奖励口径可回溯。
-* `scripts/train.py:334` 打印 `[奖励] forward_vel=... foot_lift=... success=...
+* `scripts/train.py:355` 打印 `[奖励] forward_vel=... foot_lift=... success=...
   termination=...` 作为启动横幅。
 
 ## 8. 实测与经验教训

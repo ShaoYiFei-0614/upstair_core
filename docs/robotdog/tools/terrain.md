@@ -377,7 +377,7 @@ pyramid : 平地 → n_up 级上升立面 → 平的 crest → n_down 级下降�
 | `robotdog/env.py` | `height_at` | 地形高、`foot_clearance`、支撑面参照（见 §5） |
 | `robotdog/env.py` | `crest_height` | 出生点与**成功判据**（`terrain_height_under_base >= crest_height - 1e-9`） |
 | `robotdog/config.py:326` | `demo_stairs_spec, flat_spec` | `config_to_stages()` 按 `config.yaml` 造阶段表 —— **当前唯一的课程构造路径**（见 `docs/robotdog/config.md`） |
-| `robotdog/policy.py:319/322` | `StairSpec, demo_stairs_spec, flat_spec` | `stair_from_height()` 由高度造地形，服务 `play.py` |
+| `robotdog/policy.py:327/330` | `StairSpec, demo_stairs_spec, flat_spec` | `stair_from_height()` 由高度造地形，服务 `play.py` |
 | `robotdog/training.py:38` | `StairSpec` | 建环境/向量环境时透传 spec |
 | `scripts/play.py` | `stair.crest_height` | 评估/渲染的头部信息打印 |
 

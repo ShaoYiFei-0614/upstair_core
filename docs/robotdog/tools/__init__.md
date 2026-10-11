@@ -101,7 +101,7 @@ import robotdog
 ```
 
 **没有调用 `setup_utf8_console()` 的那一步** —— 包入口只导入它。编码修复由脚本在
-`main()` 第一行显式调用（`scripts/train.py:302` / `scripts/play.py:780`）。
+`main()` 第一行显式调用（`scripts/train.py:323` / `scripts/play.py:780`）。
 
 从任一子模块进入时，父包 `robotdog.tools` 必然先执行，所以上表对 `from robotdog.tools.paths import RUNS_DIR` 同样成立：
 
@@ -140,7 +140,7 @@ from robotdog.tools.paths import RUNS_DIR
 | `robotdog/go2_model.py:39` | `from robotdog.tools.terrain import TERRAIN_GEOM_GROUP` |
 | `robotdog/go2_model.py:405` | `from robotdog.tools.paths import GENERATED_DIR`（函数内延迟导入） |
 | `robotdog/policy.py:18` | `from robotdog.tools.terrain import StairSpec` |
-| `robotdog/policy.py:322` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec`（函数内延迟导入） |
+| `robotdog/policy.py:330` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec`（函数内延迟导入） |
 | `robotdog/training.py:37` | `from robotdog.tools.paths import RUNS_DIR` |
 | `robotdog/training.py:38` | `from robotdog.tools.terrain import StairSpec` |
 | `scripts/train.py:55` | `from robotdog.tools import console  # noqa: E402` |
@@ -164,7 +164,7 @@ from robotdog.tools.paths import RUNS_DIR
 * **`import robotdog.tools` 只加载标准库**（`sys` / `pathlib` / `dataclasses`），既不加载 `numpy`、也不加载 `mujoco`。这是删掉 `touch.py`（唯一 import mujoco 的工具模块）与 `terrain.py` 里两个射线函数（唯一 import numpy 的地方）之后的直接收益。
 * **`__all__` 只影响 `from robotdog.tools import *`**。`robotdog.tools.console` 等属性无论如何都可访问。
 * **模块名就是文件路径**。规范路径 `robotdog.tools.terrain` 对应 `robotdog/tools/terrain.py`；报错信息里的模块路径不会指向别的文件，因为顶层没有兼容层。
-* **本文件不调用 `setup_utf8_console()`**。`robotdog/__init__.py:15` 也只导入它、不调用。任何 `import robotdog.*` 都**不会**修好编码 —— 这件事只由脚本在 `main()` 第一行显式调用完成（`scripts/train.py:302` / `scripts/play.py:780`）。文档曾长期声称「导入即生效」，那是假的。
+* **本文件不调用 `setup_utf8_console()`**。`robotdog/__init__.py:15` 也只导入它、不调用。任何 `import robotdog.*` 都**不会**修好编码 —— 这件事只由脚本在 `main()` 第一行显式调用完成（`scripts/train.py:323` / `scripts/play.py:780`）。文档曾长期声称「导入即生效」，那是假的。
 
 ## 10. 示例用法
 

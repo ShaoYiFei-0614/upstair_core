@@ -640,7 +640,7 @@ class Go2StairsEnv(gym.Env):
 | `reset(*, seed=None, options=None)` | `:972` | SB3 自动调；`scripts/play.py:343` 手动调（每回合带新 seed）。`set_stair()` 里**不**调它 |
 | `step(action)` | `:1079` | SB3 自动调；`scripts/play.py:359` 手动调（**注意**：`env.py` 里那条 `def step` 上方的 docstring 是说明，不是调用） |
 | `render(camera="side", *, width, height)` | `:1188` | 只有 `scripts/play.py:362`（GIF 与静帧） |
-| `close()` | `:1248` | `scripts/play.py:805/850`、`scripts/train.py:361` |
+| `close()` | `:1248` | `scripts/play.py:805/850`、`scripts/train.py:382` |
 | `set_stair(stair)` | `:401` | **当前没有任何调用点**（唯一调用者 `training.set_terrain()` 已删）。课程每一级走 `make_vec_env` 新建环境，而不是换地形。保留是因为「换地形」是真需求且文档把它当公开 API |
 
 **当前实际用到哪些？**

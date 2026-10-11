@@ -106,14 +106,25 @@ class ProgressCallback(BaseCallback):
 
 
 class CheckpointCallback(BaseCallback):
-    """每 ``every`` 步存一份 ``checkpoints/<阶段>/<阶段>_<步数>_steps.zip``。"""
+    """每 ``every`` 步存一份 ``checkpoints/<阶段>/<阶段>_<步数>_steps.zip``。
+
+    同时写一份同名的 ``_env.json``。**必须写**：``_env.json`` 是唯一能把
+    「这个权重当时跑在什么配置下」带出来的东西，而 `gait_prior` /
+    `action_scale` 这类字段**不进观测**，任何「按观测维度反推」的方案都
+    不可能恢复它们。中间检查点没有 ``_env.json`` 时，评测脚本只能拿到
+    dataclass 默认值，于是「用另一套配置回放权重」——实测同一个检查点
+    在这两种配置下给出「斜率 −0.0001」与「斜率 +0.667」两个相反结论。
+    """
 
     def __init__(self, directory: Path, stage: str, *, every: int,
+                 env_cfg: EnvConfig | None = None, step_height: float | None = None,
                  verbose: int = 0) -> None:
         super().__init__(verbose)
         self.directory = Path(directory)
         self.stage = stage
         self.every = max(1, int(every))
+        self.env_cfg = env_cfg
+        self.step_height = step_height
         self._last = 0
 
     def _on_step(self) -> bool:
@@ -124,6 +135,9 @@ class CheckpointCallback(BaseCallback):
         base = self.directory / f"{self.stage}_{self.num_timesteps}_steps"
         self.model.save(str(base))
         save_vecnormalize(self.model, base)
+        if self.env_cfg is not None:
+            save_env_json(base, self.env_cfg, step_height=self.step_height,
+                          stage=self.stage)
         return True
 
 
@@ -241,9 +255,16 @@ class Trainer:
         callbacks = [ProgressCallback(log_every=int(self.run["log_every"]))]
         every = int(self.run["save_every"])
         if every > 0:
+            # 中间检查点也要带 ``_env.json``：从子环境读回**这一级实际生效**的
+            # 配置（已叠好指令量程与奖励覆盖），而不是 ``config.yaml`` 的基线。
+            try:
+                live_cfg = venv.get_attr("cfg")[0]
+            except Exception:  # noqa: BLE001 - 取不到就不写，不影响训练
+                live_cfg = None
             callbacks.append(
                 CheckpointCallback(self.rundir.checkpoints / stage.name, stage.name,
-                                   every=every)
+                                   every=every, env_cfg=live_cfg,
+                                   step_height=stage.step_height)
             )
         t0 = time.time()
         model.learn(total_timesteps=stage.timesteps, callback=callbacks,
