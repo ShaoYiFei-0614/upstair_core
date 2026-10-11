@@ -285,12 +285,16 @@ def step_height_from_model(model_path: str | Path) -> float | None:
         return None
 
 
-def _obs_config_for_dim(total: int, history_len: int = 10) -> ObsConfig | None:
+def _obs_config_for_dim(total: int, history_len: int = 1) -> ObsConfig | None:
     """反推是哪几个观测块拼出了 ``total`` 维。
 
     ``base_lin_vel_body``(3) / ``gait_phase``(2) / ``step_height``(1) / ``command``(3)
     / ``vel_filter``(2) 五个开关组合不多，直接枚举。``base_lin_vel_body`` 与
     ``command`` 默认开，所以枚举顺序把它们放前面，使最简配置优先命中。
+
+    ``history_len`` 的默认值是 **1**（本仓 ``config.yaml`` 的取值）。它与
+    帧大小是相乘关系，只用总维度无法分离两者：51 维可以是「1 帧 × 51」也可以
+    是别的高帧数组合。所以默认取本仓最常用的历史长度，需要别的长度就显式传。
 
     **``base_height`` 故意不在枚举里**：它在 :class:`ObsConfig` 的 ``__post_init__``
     里被硬性禁止（含地形真值，会破坏盲走），所以任何会打开它的组合都不可构造。
