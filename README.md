@@ -158,8 +158,8 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 #### `kp` / `kd` 是怎么定的
 
 `kp` / `kd` 是**关节 PD** 的增益（`tau = kp*(target-q) - kd*qd`），每条腿三个（hip / thigh / calf）
-再 `tile(..., 4)` 成 12 维（`robotdog/env.py:293` 的 `self._kp` 与 `robotdog/env.py:294` 的 `self._kd`；
-增益本身的定义在 `robotdog/env.py:194-195` 的 `kp` / `kd` 元组）。它们不是拍脑袋的，而是按**实测关节惯量**
+再 `tile(..., 4)` 成 12 维（`robotdog/env.py` 的 `self._kp` 与 `self._kd`（`__init__` 里 `np.tile(...)` 成 12 维）；
+增益本身的定义在 `robotdog/env.py` 的 `EnvConfig.kp` / `EnvConfig.kd` 元组）。它们不是拍脑袋的，而是按**实测关节惯量**
 配到目标带宽与阻尼比上的。用 `mujoco.mj_fullM(model, data, M)`（mujoco 3.12 的签名是
 `mj_fullM(model, data, dst)`）在 `home_qpos` 姿态下取关节空间惯量的对角元 `J`：
 
@@ -238,7 +238,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 两个关键点：
 
 * **所有奖励数学都在 `robotdog/reward.py`**（`compute_reward(env, ...)`；它会写环境的
-  三个记忆字段，见该模块 docstring），`robotdog/env.py:714-725` 的 `_compute_reward()`
+  三个记忆字段，见该模块 docstring），`robotdog/env.py:726-737` 的 `_compute_reward()`
   只留一个转发方法。为了便于研究与改动，单看那一个文件就够。
 * 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
   （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
@@ -520,15 +520,15 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 
 | 文件 | 行数 | 说明 |
 | --- | --- | --- |
-| `robotdog/env.py` | **1227** | 环境 + 观测 + 指令 + 终止 + 渲染（奖励数学已移出） |
+| `robotdog/env.py` | **1253** | 环境 + 观测 + 指令 + 终止 + 渲染（奖励数学已移出） |
 | `robotdog/go2_model.py` | 467 | MJCF 组装 / 场景编译 / 元信息 |
 | `robotdog/config.py` | **534** | 读 `config.yaml`（含指令课程 / 奖励课程 / 播放阶段） |
-| `robotdog/policy.py` | 339 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
+| `robotdog/policy.py` | 344 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
 | `robotdog/curriculum.py` | **339** | 课程数据类 + 汇总写出 |
 | `robotdog/training.py` | 323 | 向量环境 / PPO / 运行目录 / 权重加载 |
 | `robotdog/reward.py` | **395** | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
 | `robotdog/tools/terrain.py` | 287 | 楼梯几何 |
-| `robotdog/gait.py` | 191 | 开环 trot 先验 |
+| `robotdog/gait.py` | 285 | 开环 trot 先验 |
 | `robotdog/tools/paths.py` | **38** | 路径常量（**没有任何函数**） |
 | `robotdog/tools/console.py` | 29 | UTF-8 控制台 |
 | `robotdog/__init__.py` / `tools/__init__.py` | 19 / 18 | 包入口 |
@@ -560,28 +560,28 @@ SB3 `BaseCallback` 钩子）、文档化的公开 API（`GaitParams.static()` / 
 > 变成零调用点。但「换地形」本身是真需求（当前课程每级是 `make_vec_env` 新建环境，
 > 不是换地形），所以保留。
 
-### 6.3 `env.py` 为什么还有 1227 行
+### 6.3 `env.py` 为什么还有 1253 行
 
 它不是「奖励算在里面」——奖励数学在 `robotdog/reward.py`（395 行）。`env.py` 的构成是：
 
 | 类别 | 行数 | 占比 |
 | --- | --- | --- |
-| 代码 | 677 | 55.2% |
-| docstring | 234 | 19.1% |
-| 注释 | 153 | 12.5% |
-| 空行 | 163 | 13.3% |
+| 代码 | 625 | 49.9% |
+| docstring | 332 | 26.5% |
+| 注释 | 184 | 14.7% |
+| 空行 | 112 | 8.9% |
 
 （分类口径：**注释 > 字符串 > 代码**，空行单列一类，四类相加恰好等于总行数。）
 
-其中 `class Go2StairsEnv`（`robotdog/env.py:266-1227`）一个类占 **962 行**（代码 562，docstring 238），最大的成员是
+其中 `class Go2StairsEnv`（`robotdog/env.py:278-1253`）一个类占 **976 行**（代码 531，docstring 280），最大的成员是
 `step()`（103 行）、`__init__()`（97 行）、`reset()`（62 行）、`render()`（59 行）、
-`_obs_frame()`（37 行）与 `_contact_flags()`（37 行）。类里共 46 个成员、合计 880 行。
+`_obs_frame()`（37 行）与 `_contact_flags()`（37 行）。类里共 47 个成员、合计 893 行。
 
 长的原因有三条，都是**有意的**：
 
 1. **一个 Gymnasium 环境的接口面天生就宽**。`step` / `reset` / `render` / `close` +
    观测 / 终止 / 成功 / 接触 / 高度参照 / 落脚空气时间 / 模型与场景构建 / 楼梯测距，
-   加起来 **46 个方法 + 3 条类级语句**（其中 14 个方法是 `@property` 只读量）。这不是
+   加起来 **47 个方法 + 3 条类级语句**（其中 14 个方法是 `@property` 只读量）。这不是
    「一个类干了很多事」，而是「Gym 环境本来就要求这么多钩子」。
 2. **`render()` 的 59 行是相机与 HUD**，与物理仿真没有关系。它可以搬到 `scripts/play.py`
    或独立的渲染模块，但那样它就得通过 30 多个 `env.<私有属性>` 读状态——**耦合面反而更大**，
@@ -596,7 +596,7 @@ SB3 `BaseCallback` 钩子）、文档化的公开 API（`GaitParams.static()` / 
 拆开会把「谁能改物理状态」这条边界搅浑。当前的取舍是：**奖励数学已经拆干净，
 渲染暂不拆。**
 
-`Go2StairsEnv` 的 41 个成员逐个是干什么的、各自被谁调用，见
+`Go2StairsEnv` 的 47 个成员逐个是干什么的、各自被谁调用，见
 [`docs/robotdog/env.md`](docs/robotdog/env.md) §4 与 §5。
 
 ### 6.4 改完代码怎么验证

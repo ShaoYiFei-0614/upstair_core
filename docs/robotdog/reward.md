@@ -29,7 +29,7 @@
 
 奖励是这套系统里唯一「写错了不会报错、只会几小时后训不出来」的部分。原先它作为
 `Go2StairsEnv._compute_reward` 埋在环境文件中间（该文件现在 1101 行），改一个权重要在
-物理推进、观测拼接、终止判定之间翻找。现在 `env.py:714-725` 只剩一个 `_compute_reward` 转发方法：
+物理推进、观测拼接、终止判定之间翻找。现在 `env.py:726-737` 只剩一个 `_compute_reward` 转发方法：
 
 ```python
 def _compute_reward(self, action, trunk_contact, foot_contact=None,
@@ -52,7 +52,7 @@ def _compute_reward(self, action, trunk_contact, foot_contact=None,
 代价是明细里看不出「原始量有多大」，但那个量在 `info` 里另有一份
 （`base_x` / `forward_vel` / `roll` / `pitch` / `base_z` …）。
 
-**实测**：`robotdog/env.py:714-725` 的 `_compute_reward` 转发方法返回的 `terms` 与
+**实测**：`robotdog/env.py:726-737` 的 `_compute_reward` 转发方法返回的 `terms` 与
 `robotdog/reward.py:158` 的 `compute_reward()` 的 `terms` 有 **15 个共同键**；`info["reward_terms"]` 再补一个
 `"terminal"`，共 **16 键**。
 
@@ -183,7 +183,7 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 | `torque` | `torque * sum(tau²)` |
 | `foot_lift` | `foot_lift * mean(gate * lift)`；`gate = clip(foot_speed / max(foot_lift_gate_speed,1e-6), 0, 1)`，`foot_speed = ‖(feet - _prev_foot_pos)/control_dt‖`（三维），`lift = clip(clearance / lift_target, 0, 1)` |
 | `body_collision` | `body_collision * float(trunk_contact)` |
-| `probe_lift` | 仅当 `rc.probe_lift != 0 and env._blocked` 时非零：`peaks = env._peak_swing_clearance`、`floor = np.maximum(env._probe_best, env.probe_target)`、`gain = np.sum(np.clip(peaks - floor, 0, None))`、`terms["probe_lift"] = probe_lift * gain`，并在 `gain > 0` 时把**逐足地板** `env._probe_best = np.maximum(env._probe_best, peaks)`、`_probe_count += 1`（**势函数塑形**，总量有界、不可刷分）。`env._probe_best` 是**逐足 ndarray**（先前是标量：四足同一步同时抬高时，标量地板会把只抬了一只脚的足也算成进展）；`env.probe_target` 是只读属性（`robotdog/env.py:804`），直接取 `reward.probe_lift_target`（0.06 m），**不乘台阶高** |
+| `probe_lift` | 仅当 `rc.probe_lift != 0 and env._blocked` 时非零：`peaks = env._peak_swing_clearance`、`floor = np.maximum(env._probe_best, env.probe_target)`、`gain = np.sum(np.clip(peaks - floor, 0, None))`、`terms["probe_lift"] = probe_lift * gain`，并在 `gain > 0` 时把**逐足地板** `env._probe_best = np.maximum(env._probe_best, peaks)`、`_probe_count += 1`（**势函数塑形**，总量有界、不可刷分）。`env._probe_best` 是**逐足 ndarray**（先前是标量：四足同一步同时抬高时，标量地板会把只抬了一只脚的足也算成进展）；`env.probe_target` 是只读属性（`robotdog/env.py:816`），直接取 `reward.probe_lift_target`（0.06 m），**不乘台阶高** |
 | `command_follow` | **求和**：`vy_max > 0` 时 `x = \|vy − command.vy\| / vy_max`、`follow += lateral_vel * max(-1.0, track_shape(x, track_tail))`；偏航项**恒在**（不受 `yaw_max` 门控），`x = yaw_err / max(command.yaw_max, rc.yaw_range_floor)`、`follow += yaw_rate * max(-1.0, track_shape(x, track_tail))`，其中 `yaw_err = \|env.yaw_rate − command.wz\|`，且 `command.wz == 0.0` 时先做 `yaw_err = 1.5 * (yaw_err + \|wz\|)`（零指令基线惩罚）；横向不开且偏航指令也为 0 时仍有偏航那一项。`vy` 取滤波量还是瞬时量由 `obs.vel_filter` 决定 |
 | `leg_collision` | `leg_collision * float(leg_contact)` |
 | `air_time` | `air_time * sum((clip(air - air_time_target, 0, None) - clip(air - air_time_max, 0, None)) * landed)`；`landed = foot_contact & ~_prev_foot_contact`，`air = _foot_air_time`（**本步之前**累积的腾空时间）；`air_time == 0.0` 时恒 `0.0` |
@@ -243,15 +243,15 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 ## 5. 内部结构与数据流
 
 ```
-robotdog/env.py:1053  step()
-    │  物理推进 decimation 次（env.py:1071-1078）
-    │  trunk_contact, leg_contact = _contact_flags()          env.py:844
-    │  foot_contact = _foot_contact_mask()                    env.py:727
-    │  _track_swing_peak(foot_contact)                        env.py:755
+robotdog/env.py:1079  step()
+    │  物理推进 decimation 次（env.py:1097-1104）
+    │  trunk_contact, leg_contact = _contact_flags()          env.py:856
+    │  foot_contact = _foot_contact_mask()                    env.py:739
+    │  _track_swing_peak(foot_contact)                        env.py:767
     │  _update_probe_state(foot_contact)                      env.py:775
     │  terminated, truncated = _terminated(...)               env.py:946
     │  低通滤波推进 filtered_lateral_vel / filtered_yaw_rate  env.py:1093-1095
-    │  if _success_reached(): _reached_top = True             env.py:561
+    │  if _success_reached(): _reached_top = True             env.py:573
     ▼
 robotdog/env.py:1114  _compute_reward(..., terminated=terminated)   ← 调用点在 env.py:1114
     ▼
@@ -282,7 +282,7 @@ robotdog/env.py:1114  reward, terms = ...；_advance_foot_air_time(foot_contact)
 
 **顺序上的两个关键点**（改动 `step` 时必须保持）：
 
-1. `_success_reached()`（`env.py:561`）必须在 `_compute_reward` **之前**跑，因为
+1. `_success_reached()`（`env.py:573`）必须在 `_compute_reward` **之前**跑，因为
    `_reached_top` 决定 `terminal` 取 `success` 还是 `termination`。
 2. `_advance_foot_air_time()`（`env.py:748`）必须在 `_compute_reward` **之后**跑 ——
    `air_time` 项读的是「本步之前」累积的腾空时间，先累加就等于把当步白送出去。

@@ -65,9 +65,9 @@ robotdog/<你要改的模块>.py        代码本身（约 200~1100 行，可通
 | 评估与 GIF | `scripts/play.py` |
 | 读配置 | `robotdog/config.py` |
 
-**代码规模**（`README.md` §6.1 有完整表）：最大的几个是 `robotdog/env.py` 1101、
-`scripts/play.py` 856、`robotdog/config.py` 527、`robotdog/go2_model.py` 467、
-`robotdog/policy.py` 339。最大的文件也可以直接通读。
+**代码规模**（`README.md` §6.1 有完整表）：最大的几个是 `robotdog/env.py` 1253、
+`scripts/play.py` 856、`robotdog/config.py` 534、`robotdog/go2_model.py` 467、
+`robotdog/reward.py` 395。最大的文件也可以直接通读。
 
 ---
 

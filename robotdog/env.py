@@ -190,7 +190,19 @@ class EnvConfig:
     # 巨大的系统性偏置。实测（200k 步、只改这一个旋钮）把幅值缩到 0.45/0.55 后
     # |vx 误差| 从 0.597 降到 0.267/0.178，且奖励账从「超速惩罚主导」回到
     # 「姿态/力矩主导」。取 0.5 兼顾抬腿高度与速度量程。
-    gait_amp_scale: float = 0.5
+    gait_amp_scale: float = 1.0
+    # 速度参数化：让**先验的步幅幅值跟着当前指令缩放**，于是先验自己去指令
+    # 附近的速度，策略只剩平衡与微调 —— 速度这才真正成为控制量。
+    #
+    # 为什么必须这么做：原先验是一条固定轨迹，自然速度由机械结构决定。实测
+    # （`.tmp/zz_prior_calib.py`）幅值缩放 `s` 与稳态速度是
+    # `v(s) = 2.4975·s − 0.4657`，而**行走支的下沿是 s=0.46 ⇒ v=0.70 m/s**，
+    # s∈[0.34,0.44] 全部摔倒。于是「先验自己走 0.79、指令要 0.45」这种组合
+    # 只能靠策略常驻刹车，而刹车需要大腿偏置约 −0.5 rad，`action_scale=0.30`
+    # 下要动作 −1.67，超出 ±1 限幅 —— 实测策略退化成一个常值动作（|action|
+    # 恒 0.92，速度锁死 0.39）而完全不理指令。打开这个开关后，先验按标定曲线
+    # 跟随指令，残差需求回到 ±0.1 rad 量级。
+    gait_speed_track: bool = True
     kp: tuple[float, float, float] = (30.0, 30.0, 45.0)
     kd: tuple[float, float, float] = (0.6, 0.6, 0.9)
 
@@ -1020,6 +1032,16 @@ class Go2StairsEnv(gym.Env):
 
         return self._observation(), {}
 
+    def _gait_scale(self) -> float:
+        """当前指令下先验应有的幅值缩放（速度参数化）。
+
+        关掉 ``gait_speed_track`` 时恒为 1.0，于是动作流水线退化回「固定先验」
+        那条老路径（`config_to_env` 里的全局 ``gait_amp_scale`` 仍然生效）。
+        """
+        if not self.cfg.gait_speed_track:
+            return 1.0
+        return float(GaitParams.scale_for_speed(float(self._command[0])))
+
     def _gait_action(self) -> np.ndarray:
         """步态先验在当前相位下的关节角偏移（rad）。
 
@@ -1028,7 +1050,11 @@ class Go2StairsEnv(gym.Env):
         """
         if not self.cfg.gait_prior or self.cfg.gait_gain == 0.0:
             return np.zeros(self.num_act, dtype=np.float64)
-        return self.cfg.gait_gain * self.cfg.gait.radians(self._gait_phase)
+        gait = self.cfg.gait
+        scale = self._gait_scale()
+        if scale != 1.0:
+            gait = gait.with_dynamic_scale(scale)
+        return self.cfg.gait_gain * gait.radians(self._gait_phase)
 
     def _target_from_action(self, action: np.ndarray) -> np.ndarray:
         """把策略动作映射为 PD 关节目标（整条动作流水线）。

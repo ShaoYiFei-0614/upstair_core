@@ -120,6 +120,58 @@ target = home + gait_gain * gait.radians(t) + action_scale * action
 两者刻意不是同一条：`default_trot()` 是「速度目标 0.55 m/s 那一档搜索的胜者」，
 出货 JSON 是「**stairs** 目标重新搜出来的胜者」。
 
+### D7 —— 速度参数化：先验的步幅跟着指令缩放（`scale_for_speed`）
+
+**问题**。原先验是一条固定轨迹，它把机器人推到一个由机械结构决定的自然速度
+（`gait_amp_scale=1.0` 下 2.03 m/s、0.50 下 0.79 m/s）。策略只能叠一个小残差，
+于是「速度指令」在这套设定里根本不是控制量：先验自己往前走，奖励惩罚它，它
+既刹不住也跟不动。实测策略退化成一个**常值动作**（`|action|` 恒 0.92、速度锁死
+0.39 m/s），三个检查点放到 5 个不同指令带上速度完全不变。
+
+**标定**（`.tmp/zz_prior_calib.py`，零残差、100 s 长回合、逐项区分摔倒/超时）：
+只缩幅值 `s` 时，`(s, 稳态 vx)` 是
+
+| s | amp_th | amp_ca | vx | 结局 |
+| --- | --- | --- | --- | --- |
+| 0.28 | 0.07421 | 0.27618 | +0.037 | 稳定（原地小步支） |
+| 0.34 ~ 0.44 | — | — | — | **全部在 320 步内摔倒** |
+| 0.46 | 0.12191 | 0.45373 | +0.698 | 稳定（行走支下沿） |
+| 0.52 | 0.13781 | 0.51291 | +0.839 | 稳定 |
+| 0.70 | 0.18552 | 0.69046 | +1.267 | 稳定 |
+| 1.00 | 0.26503 | 0.98637 | +2.031 | 稳定 |
+| 1.62 | 0.42935 | 0.98655 | +1.734 | 稳定（`normalize()` 已再缩放） |
+
+行走支的最小二乘拟合（10 个点）是
+
+```
+v(s) = 2.4975·s − 0.4657        最大残差 0.0153 m/s
+```
+
+`scale_for_speed(v)` 就是它的反解 `s = (v + 0.4657) / 2.4975`，再裁剪到
+`[SPEED_SCALE_MIN, SPEED_SCALE_MAX] = [0.46, 1.00]`。`speed_for_scale(s)` 是正向。
+
+**两条结构性的结论**（都会限制这套参数化能表达什么）：
+
+1. **只有两支稳定，中间是空的。** 原地小步支只在 0.04~0.07 m/s；行走支从
+   0.70 m/s 起。`(0.07, 0.58)` 这一段在 `(amp, freq)` 平面上**没有任何稳定点**
+   （`.tmp/zz_freq_amp_grid.py` 与 `.tmp/zz_slowbranch.py` 共扫了
+   amp∈[0.30,0.70] × freq∈[1.5,7.0] 的格点，落进 `[0.15,0.65]` 的稳定点只有
+   amp=0.44/freq=7.0 → 0.579 与 amp=0.46/freq=7.0 → 0.621 两个，且都在行走支
+   的上沿）。**常值偏置 trot 结构上走不到中速。**
+2. **所以 v_cmd < 0.70 时先验被裁剪成一个常数**（0.6985 m/s）。那一段只能靠
+   策略残差刹车，而刹车曲线既非线性、又**过刹**：偏置 −0.104 → 0.376、
+   −0.209 → 0.174、−0.315 → −0.139 m/s。要够到 0.2 m/s 需要偏置约 −0.53 rad，
+   即 `action_scale · 1.0 ≳ 0.53 rad` —— 出厂 `action_scale=0.30` 远远不够
+   （实测策略因此退化）。⇒ 参数化只在**指令落在先验可表达区**时有效。
+
+**效果**（零残差、实测，`.tmp/zz_prior_eval.py`）：`v_cmd = 0.70 / 0.90 / 1.50`
+→ 先验稳态 `0.6985 / 0.9003 / 1.4997` m/s，即**先验精确跟随指令**。
+
+**实现要点**：`radians()` 里对 `amp_th`/`amp_ca` 乘动态缩放，**不动 `off_th`/`off_ca`**
+（偏置是站立姿态的一部分，缩它会改变机身高度与腿的负载分配，实测直接前倾摔倒）；
+动态缩放存在 `_scale_dyn` 字段里，由 `with_dynamic_scale()` 写进副本，**不进
+`to_dict()`**（它是运行期产物，写进配置或 `summary.json` 只会带一个过期数字回来）。
+
 ## 4. 公开 API
 
 ### 模块级常量
@@ -127,6 +179,11 @@ target = home + gait_gain * gait.radians(t) + action_scale * action
 ```python
 TROT_PHASE = (0.0, math.pi, math.pi, 0.0)
 CALF_SHAPES = ("sin", "dip", "half")
+# 速度参数化：v(s) = SLOPE·s + BIAS 的实测拟合（行走支 10 个点，最大残差 0.0153）
+SPEED_TO_SCALE_SLOPE = 2.4975
+SPEED_TO_SCALE_BIAS = -0.4657
+SPEED_SCALE_MIN = 0.46      # 行走支下沿，再小就摔倒
+SPEED_SCALE_MAX = 1.00      # normalize() 开始整体再缩放的边界
 _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
 ```
 
@@ -150,6 +207,7 @@ _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
 | `calf_shape` | `str` | `"sin"` | `sin` / `dip` / `half` |
 | `action_scale` | `float` | `0.70` | 归一化单位 → 弧度（rad per unit） |
 | `leg_phase` | `tuple[float, float, float, float]` | `field(default_factory=lambda: tuple(TROT_PHASE))` | 四条腿的相位偏移 [rad] |
+| `_scale_dyn` | `float` | `1.0` | **运行期**动态幅值缩放（速度参数化的产物，不是配置项） |
 
 方法：
 
@@ -162,7 +220,15 @@ _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
   髋列恒 0，大腿 `off_th + amp_th·sin(p + ph_th)`，小腿
   `off_ca + amp_ca·_calf_wave(p + ph_ca)`，最后 `np.clip(a, -1, 1).ravel()`。
 * `radians(t: float) -> np.ndarray` —— **环境真正调用的那个**：`action_scale * actions(t)`，
-  返回弧度偏移 `(12,)`。
+  返回弧度偏移 `(12,)`。`_scale_dyn != 1.0` 时先给 `amp_th`/`amp_ca` 乘它再还原
+  （见 §3 D7；只缩幅值，不动 `off_th`/`off_ca`）。
+* `@staticmethod scale_for_speed(v_cmd: float) -> float` —— 由期望前进速度反解幅值
+  缩放并裁剪到 `[SPEED_SCALE_MIN, SPEED_SCALE_MAX]`（见 §3 D7）。**`v_cmd < 0.70`
+  时返回的都是 `SPEED_SCALE_MIN = 0.46`**，即先验最低只走 0.6985 m/s。
+* `@staticmethod speed_for_scale(scale: float) -> float` —— 正向：该缩放下先验的
+  稳态前进速度 [m/s]。
+* `with_dynamic_scale(scale: float) -> GaitParams` —— `copy.copy` 一个副本并把
+  `_scale_dyn` 写成 `scale`，**不改自己**（环境每步调一次，所以不能就地改）。
 * `targets(t: float, home: np.ndarray) -> np.ndarray` —— `home + self.radians(t)`。
 * `@property period -> float` —— `1.0 / freq`；`freq <= 0` 时返回 `float("inf")`。
 * `normalize() -> GaitParams` —— **就地**夹取（见 §3 D5），返回 `self`。
@@ -171,7 +237,8 @@ _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
   注意先夹 `calf_shape` 合法性再夹 `leg_phase` 长度，且 `leg_phase` 会被转成 `tuple(float, ...)`。
 * `@property is_static -> bool` —— **已删除**。判据曾是 `amp_th == 0.0 and amp_ca == 0.0`；
   现在要判「没有先验」请直接用 `GaitParams.static()` 或比较 `radians(t)` 是否恒为 0。
-* `to_dict() -> dict` —— `asdict()` 且 `leg_phase` 转 `list`（便于 json 序列化）。
+* `to_dict() -> dict` —— `asdict()`、去掉 `_scale_dyn`（运行期字段，不进配置）、
+  `leg_phase` 转 `list`（便于 json 序列化）。
 * `save(path: str | Path) -> Path` —— 建父目录，写 `json.dumps(..., indent=2)`，
   `encoding="utf-8"`，返回 `Path`。
 * `@classmethod from_dict(d: dict) -> GaitParams` —— **按已知字段名过滤**后构造，
@@ -179,7 +246,7 @@ _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
   `CALF_SHAPES[int(...)]`。
 * `@classmethod from_json(path) -> GaitParams` —— **已删除**（无调用方）。它当时是
   `json.loads(Path(path).read_text(encoding="utf-8"))` 后走 `from_dict`；
-  需要同样的行为就自己读文件再 `from_dict`（`robotdog/gait.py:143` 的 `from_dict`
+  需要同样的行为就自己读文件再 `from_dict`（`robotdog/gait.py:237` 的 `from_dict`
   仍在，`load_gait` 也仍是推荐入口）。
 * `@classmethod from_search_json(path, rank: int = 0) -> GaitParams` —— 取
   `data["top"][rank]`，用 `entry["gait"]` 加上顶层的 `entry["action_scale"]`（`float(...)`）。
@@ -207,17 +274,17 @@ _FALLBACK_TROT: dict   # default_trot() 的来源，不是公开名
 ```
 EnvConfig()
   → field(default_factory=GaitParams.default_trot)          # robotdog/env.py:185
-    → GaitParams.default_trot() → from_dict(dict(_FALLBACK_TROT))  # robotdog/gait.py:165-167
+    → GaitParams.default_trot() → from_dict(dict(_FALLBACK_TROT))  # robotdog/gait.py:259-261
       → cls(**kw).normalize()
 ```
 
 **控制步（每个 `step()` 一次）**：
 
 ```
-Go2StairsEnv.step(action)                                    # robotdog/env.py:1172
-  → self._gait_phase = self._gait_t                          # env.py:1186（本步实际用的相位）
-  → self._target_from_action(action)                         # env.py:1187
-    → self._gait_action()                                    # env.py:1141
+Go2StairsEnv.step(action)                                    # robotdog/env.py:1079
+  → self._gait_phase = self._gait_t                          # env.py:1093（本步实际用的相位）
+  → self._target_from_action(action)                         # env.py:1094
+    → self._gait_action()                                    # env.py:1054
        若 not cfg.gait_prior 或 cfg.gait_gain == 0.0 → zeros(12)
        否则 → cfg.gait_gain * cfg.gait.radians(self._gait_phase)
               → GaitParams.radians(t)                        # gait.py:94
@@ -226,14 +293,14 @@ Go2StairsEnv.step(action)                                    # robotdog/env.py:1
                     → GaitParams.leg_phases(t)               # gait.py:77
                     → GaitParams._calf_wave(p + ph_ca)       # gait.py:68
   → target = home + _gait_action() + cfg.action_scale * action
-  → np.clip(target, act_low, act_high)                       # env.py:1169
-  → self._gait_t += cfg.control_dt                           # env.py:276（20 ms）
+  → np.clip(target, act_low, act_high)                       # env.py:1100
+  → self._gait_t += cfg.control_dt                           # env.py:270（20 ms）
 ```
 
 **观测里的步态时钟**（`ObsConfig.gait_phase=True`，每帧 2 维）：
 
 ```
-_obs_frame()                                                 # robotdog/env.py:767
+_obs_frame()                                                 # robotdog/env.py:683
   → theta = 2π * cfg.gait.freq * self._gait_phase
   → np.array([np.sin(theta), np.cos(theta)])
 ```
@@ -242,7 +309,7 @@ _obs_frame()                                                 # robotdog/env.py:7
 
 ```
 config.yaml: env.gait_prior / env.gait_file                    # robotdog/config.py:279-280
-  → load_gait(PATH)                                            # robotdog/config.py:293 → robotdog/gait.py:181
+  → load_gait(PATH)                                            # robotdog/config.py:280 → robotdog/gait.py:275
       → GaitParams.from_search_json(PATH)                      # 有 "top" 键时
         → from_dict(entry["gait"] | action_scale=entry["action_scale"])
   → cfg.gait_prior = True; cfg.gait = gait
@@ -253,7 +320,20 @@ config.yaml: env.gait_prior / env.gait_file                    # robotdog/config
 
 **dataclass 默认值**：`freq=2.0`、`amp_th=0.0`、`amp_ca=0.0`、`ph_th=0.0`、`ph_ca=0.0`、
 `off_th=0.0`、`off_ca=0.0`、`calf_shape="sin"`、`action_scale=0.70`、
-`leg_phase=(0.0, 3.141592653589793, 3.141592653589793, 0.0)`。
+`leg_phase=(0.0, 3.141592653589793, 3.141592653589793, 0.0)`、`_scale_dyn=1.0`。
+
+**速度参数化常量**（见 §3 D7）：
+
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `SPEED_TO_SCALE_SLOPE` | `2.4975` | 行走支 `v(s)` 的斜率 [m/s per unit scale] |
+| `SPEED_TO_SCALE_BIAS` | `-0.4657` | 行走支 `v(s)` 的截距 [m/s] |
+| `SPEED_SCALE_MIN` | `0.46` | 行走支下沿；低于它先验摔倒 |
+| `SPEED_SCALE_MAX` | `1.00` | `normalize()` 开始整体再缩放的边界 |
+
+⇒ `speed_for_scale(0.46) = 0.6832`、`speed_for_scale(1.0) = 2.0318`；
+`scale_for_speed(v) = clip((v + 0.4657) / 2.4975, 0.46, 1.00)`，
+**所以任何 `v < 0.6832` 的指令都得到同一个 `0.46`**。
 
 **`normalize()` 的边界**：`freq ∈ [0.0, 10.0]`；`amp_th/amp_ca/off_th/off_ca ∈ [-1.0, 1.0]`；
 `|off| + amp <= 1.0`（超出时按 `s = 1 / max(|off| + amp, 1e-9)` 同缩）；
@@ -357,7 +437,7 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   `default_trot()` 速度目标 0.550 m/s、8 s 走 4.39 m、100% 存活、机身高度 0.268 m。
   （`fast_trot()` 的 1.702 m/s、6 s 走 10.19 m 是同批标定的另一半，但该 classmethod
   已在死代码清理中删除。）速度目标写在 classmethod 的 docstring 里
-  （`robotdog/gait.py:190-191` 是 `load_gait` 的两条 `return`）；
+  （`robotdog/gait.py:275-285` 是 `load_gait`）；
   **模块 docstring（`robotdog/gait.py:1-23`）只记「从零学不出步态」
   的两次标定**，不记这几个速度数字。
 * 先验的几何能力（摆动峰值 0.1124 m / 频率 ×0.6 → 0.1658 m）与「开环调参也翻不过去」
@@ -366,6 +446,18 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
 * `experience.md` §2 —— 残差 RL 两个尺度分开的动机（共用一个 scale ⇒ 2 s 内摔倒），
   以及「从零学步态落在平台期」的两次标定。
 * `train.md` §1 的启动自检要求核对 `[步态] ...` 那一行——本文 §6 给出了它的逐字段来源。
+* **速度参数化的标定与它的两条边界**：见 §3 D7。要点是
+  （a）`v(s) = 2.4975·s − 0.4657` 只对**行走支**成立，该支的下沿是 `s=0.46`；
+  （b）`(amp, freq)` 平面上中速是**空的** —— `.tmp/zz_freq_amp_grid.py` 与
+  `.tmp/zz_slowbranch.py` 扫描后落进 `[0.15, 0.65] m/s` 的稳定点只有两个
+  （amp=0.44/freq=7.0 → 0.579、amp=0.46/freq=7.0 → 0.621）。⇒ **常值偏置 trot
+  结构上走不到 0.1~0.6 m/s**；那一段只能用策略残差刹车，而刹车是过刹的。
+  `experience.md` §20 记了这次排查的完整过程与实测数字。
+* **速度参数化只在「先验可表达区」有效（实测对照）**：两条单级平地臂、各 800k 步、
+  `action_scale=0.60`，唯一差别是指令带 —— A 臂 `[0.70, 1.20]`（先验在带内精确可
+  表达）在 40k 步时 `success_rate 0.44`、`explained_variance 0.94`、`ep_len 912`；
+  B 臂 `[0.20, 0.60]`（先验被裁剪成常数 0.6985）恒 `success_rate 0`、`ep_len 711`。
+  这是「速度真的变成控制量」的第一个正面证据。
 
 ## 9. 已知限制与坑
 
@@ -405,6 +497,15 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
 * **`FAST_TROT` / `fast_trot()` / `from_json()` / `is_static` / `LEG_ORDER` 都已删除**：
   它们是零调用方的历史基线，改不到任何训练或推理路径（本来也改不到）。
   看到旧文档或旧脚本引用它们，一律按过期处理。
+* **速度参数化不能表达中速**：`scale_for_speed` 的下限 0.46 对应先验 0.6985 m/s，
+  所以 `v_cmd < 0.70` 时先验被裁剪成一个**常数** —— 那一段的指令跟踪完全落在
+  策略残差上，而残差刹车是过刹且非线性的（§8 最后两条）。若要真正覆盖低速，
+  需要**换一类步态**（如带支撑相占空比的 walk/crawl），而不是继续调这条 trot 的
+  幅值与频率。历史上有过一个「弱先验（`gait_amp_scale` 缩到 0.30）做探索种子」
+  的思路，实测该缩放落在原地小步支（0.0457 m/s），**没有推进权限**，已废弃。
+* **`_scale_dyn` 不进 `to_dict()`**：它是运行期字段，`from_dict()` 之后恒为 `1.0`。
+  若从 `summary.json` 重建 `GaitParams`，拿到的是**未缩放**的幅值，而环境每步会
+  按当前指令重新现算 —— 这是有意为之，不要试图把它持久化。
 
 ## 10. 示例用法
 

@@ -34,6 +34,51 @@ import numpy as np
 TROT_PHASE = (0.0, math.pi, math.pi, 0.0)
 CALF_SHAPES = ("sin", "dip", "half")
 
+# --------------------------------------------------------------------------- #
+# 速度参数化：把「期望前进速度」映射到「先验幅值缩放」
+# --------------------------------------------------------------------------- #
+# 为什么需要它
+# ------------
+# 原先验是一条**固定**的开环轨迹，它把机器人推到一个机械结构决定的自然速度
+# （`gait_amp_scale=0.5` 下 0.79 m/s）。指令区间 [0.2, 0.6] 的下半段因此物理上
+# 够不着：策略要刹车就得把大腿偏置到 −0.5 rad，而 `action_scale=0.30` 时那需要
+# 动作 −1.667，超出 ±1 限幅 —— 于是策略只能「不去跟」，指令不是控制量。
+#
+# 标定（`.tmp/zz_prior_calib.py`，零残差、长回合、逐项区分摔倒/超时）
+# ------------------------------------------------------------------
+#      s     amp_th     amp_ca        稳态 vx
+#   0.28    0.07421    0.27618       +0.037   ← 原地小步支
+#   0.34~0.44                         摔倒     ← 两支之间的**不稳定带**
+#   0.46    0.12191    0.45373       +0.698   ← 行走支的下沿
+#   0.52    0.13781    0.51291       +0.839
+#   0.58    0.15372    0.57209       +0.977
+#   0.64    0.16962    0.63127       +1.118
+#   0.70    0.18552    0.69046       +1.267
+#   0.76    0.20142    0.74964       +1.426
+#   0.82    0.21732    0.80882       +1.591
+#   0.88    0.23323    0.86800       +1.742
+#   0.94    0.24913    0.92718       +1.887
+#   1.00    0.26503    0.98637       +2.031
+#
+# 结论：只有两支稳定（原地小步 0.04 与行走支 ≥0.70），中间是**空的**。
+# 行走支上 `vx` 是 `s` 的干净线性函数，最小二乘拟合（只用行走支 10 个点）得
+#
+#     v(s) = 2.4975 · s − 0.4657      （最大残差 0.0153 m/s）
+#
+# 反解就是 `scale_for_speed`。**注意它的定义域**：反解出的 `s` 必须 ≥ 行走支
+# 下沿 0.46，也就是**先验最低只能稳定走到 0.70 m/s**。指令带 [0.2, 0.6] 里的
+# 每一档都低于它 —— 这不是参数化能修的，是「常值偏置 trot」这条步态的结构
+# 上限：幅值缩到 0.44 以下时腿摆不起来，实测 s∈[0.34,0.44] 全部在 320 步内
+# 前倾摔倒（`.tmp/zz_prior_calib.py`）。低于 0.70 m/s 的部分只能靠**策略残差
+# 刹车**，而刹车需要大腿偏置约 −0.5 rad ⇒ 需要 `action_scale·1.0 ≥ 0.5 rad`。
+SPEED_TO_SCALE_SLOPE = 2.4975  # v(s) 的斜率（m/s per unit scale）
+SPEED_TO_SCALE_BIAS = -0.4657  # v(s) 的截距
+# 行走支下沿：低于它先验会摔倒，所以任何指令都不得把缩放压到这里以下。
+SPEED_SCALE_MIN = 0.46
+# 上限 1.0：再往上 `normalize()` 的 `|off|+amp<=1` 会整体再缩放，速度反而下降
+# （实测 s=1.62 时只剩 1.73 m/s）。
+SPEED_SCALE_MAX = 1.00
+
 # 默认先验 = 「速度目标」搜索的赢家：自然前进速度已是 0.55 m/s（实测 0.550 m/s
 # 均值、8 s 走 4.39 m、100% 存活、机身 0.268 m，标称站姿 0.27 m）。
 _FALLBACK_TROT = dict(
@@ -63,6 +108,10 @@ class GaitParams:
     leg_phase: tuple[float, float, float, float] = field(
         default_factory=lambda: tuple(TROT_PHASE)
     )
+    # 运行期的动态幅值缩放（速度参数化的产物）。它不是配置项：环境每步按当前
+    # 指令算出它，再给 ``radians()`` 用。保留在 dataclass 里是为了让
+    # ``copy.copy`` / ``dataclasses.replace`` 能带着它走。
+    _scale_dyn: float = 1.0
 
     # ---------------------------------------------------------------- 形状
     def _calf_wave(self, x: np.ndarray) -> np.ndarray:
@@ -100,7 +149,48 @@ class GaitParams:
         背地里把策略的探索噪声乘上先验的缩放系数
         （实测：它让机器人在 2 s 内摔倒）。
         """
+        scale = self._scale_dyn
+        if scale != 1.0:
+            # 动态缩放（速度参数化）只作用在**幅值**上，不动常量偏置：偏置是
+            # 站立姿态的一部分，缩它会改变机身高度与腿的负载分配，实测会让
+            # 机器人直接前倾摔倒。
+            saved = (self.amp_th, self.amp_ca)
+            self.amp_th, self.amp_ca = saved[0] * scale, saved[1] * scale
+            try:
+                return self.action_scale * self.actions(t)
+            finally:
+                self.amp_th, self.amp_ca = saved
         return self.action_scale * self.actions(t)
+
+    # ------------------------------------------------------- 速度参数化
+    @staticmethod
+    def scale_for_speed(v_cmd: float) -> float:
+        """把期望前进速度 ``v_cmd`` [m/s] 映射成先验幅值缩放。
+
+        用行走支的实测线性律 ``v(s) = SLOPE·s + BIAS`` 反解：
+
+            s = (v_cmd - BIAS) / SLOPE
+
+        再裁剪到 ``[SPEED_SCALE_MIN, SPEED_SCALE_MAX]``。裁剪的两侧都有明确
+        物理含义：下侧 0.46 是行走支的下沿（再小就摔倒），上侧 1.0 是
+        ``normalize()`` 开始整体再缩放的边界。**因此 v_cmd < 0.70 时先验
+        仍是 0.70 m/s** —— 那一段只能靠策略残差刹车，见模块顶部说明。
+        """
+        s = (float(v_cmd) - SPEED_TO_SCALE_BIAS) / SPEED_TO_SCALE_SLOPE
+        return float(np.clip(s, SPEED_SCALE_MIN, SPEED_SCALE_MAX))
+
+    @staticmethod
+    def speed_for_scale(scale: float) -> float:
+        """``scale_for_speed`` 的正向：该缩放下先验的稳态前进速度 [m/s]。"""
+        return float(SPEED_TO_SCALE_SLOPE) * float(scale) + float(SPEED_TO_SCALE_BIAS)
+
+    def with_dynamic_scale(self, scale: float) -> GaitParams:
+        """返回一个把动态缩放写成 ``scale`` 的副本（本方法不改自己）。"""
+        import copy as _copy
+
+        clone = _copy.copy(self)
+        clone._scale_dyn = float(scale)
+        return clone
 
     @property
     def period(self) -> float:
@@ -129,7 +219,11 @@ class GaitParams:
 
     # ------------------------------------------------------------- （反）序列化
     def to_dict(self) -> dict:
+        # `_scale_dyn` 是运行期的动态缩放（速度参数化的产物），不是配置：
+        # 环境每步按当前指令现算它。写进配置文件或 `summary.json` 只会让
+        # 下次加载时带一个过期的数字进来。
         d = asdict(self)
+        d.pop("_scale_dyn", None)
         d["leg_phase"] = list(d["leg_phase"])
         return d
 
