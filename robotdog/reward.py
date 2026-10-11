@@ -40,22 +40,28 @@ class RewardConfig:
     """
 
     # --- 五个要求的项 ----------------------------------------------------- #
-    # 形状是「按量程归一化的线性死区」，与 ``lateral_vel`` / ``yaw_rate``
-    # 一致；量程取 ``max(|cmd.vx|, forward_range_floor)``，超速侧另加
-    # ``forward_overspeed`` 的惩罚。
-    forward_vel: float = 10.0           # [SPEC] 对 vx 指令的线性死区跟踪
+    # 前进项的形状是「**绝对**误差窗口」：量程是一个常数，不随指令大小变。
+    # 超速侧另加 ``forward_overspeed`` 的惩罚。
+    forward_vel: float = 10.0           # [SPEC] 对 vx 指令的绝对误差窗口跟踪
     forward_overspeed: float = 1.0      # [SPEC] 超速侧惩罚斜率（× forward_vel 量级）
     # 超速侧惩罚的**斜率量程** [m/s]：超速每 1 m/s 扣 ``forward_vel /
     # overspeed_range`` 分。取 0.45 表示「超速 0.45 m/s 就把这一项的满分扣光」，
     # 而实测小跑的过冲正好在这一量级 —— 既留得住梯度，又不会让超速 0.05 m/s
     # 就吃掉整项。
     overspeed_range: float = 0.45
-    # ``vx`` 指令为 0 时，前进跟踪项用来归一化误差的**量程下限** [m/s]。
-    # ``vx`` 是定值基线、没有「采样上界」可借（横向/偏航有 ``vy_max``/``yaw_max``），
-    # 所以要用一个下限把分母撑开。取 0.30 的含义：vx=0 时允许 ±0.30 m/s 的余量
-    # 拿满分，超过 0.30 m/s 归零 —— 与实测「小跑步态自带 0.24 m/s 前进偏置」
-    # 同量级，足以把「别前进」这句话变成有价钱的要求。
-    forward_range_floor: float = 0.30
+    # 前进跟踪项的**绝对**误差窗口 [m/s]：``|v - cmd|`` 超过它就把这一项扣光。
+    #
+    # 为什么必须是**绝对**量程：早先这里取 ``max(|cmd.vx|, forward_range_floor)``，
+    # 于是分值变成「相对误差」—— 指令区间一窄，站着不动就几乎满分。实测
+    # 无先验从零训练时 ``cmd.vx = 0.25``、策略 ``v = 0`` 仍拿 ``+1.10/步``，
+    # 配上 ``command_follow`` 的 ``+3.76/步`` 与 ``alive +0.15``，站桩合计
+    # ``+4.93/步``；三臂各 200k~300k 步全都收敛到同一个常数输出
+    # （``|action|`` 均值 0.051、``vx = −0.0003``）。改成绝对窗口后，
+    # 「离指令远」不再因为指令本身小而被赦免：``v = 0`` 对 ``cmd = 0.25``
+    # 的绝对误差就是 0.25，窗口 0.15 下这一项为负。
+    #
+    # 取值要**低于**最窄的指令带宽度，否则带内所有速度都拿满分、没有区分度。
+    forward_track_window: float = 0.25
     # 线性死区**外侧**的线性尾项系数。死区形状 ``max(0, 1 - |err|/range)`` 在
     # ``|err| > range`` 之后恒为 0、梯度也恒为 0，于是「已经偏出量程」的状态
     # 完全没有回头路 —— 实测偏航误差 0.44 rad/s 而 ``yaw_max`` 只有 0.15 时，
@@ -190,22 +196,32 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     terms: dict[str, float] = {}
 
     # 1) 前进速度跟踪 ------------------------------------------------------
-    # 形状与横向/偏航一致（按量程归一化的线性死区），但**超速侧单独加一段惩罚**：
-    # 线性死区在 ``|err| > range`` 之后恒为 0，梯度也跟着消失，于是「冲到 1.9 m/s」
-    # 与「刚好 0.45 m/s」拿同样的分（实测指令量程 0~0.90 扫一遍，策略输出恒为
-    # 1.27 m/s，完全开环）。超速是主动选择，必须一路有价钱。
+    # 形状是**绝对**误差窗口上的线性死区：``1 - |v - cmd| / forward_track_window``，
+    # 外侧接 ``track_tail`` 的线性尾项让越界之后仍有回头梯度。另外**超速侧单独
+    # 加一段惩罚**：``err > 0`` 时减 ``forward_overspeed * err / overspeed_range``，
+    # 否则「冲到 1.9 m/s」与「刚好 0.45 m/s」拿同样的分（实测指令量程 0~0.90
+    # 扫一遍，策略输出恒为 1.27 m/s，完全开环）。
     #
-    # 量程取 ``max(|cmd.vx|, rc.forward_range_floor)`` 把 ``vx=0`` 时的分母撑开，
-    # 否则「别前进」这个指令没有价钱。超速惩罚的斜率量程是 ``rc.overspeed_range``。
+    # 量程是常数 ``rc.forward_track_window``，**不随指令大小变**。历史教训：
+    # 早先取 ``max(|cmd.vx|, forward_range_floor)``，把分值变成「相对误差」，
+    # 指令带一窄站桩就几乎满分 —— 无先验三臂全部收敛到常数输出，逐项对账见
+    # :attr:`RewardConfig.forward_track_window`。
     #
     # 两处都必须**有界**：死区外没有任何下界时（``−（超速量/0.45）`` 可以到 −7 以上），
     # 平地上「先验 2.05 m/s 对指令 0.45」的固定偏差会把逐步奖励压到 −27/步、
     # 回报 −65000，价值函数彻底学不动（实测 explained_variance −10~0，策略梯度
     # 损失只有 ±0.015）。现在 shape 下界到 −1（即 ``forward_vel`` 最差 −10），
     # 超速倍率上界到 ``rc.overspeed_cap``，于是最差一项是 −15/步，与其它惩罚同量级。
-    err = float(lin[0]) - float(cmd.vx)
-    fwd_range = max(abs(float(cmd.vx)), float(rc.forward_range_floor))
-    track = max(-1.0, track_shape(abs(err) / fwd_range, float(rc.track_tail)))
+    # 目标取**这一刻真正采样的指令** ``env._command[0]``，不是 ``cmd.vx``：
+    # ``cmd.vx`` 是「采样范围为 0 时的回退定值」，只在 ``set_command_now`` 里跟
+    # 着改；课程下发的是 ``vx_min/vx_max`` 范围，于是 ``cmd.vx`` 会一直停在
+    # ``config.yaml`` 的出厂值上。实测代价：课程 vx∈[0.05,0.20] 而 ``cmd.vx=0.55``
+    # 时，``|err|`` 恒 ≥0.35，``track_shape`` 一步就撞到 −1 下界，
+    # ``forward_vel`` 每一步都吃满 −10；而观测与成功判据用的是真实采样值 ——
+    # 奖励和判据指着两个不同的目标，策略自然学不动。
+    err = float(lin[0]) - float(env._command[0])
+    track = max(-1.0, track_shape(abs(err) / float(rc.forward_track_window),
+                                  float(rc.track_tail)))
     if err > 0.0:
         over = min(
             float(rc.forward_overspeed) * err / float(rc.overspeed_range),

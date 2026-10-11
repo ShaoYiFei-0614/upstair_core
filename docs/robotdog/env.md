@@ -127,12 +127,14 @@ base_frame_size: int = 42
   **奖励不再读它**（`forward_vel` 一度读世界系 x，那是位姿导数、机器人自转时会在步态周期内换号，
   实测三个平阶级上策略都是「转着走」把奖励刷负）。
 
-### 3.4 `forward_vel` 现在按量程归一的**线性死区 + 线性尾项**，`*_sigma` 字段是历史残留
+### 3.4 `forward_vel` 用**绝对**误差窗口的**线性死区 + 线性尾项**，`*_sigma` 字段是历史残留
 
-`x = |err| / max(|cmd.vx|, rc.forward_range_floor)`，
+`err = lin[0] - env._command[0]`（**本步真正采样的指令**，不是 `cfg.command.vx` ——
+后者只是「采样范围为空」时的回退定值，`set_commands` 不改它，见 §5），
+`x = |err| / rc.forward_track_window`（常数窗口 `0.25` m/s，**不随指令大小归一化**），
 `track = max(-1.0, track_shape(x, rc.track_tail))`，超速侧（`err > 0`）再减
 `min(rc.forward_overspeed * err / rc.overspeed_range, rc.overspeed_cap)`。
-`forward_range_floor = 0.30`、`track_tail = 1.5`（`config.yaml`）、`overspeed_cap = 2.0`
+`forward_track_window = 0.25`、`track_tail = 1.5`（`config.yaml`）、`overspeed_cap = 2.0`
 都是 `RewardConfig` 字段。**`forward_vel_sigma` 不再参与计算**。
 （尾项的理由：死区外侧恒 0、梯度也恒 0，「已经偏出量程」就没有回头路 ——
 实测偏航误差 0.44 rad/s 而 `yaw_max` 只有 0.15 时整项归零，策略 250k 步没把自转收回来。
@@ -447,6 +449,13 @@ class Go2StairsEnv(gym.Env):
   * `set_commands(vy_max, yaw_max, vx_min, vx_max)`：改**采样范围**（四个都是关键字参数），
     课程在阶段边界调（`scripts/train.py` 的 `Trainer.make_env` 走 `kw_call(venv, ...)`）。
     `vx_min > vx_max` 时抛 `ValueError("前向指令范围为空：...")`。
+    ⚠ 它**只改范围，不改回退定值 `cfg.command.vx`** —— 于是课程把 `vx` 带调窄之后，
+    `cfg.command.vx` 会一直停在 `config.yaml` 的出厂值上。奖励因此不能拿它当目标：
+    `forward_vel` 读的是**本步真实采样值** `env._command[0]`（见 §3.4）。
+    实测代价：课程 `vx ∈ [0.05, 0.20]` 而 `cfg.command.vx = 0.55` 时，旧写法
+    `|err| ≥ 0.35` 恒成立，`track_shape` 一步撞到 −1 下界、`forward_vel` 每步恒 −10，
+    换用采样值后同一条零残差回合的回报从 **−8429.7 升到 +1571.5**，
+    `forward_vel` 从 −9.995/步 变 +0.0158/步（误差 0.094 对窗口 0.10）。
   * `set_command_now(vy, yaw_rate, vx)`：改**当前值**，控制器可以每个控制步调一次。
     传了 `vx` 时会**同时改写基线** `cfg.command.vx` —— 那是 `vx_max == 0` 时的回退定值。
     `env._command` 与 `cfg.command._now` 是**同一个 list 对象**，所以没有两份状态不同步的窗口。
@@ -861,14 +870,16 @@ frame_size = 42
 | F | T | T | T | 50 | 500 |
 | **T** | **T** | **T** | **T** | **53** | **530** ← `ObsConfig()` 的默认组合；本仓 `config.yaml` 把它改成 `gait_phase=false`（51）且 `history_len=1` ⇒ **51 维** |
 
-**奖励**：31 个字段的默认值见 §4.2；其中 `[SPEC]` 九项
-`forward_vel=10.0` / `orientation=-1.2` / `torque=-1.5e-4` / `foot_lift=0.9` /
-`body_collision=-1.2` / `lateral_vel=6.0` / `yaw_rate=4.0`；
-`forward_overspeed=1.0` / `overspeed_range=0.45` / `forward_range_floor=0.30` /
-`track_tail=1.5`（默认 1.0，`config.yaml` 调高）/ `overspeed_cap=2.0`；
+**奖励**：31 个字段的默认值见 §4.2；其中源码里带 `[SPEC]` 标记的 **6 项**
+`forward_vel=10.0` / `forward_overspeed=1.0` / `orientation=-1.2` / `torque=-1.5e-4` /
+`foot_lift=0.9` / `body_collision=-1.2`；
+其余关键量：`overspeed_range=0.45` / `forward_track_window=0.25`（**绝对**误差窗口 [m/s]） /
+`track_tail=1.5`（默认 1.0，`config.yaml` 调高）/ `overspeed_cap=2.0` /
+`yaw_range_floor=0.30`；
 （`forward_vel_sigma` / `lateral_vel_sigma` / `yaw_rate_sigma` 三个字段**已经删除**，
 不再存在于 `RewardConfig` 里）
 `alive=0.15`、`termination=-15.0`、`success=50.0`、
+`lateral_vel=6.0` / `yaw_rate=4.0`（`command_follow` 两项的权重）、
 `foot_lift_target=0.08`、`foot_lift_step_ratio=1.4`、`foot_lift_gate_speed=0.25`、
 `probe_lift=1.0` / `probe_lift_target=0.06` / `probe_blocked_frac=0.30`、
 `leg_collision=-0.25`、`stair_progress=3.0`、

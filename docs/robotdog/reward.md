@@ -2,8 +2,8 @@
 
 ## 1. 一句话定位
 
-本仓库**所有奖励数学的唯一来源**：`RewardConfig` 的 29 个权重/阈值加一个**有状态**的函数
-`compute_reward(env, action, ...)`（`robotdog/reward.py:152`），输出逐步奖励、逐项明细与终止奖励。
+本仓库**所有奖励数学的唯一来源**：`RewardConfig` 的 31 个权重/阈值加一个**有状态**的函数
+`compute_reward(env, action, ...)`（`robotdog/reward.py:158`），输出逐步奖励、逐项明细与终止奖励。
 
 ## 2. 职责边界
 
@@ -16,7 +16,9 @@
 
 **不做：**
 
-* 不推进物理、不改环境状态、不写任何字段（**只读** `env`）。
+* 不推进物理、不改环境状态。它**只读** `env` 的配置与状态属性，但会写
+  `_peak_terrain_height` / `_probe_best` / `_probe_count` 三个势函数记忆字段 ——
+  所以**不是纯函数**（见本节 D1 与 `robotdog/reward.py` 模块 docstring）。
 * 不决定「本步是否终止」——那是 `robotdog/env.py` 的 `_terminated()` /
   `_success_reached()` 的职责，`compute_reward` 只是通过 `terminated` 参数接收结论。
 * 不管观测、不管课程、不管 PPO。
@@ -51,7 +53,7 @@ def _compute_reward(self, action, trunk_contact, foot_contact=None,
 （`base_x` / `forward_vel` / `roll` / `pitch` / `base_z` …）。
 
 **实测**：`robotdog/env.py:714-725` 的 `_compute_reward` 转发方法返回的 `terms` 与
-`robotdog/reward.py:152` 的 `compute_reward()` 的 `terms` 有 **15 个共同键**；`info["reward_terms"]` 再补一个
+`robotdog/reward.py:158` 的 `compute_reward()` 的 `terms` 有 **15 个共同键**；`info["reward_terms"]` 再补一个
 `"terminal"`，共 **16 键**。
 
 ### 3.3 终止奖励单列而不是塞进 `terms`（D3）
@@ -115,13 +117,16 @@ class RewardConfig:
     forward_vel: float = 10.0           # [SPEC] 对 vx 指令的线性死区跟踪
     forward_overspeed: float = 1.0      # [SPEC] 超速侧惩罚斜率
     overspeed_range: float = 0.45       # 超速惩罚的斜率量程 [m/s]
-    forward_range_floor: float = 0.30   # vx 指令为 0 时归一化误差的量程下限 [m/s]
+    forward_track_window: float = 0.25  # 前进跟踪的**绝对**误差窗口 [m/s]（不随指令大小变）
+    track_tail: float = 1.0             # 线性死区外侧的线性尾项系数（越界后仍有回头梯度）
+    overspeed_cap: float = 2.0          # 超速惩罚的倍率上界（forward_vel 的倍数）
     orientation: float = -1.2           # [SPEC] roll^2 + pitch^2（平方和）
     torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
     foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
     body_collision: float = -1.2        # [SPEC] 躯干接触地形
     lateral_vel: float = 6.0            # [SPEC] 横向速度指令跟踪（仅在 vy_max > 0 时计入）
     yaw_rate: float = 4.0               # [SPEC] 偏航角速度指令跟踪（恒计入，量程取 max(yaw_max, yaw_range_floor)）
+    yaw_range_floor: float = 0.30       # yaw_max 为 0 时偏航跟踪的归一化量程下限 [rad/s]
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
     foot_lift_step_ratio: float = 1.4   # 取较大者：target = max(target, ratio * step_height)
     foot_lift_gate_speed: float = 0.25  # m/s，三维足端速度门限
@@ -173,7 +178,7 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 
 | key | 公式 |
 | --- | --- |
-| `forward_vel` | `forward_vel * track`，其中 `err = lin[0] - command.vx`、`fwd_range = max(\|command.vx\|, rc.forward_range_floor)`、`x = \|err\| / fwd_range`、`track = max(-1.0, track_shape(x, rc.track_tail))`；`err > 0`（超速）时再减 `min(rc.forward_overspeed * err / rc.overspeed_range, rc.overspeed_cap)`。**线性死区 + 线性尾项 + 有界超速惩罚**：死区在 `\|err\| > fwd_range` 之后恒 0、梯度消失，尾项让越界仍有梯度，超速是主动选择所以单独有价钱。`forward_range_floor = 0.30`、`track_tail = 1.5`（`config.yaml`）、`overspeed_cap = 2.0` 都在 `RewardConfig` |
+| `forward_vel` | `forward_vel * track`，其中 `err = lin[0] - env._command[0]`（**本步真正采样的指令**，不是 `command.vx`）、`x = \|err\| / rc.forward_track_window`（**绝对**误差窗口 `0.25` m/s，不随指令大小归一化）、`track = max(-1.0, track_shape(x, rc.track_tail))`；`err > 0`（超速）时再减 `min(rc.forward_overspeed * err / rc.overspeed_range, rc.overspeed_cap)`。**线性死区 + 线性尾项 + 有界超速惩罚**：死区在 `\|err\| > forward_track_window` 之后恒 0、梯度消失，尾项让越界仍有梯度，超速是主动选择所以单独有价钱。`forward_track_window = 0.25`、`track_tail = 1.5`（`config.yaml`）、`overspeed_cap = 2.0` 都在 `RewardConfig` |
 | `orientation` | `orientation * (rpy[0]² + rpy[1]²)` |
 | `torque` | `torque * sum(tau²)` |
 | `foot_lift` | `foot_lift * mean(gate * lift)`；`gate = clip(foot_speed / max(foot_lift_gate_speed,1e-6), 0, 1)`，`foot_speed = ‖(feet - _prev_foot_pos)/control_dt‖`（三维），`lift = clip(clearance / lift_target, 0, 1)` |
@@ -192,11 +197,15 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 
 `RewardConfig` 的 **31 个字段**里有 16 个是**参数**而不是键（其余 15 个各自对应 `terms` 里的一个键，
 加上 `env._compute_reward` 塞回的 `"terminal"` 就是 `info["reward_terms"]` 的 16 个键）：`forward_overspeed`、
-`overspeed_range`、`forward_range_floor`、`track_tail`、`lateral_vel`、`yaw_rate`、
-`foot_lift_target`、`foot_lift_step_ratio`、`foot_lift_gate_speed`、
+`overspeed_range`、`forward_track_window`、`track_tail`、`overspeed_cap`、`lateral_vel`、`yaw_rate`、
+`yaw_range_floor`、`foot_lift_target`、`foot_lift_step_ratio`、`foot_lift_gate_speed`、
 `probe_lift_target`、`probe_blocked_frac`、
 `air_time_target`、`air_time_max`、`termination`
-（前 10 个是门槛/斜率参数：它们只调整别的项的形状，本身不产生 `terms` 键；
+（前 13 个是门槛/斜率/形状参数：它们只调整别的项的形状，本身不产生 `terms` 键 ——
+`overspeed_range` / `forward_track_window` / `track_tail` / `overspeed_cap` / `yaw_range_floor` /
+`foot_lift_target` / `foot_lift_step_ratio` / `foot_lift_gate_speed` / `probe_lift_target` /
+`probe_blocked_frac` / `air_time_target` / `air_time_max` 是纯形状，`forward_overspeed` 是超速斜率；
+`lateral_vel` / `yaw_rate` 是 `command_follow` 两个分量的权重，键合并成一个；
 `termination` 是终局值，由 `compute_reward` 单独返回，也不在 `terms` 里）。
 
 > **横向项必须门控，偏航项必须不门控**（两次真实的自伤，方向相反）。
@@ -222,9 +231,12 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 > 更后一轮发现高斯的根问题：`forward_vel` 以前**只拿 `command.vx` 当目标**，而 `vx` 是
 > 定值基线、不随回合重抽，于是课程里 `command_vx = 0.0` 的级别「指令说别前进，却没有
 > 任何一项惩罚前进」，小跑步态先验自带的前进偏置白拿分（实测该级均回报 9052.5/1000 步
-> ≈ 9.05/步，同时横向指令 ±0.10 只跟出 ±0.02 m/s）。现已改成**按量程归一化的线性死区**：
+> ≈ 9.05/步，同时横向指令 ±0.10 只跟出 ±0.02 m/s）。当时先改成**按量程归一化的线性死区**：
 > 量程 `max(|cmd.vx|, rc.forward_range_floor = 0.30)`，权重 2.5 → **10.0**，`vx = 0` 时该项
-> 恰好为 0。原先的 5 个字段（`forward_vel_sigma` / `lateral_vel_sigma` / `yaw_rate_sigma` /
+> 恰好为 0 —— 但分母随指令大小变，等于把"相对误差"当成判据。这版**已被废弃**：
+> 现在的量程是常数 `rc.forward_track_window = 0.25`（绝对误差窗口），目标也不再是
+> `command.vx` 而是本步真实采样的 `env._command[0]`，理由见 §4.1 与 `robotdog/reward.py:205-221`。
+> 原先的 5 个字段（`forward_vel_sigma` / `lateral_vel_sigma` / `yaw_rate_sigma` /
 > `probe_lift_ratio` / `probe_lift_max`）已在本轮随线性死区改造一并从 `RewardConfig` 删除，
 > 原因见 `experience.md` §2.2 与 §12。
 
@@ -243,7 +255,7 @@ robotdog/env.py:1053  step()
     ▼
 robotdog/env.py:1114  _compute_reward(..., terminated=terminated)   ← 调用点在 env.py:1114
     ▼
-robotdog/reward.py:152  compute_reward(env, action, trunk_contact,
+robotdog/reward.py:158  compute_reward(env, action, trunk_contact,
                                        foot_contact, leg_contact, terminated)
     │  读 env.cfg.reward / env.cfg.command / env.cfg.obs.vel_filter
     │     env.base_rpy / env.base_lin_vel_body / env.data.actuator_force
@@ -282,7 +294,7 @@ robotdog/env.py:1114  reward, terms = ...；_advance_foot_air_time(foot_contact)
 | `RewardConfig.forward_vel` | `10.0` | 唯一的大额正项（线性死区，见 §4.1） |
 | `RewardConfig.forward_overspeed` | `1.0` | 超速侧惩罚斜率（`err > 0` 时按 `err / overspeed_range` 扣） |
 | `RewardConfig.overspeed_range` | `0.45` m/s | 超速惩罚的斜率量程（超速 0.45 m/s 扣光这一项） |
-| `RewardConfig.forward_range_floor` | `0.30` m/s | `vx = 0` 时归一化误差的量程下限 |
+| `RewardConfig.forward_track_window` | `0.25` m/s | 前进跟踪的**绝对**误差窗口（常数，不随指令大小变） |
 | `RewardConfig.body_collision` | `-1.2` | 躯干接触地形（**不致命**，唯一的兜底） |
 | `RewardConfig.lateral_vel` | `6.0` | 横向指令跟踪的权重（`vy_max > 0` 才计入 `command_follow`） |
 | `RewardConfig.yaw_rate` | `4.0` | 偏航指令跟踪的权重（**恒计入**，量程取 `max(yaw_max, yaw_range_floor)`） |
@@ -335,8 +347,9 @@ robotdog/env.py:1114  reward, terms = ...；_advance_foot_air_time(foot_contact)
 * **5 个历史字段已从 `RewardConfig` 删除。** `forward_vel_sigma`、`lateral_vel_sigma`、
   `yaw_rate_sigma`、`probe_lift_ratio`、`probe_lift_max` 现在都不存在（原因见
   `experience.md` §2.2 与 §12）；写进 `config.yaml` 的 `reward:` 段会被配置校验直接拒绝。
-  前进/横向/偏航三项的容差是「指令量程」（`max(|cmd.vx|, forward_range_floor)` 或
-  `vy_max` / `yaw_max`），不是 σ。
+  前进项的容差是**绝对**误差窗口（`rc.forward_track_window = 0.25` m/s）；横向/偏航
+  两项的容差是「指令量程」（`vy_max` / `yaw_max`，偏航零指令时退回
+  `yaw_range_floor = 0.30` rad/s），不是 σ。
 * **`terminal` 不在 `compute_reward` 返回的 `terms` 里**，只有
   `info["reward_terms"]` 有它。直接对 `terms` 求和得到的是逐步奖励，差一个终局项。
 * `limit` 项用的 `act_low/act_high` 是**关节软限位**而不是 `ctrl_ranges`（力矩限幅），

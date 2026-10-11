@@ -96,7 +96,7 @@ upstair_core/
     policy.py        训练产物的加载：配置 / 观测维度 / 网络结构 / 归一化统计
     config.py        读 config.yaml → EnvConfig + 课程阶段表
     training.py      PPO 组装、向量环境、运行目录、权重加载
-    reward.py        ★ 全部奖励数学（RewardConfig + 纯函数 compute_reward）
+    reward.py        ★ 全部奖励数学（RewardConfig + 有状态 compute_reward）
     curriculum.py    课程数据类（StageSpec/EpisodeStats/StageResult）与汇总写出
     tools/           工具层（不 import env）
       console.py     UTF-8 控制台
@@ -217,7 +217,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 
 | 项 | 默认 | 口径 |
 | --- | --- | --- |
-| `forward_vel` | **+10.0** | 机身系 `vx` 对指令的线性死区：`x = |vx - cmd.vx| / max(|cmd.vx|, 0.30)`、`shape = max(0,1-x) - track_tail*max(0,x-1)`，超速侧（`vx > cmd.vx`）再减 `forward_overspeed * err / overspeed_range`（有 `overspeed_cap` 上界）。量程就是指令本身，所以「指令说别前进」时 `vx = 0` 得 0 分（而不是旧高斯核那种「站着也拿 +0.86/步」）。**读机身系不读世界系**：世界系 x 是位姿导数，机器人自转时会在步态周期内换号 |
+| `forward_vel` | **+10.0** | 机身系 `vx` 对指令的**绝对**误差窗口线性死区：`err = vx - env._command[0]`、`x = \|err\| / forward_track_window`（常数窗口 `0.25` m/s，**不随指令大小归一化**）、`shape = max(0,1-x) - track_tail*max(0,x-1)`，超速侧（`err > 0`）再减 `forward_overspeed * err / overspeed_range`（有 `overspeed_cap` 上界）。目标取**本步真实采样的指令** `env._command[0]`，不是 `cfg.command.vx` —— 后者只是「采样范围为空」时的回退定值，`set_commands` 不改它、会一直停在出厂值上：课程 `vx ∈ [0.05,0.20]` 而 `cfg.command.vx = 0.55` 时旧写法恒 `\|err\| ≥ 0.35`、`shape` 一步撞死在下界 −1、`forward_vel` 每步恒 −10；修正后同一条零残差回合的回报从 **−8429.7 升到 +1571.5**。**读机身系不读世界系**：世界系 x 是位姿导数，机器人自转时会在步态周期内换号 |
 | `command_follow` | 见下 | 横向 / 偏航指令的跟踪项，**只在对应指令范围非零时才计**（见下方说明） |
 | `orientation` | -1.2 | `roll² + pitch²` |
 | `torque` | -1.5e-4 | `Σ tau²` |
@@ -276,8 +276,9 @@ follow += 4.0 * (max(0.0, 1.0 - x) - 1.5 * max(0.0, x - 1.0))
 ⚠ **偏航项反过来必须不门控**。`yaw_max == 0` 的级别里没有任何一项读 `wz`，策略学会以
 −0.608 rad/s **恒定自转**：扫 `wz ∈ [−0.6, +0.6]` 七档，实测 vx 恒 +0.365、wz 恒 −0.608，
 斜率 −0.0021 —— 输出与偏航指令逐位无关，而且这个转法在后续级别里冻住。现在偏航项恒在，
-量程取 `max(yaw_max, reward.yaw_range_floor)`（默认 0.30 rad/s，与 `forward_range_floor` 同一个用意：
-零指令级别也要有「不转」的价钱，同时避免除零）。横向仍门控 —— 它的作动权限小得多
+量程取 `max(yaw_max, reward.yaw_range_floor)`（默认 0.30 rad/s，与前进项的 `forward_track_window`
+同一个用意 —— 给跟踪项一个不依赖指令大小的常数尺度，零指令级别也要有「不转」的价钱，
+同时避免除零）。横向仍门控 —— 它的作动权限小得多
 （缩幅值先验下 `hip` 模式 ±0.19 rad/s，横向只有 ±0.10 m/s），代价不对称。
 
 **线性死区外侧的线性尾项**（`reward.track_tail`）是三项跟踪惩罚共用的形状：
@@ -525,7 +526,7 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 | `robotdog/policy.py` | 339 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
 | `robotdog/curriculum.py` | **339** | 课程数据类 + 汇总写出 |
 | `robotdog/training.py` | 323 | 向量环境 / PPO / 运行目录 / 权重加载 |
-| `robotdog/reward.py` | **379** | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
+| `robotdog/reward.py` | **395** | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
 | `robotdog/tools/terrain.py` | 287 | 楼梯几何 |
 | `robotdog/gait.py` | 191 | 开环 trot 先验 |
 | `robotdog/tools/paths.py` | **38** | 路径常量（**没有任何函数**） |
@@ -561,7 +562,7 @@ SB3 `BaseCallback` 钩子）、文档化的公开 API（`GaitParams.static()` / 
 
 ### 6.3 `env.py` 为什么还有 1227 行
 
-它不是「奖励算在里面」——奖励数学在 `robotdog/reward.py`（379 行）。`env.py` 的构成是：
+它不是「奖励算在里面」——奖励数学在 `robotdog/reward.py`（395 行）。`env.py` 的构成是：
 
 | 类别 | 行数 | 占比 |
 | --- | --- | --- |
