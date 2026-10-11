@@ -82,7 +82,7 @@ DummyVecEnv → VecMonitor → VecNormalize
 
 * `set_terrain(venv, stair)`（`env_method("set_stair")` + `reset()` 两行）已随死代码
   清理删除（见 §9）。
-* `Go2StairsEnv.set_stair()` 本身还在（`robotdog/env.py:320-334`），但**零调用点**——
+* `Go2StairsEnv.set_stair()` 本身还在（`robotdog/env.py:360-366`），但**零调用点**——
   保留的理由见 `experience.md` §9.1。
 * 所以 **`grep env_method` 在本仓只有一处命中**：`scripts/train.py` 的
   `Trainer.make_env()` 在建完这一级的环境后下发指令范围
@@ -192,8 +192,8 @@ def format_duration(seconds: float) -> str: ...      # 12.3s / 4.5min / 1.20h
 * `load_policy` 在 `set_parameters` 之后**还会调一次 `restore_vecnormalize(venv, cand)`**，
   把统计量装回模型自带的 `VecEnv`；`cand` 不存在时跳过。返回值里的 `ObsNorm`
   与模型自带包装器因此始终是同一份统计量。**注意 `cfg` 要传对**：
-  `make_env_fn(stair, None)` 会用默认 `EnvConfig`（`history_len=10` → 480 维），
-  载入本仓 `history_len=1`（48 维）的权重时观测维度就对不上了。
+  `make_env_fn(stair, None)` 会用默认 `EnvConfig`（`history_len=10` → 510 维），
+  载入本仓 `history_len=1`（51 维）的权重时观测维度就对不上了。
   另外 `_env.json` 里的 `command` 经 JSON 往返会变成 `dict`，`policy.py` 的
   `_rebuild(CommandConfig, ...)` 必须先把它还原成 dataclass，否则 `set_command_now`
   会抛 `AttributeError: 'dict' object has no attribute '_now'`。

@@ -23,9 +23,9 @@
 * **不含闭环**：不读 qpos/qvel、不做平衡、不知道台阶，相位纯由外部累加的时间 `t` 决定；
 * 不做 PD 控制、不写 `mjData`、不碰 MuJoCo；
 * 不决定「先验开不开」——`gait_prior` / `gait` / `gait_gain` 都是 `EnvConfig` 的字段，
-  `_gait_action()`（`robotdog/env.py:912`）才决定要不要用它；
+  `_gait_action()`（`robotdog/env.py:921`）才决定要不要用它；
 * 不决定观测里有没有步态时钟——那是 `ObsConfig.gait_phase`（`robotdog/env.py:67`，
-  观测块在 `robotdog/env.py:584-585`）；
+  观测块在 `robotdog/env.py:591-592`）；
 * **不做相位随机化**：`gait_phase_randomize` 字段已从 `EnvConfig` 删除，
   `reset()` 里 `_gait_t` / `_gait_phase` 都置 0.0 是固定值（`robotdog/env.py:899-900`）。
 
@@ -72,7 +72,7 @@ target = home + gait_gain * gait.radians(t) + action_scale * action
 ```
 
 `gait.action_scale` 说「先验动作多大」（它是搜索出来的一部分），
-`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:922-940` 的 `_target_from_action()`）。
+`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:931-941` 的 `_target_from_action()`）。
 `gait_gain` 默认 `1.0` 且**没有 CLI 开关**，只能改 `cfg`。
 
 **被否决的方案**：共用一个 `action_scale`（先验与策略同权）。否决原因就是上面那条实测：
@@ -214,10 +214,10 @@ EnvConfig()
 **控制步（每个 `step()` 一次）**：
 
 ```
-Go2StairsEnv.step(action)                                    # robotdog/env.py:942
-  → self._gait_phase = self._gait_t                          # env.py:947（本步实际用的相位）
-  → self._target_from_action(action)                         # env.py:948
-    → self._gait_action()                                    # env.py:912
+Go2StairsEnv.step(action)                                    # robotdog/env.py:951
+  → self._gait_phase = self._gait_t                          # env.py:956（本步实际用的相位）
+  → self._target_from_action(action)                         # env.py:957
+    → self._gait_action()                                    # env.py:921
        若 not cfg.gait_prior 或 cfg.gait_gain == 0.0 → zeros(12)
        否则 → cfg.gait_gain * cfg.gait.radians(self._gait_phase)
               → GaitParams.radians(t)                        # gait.py:94
@@ -226,14 +226,14 @@ Go2StairsEnv.step(action)                                    # robotdog/env.py:9
                     → GaitParams.leg_phases(t)               # gait.py:77
                     → GaitParams._calf_wave(p + ph_ca)       # gait.py:68
   → target = home + _gait_action() + cfg.action_scale * action
-  → np.clip(target, act_low, act_high)                       # env.py:940
-  → self._gait_t += cfg.control_dt                           # env.py:231（20 ms）
+  → np.clip(target, act_low, act_high)                       # env.py:948
+  → self._gait_t += cfg.control_dt                           # env.py:238（20 ms）
 ```
 
 **观测里的步态时钟**（`ObsConfig.gait_phase=True`，每帧 2 维）：
 
 ```
-_obs_frame()                                                 # robotdog/env.py:568
+_obs_frame()                                                 # robotdog/env.py:575
   → theta = 2π * cfg.gait.freq * self._gait_phase
   → np.array([np.sin(theta), np.cos(theta)])
 ```
@@ -348,11 +348,11 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   **有开环先验时未训练策略第一轮就达标**，`learn()` 立刻返回 False 进入下一档，
   于是 `mean|a| = 0.0109`、策略成功率与纯先验一模一样（75.0% vs 75.0%）。这条结论
   当年直接催生了 `StageSpec.min_timesteps` / `--min-stage-frac` 这套「最少步数」下限；
-  **本仓已取消毕业门**（六级各跑满固定预算，见 `docs/robotdog/curriculum.md` §3.2），
+  **本仓已取消毕业门**（每一级各跑满固定预算，见 `docs/robotdog/curriculum.md` §3.2），
   所以现在这个坑在结构上不会发生 —— 但「先验越强，别让策略少学」这句话仍然成立。
 * `experience.md` §3.4 —— 残差策略不知道自己处在步态周期的哪一点：叠加在周期先验上
   的残差策略若无法判断相位就不可能是最优的，修法是 `ObsConfig.gait_phase`
-  （sin/cos 两维）。实现就在 `robotdog/env.py:584-585`。
+  （sin/cos 两维）。实现就在 `robotdog/env.py:591-592`。
 * 先验自身的标定数字（在平地、确定性 reset、零动作噪声下用真实 `Go2StairsEnv` 测）：
   `default_trot()` 速度目标 0.550 m/s、8 s 走 4.39 m、100% 存活、机身高度 0.268 m。
   （`fast_trot()` 的 1.702 m/s、6 s 走 10.19 m 是同批标定的另一半，但该 classmethod
@@ -395,7 +395,7 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   `ValueError: {path} has no 'top' entries` 或 `IndexError` 上炸掉。
 * **两个 `action_scale` 同名但不同义**：`GaitParams.action_scale`（出货值 `1.0`）是
   「先验幅度」，`EnvConfig.action_scale`（`0.30`）是「策略权限」。源码里没有任何一处把
-  两者相加或相乘后再 clip；`_target_from_action()` 的真实实现（`robotdog/env.py:922-940`）是
+  两者相加或相乘后再 clip；`_target_from_action()` 的真实实现（`robotdog/env.py:931-941`）是
   `target = clip(home + gait_gain*gait.radians(t) + cfg.action_scale*action, act_low, act_high)`
   ——clip 的是最终关节目标（用 MJCF 关节限位），没有「先求和再 clip 到 ±1」这一步。
   `grep "action_scale"` 会同时命中两处，对账时注意区分。以代码为准。

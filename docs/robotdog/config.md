@@ -4,7 +4,7 @@
 
 **配置层**：把仓根的 `config.yaml` 读成两个已经可直接使用的东西 ——
 :class:`~robotdog.env.EnvConfig`（一个环境实例的全部参数）和
-:class:`~robotdog.curriculum.StageSpec` 列表（六级课程），让 `scripts/train.py` 与
+:class:`~robotdog.curriculum.StageSpec` 列表（八级课程），让 `scripts/train.py` 与
 `scripts/play.py` 不必再暴露一堆命令行开关。
 
 ## 2. 职责边界
@@ -58,7 +58,7 @@ config.yaml 的 env: 无法识别的键 ['command_vx_']; 可用键 = ['action_sc
 * `timesteps: 2000` ⇒ 每级都 2000（冒烟用）。
 * `timesteps: [100000, 250000, ...]` 且长度等于级数 ⇒ 原样使用。
 * 长度**不等** ⇒ 按比例重采样到级数（保持总量，**余数补给最难的一级**），
-  这样把 `heights_cm` 从六级改成七级时不必手改预算。
+  这样把 `heights_cm` 从八级改成九级时不必手改预算。
 
 `learning_rate` 同理，但缺省时给统一值 `1.5e-4`，而不是 `curriculum.py` 里那条
 逐级递减的表 —— **哪套学习率是「配置」而不是「常量」**：`config.yaml` 显式给了就用它，
@@ -138,7 +138,9 @@ def _load_gait(gait_file) -> GaitParams
 
 `config_to_env` 会**弹出**四个键再交给 `_apply`：`obs` 与 `command`（嵌套子段，
 各自单独 `_apply` 到 `cfg.obs` / `cfg.command`）、`n_envs`（属于运行参数，不属于
-`EnvConfig`）、`gait_file`（只有开了 `gait_prior` 才真的读文件）。
+`EnvConfig`）、`gait_file`（只有开了 `gait_prior` 才真的读文件）。读进先验之后，
+若 `gait_amp_scale != 1.0`，就把 `amp_th` / `amp_ca` 各乘一次该系数再 `normalize()`
+—— 只缩振幅、保留高步频（先验自身 2.05 m/s，而指令区间是 0.2~0.6 m/s）。
 
 `command_for_stage(stage)` 是**播放侧**用的：给一个课程阶段，返回一条「落在该级
 指令量程内」的 `(vx, vy, yaw_rate)` —— 量程为 0 的方向给 0，有量程的给
@@ -188,8 +190,9 @@ raw: dict
 > `play.py` 的 `write_gif()` 也随之不再收 `fps` / `scale` 参数。
 
 默认课程（不写 `curriculum` 段时）来自 `robotdog/curriculum.py` 的
-`STAGE_HEIGHTS_CM`（`(0.0, 0.0, 0.0, 3.0, 6.0, 9.0)`）与
-`DEFAULT_TREAD`/`DEFAULT_N_UP`（`0.50` m / `8` 级），总预算 1,350,000 步。
+`STAGE_HEIGHTS_CM`（`(0.0, 0.0, 0.0, 3.0, 6.0, 9.0, 12.0, 15.0)`）与
+`DEFAULT_TREAD`/`DEFAULT_N_UP`（`0.50` m / `8` 级），总预算 1,850,000 步。
+`config.yaml` 显式给出的八级与这套默认值一致。
 
 ## 7. 与其它模块的关系
 
@@ -209,8 +212,8 @@ raw: dict
 
 ## 8. 实测与经验教训
 
-* 首次跑通：`load_config()` → `frame 48 / obs 48`（`history_len=1`，含指令那 2 维）、`gait_prior=True`、
-  六级打印正确、总预算 1,350,000 步。见 `experience.md` §7 的开头。
+* 首次跑通：`load_config()` → `frame 48 / obs 48`（`history_len=1`，当时指令占 2 维）、`gait_prior=True`、
+  课程打印正确。见 `experience.md` §7 的开头。
 * `policy_arch()` 的必要性（不读配置的结构就会 `size mismatch`）见
   `experience.md` §7.1。
 * 每个 checkpoint 各存一份地形记录（`<模型>_env.json`）见 `experience.md` §7.4。
@@ -239,9 +242,9 @@ raw = load_config()                       # 默认 <仓根>/config.yaml
 cfg = config_to_env(raw)
 stages = config_to_stages(raw)
 
-print(cfg.obs.size)                       # 48（history_len=1，含指令那 2 维）
+print(cfg.obs.size)                       # 51（history_len=1，含三轴指令与两条滤波量）
 print([(s.name, s.timesteps) for s in stages])
-print(sum(s.timesteps for s in stages))   # 1350000
+print(sum(s.timesteps for s in stages))   # 1850000
 ```
 
 命令行侧（`scripts/train.py` 与 `scripts/play.py` 只暴露两个开关）：

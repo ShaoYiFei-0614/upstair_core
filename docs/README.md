@@ -17,7 +17,7 @@ docs/
     policy.md               训练产物的加载与观测归一化
     reward.md               ★ 全部奖励数学（RewardConfig + compute_reward）
     training.md             PPO 组装 / 向量环境 / 运行目录
-    curriculum.md           六级课程（三级平地预热 + 3/6/9 cm）
+    curriculum.md           八级课程（三级平地预热 + 3/6/9/12/15 cm）
     tools/
       __init__.md           工具子包入口
       console.md            UTF-8 控制台

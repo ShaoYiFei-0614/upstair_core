@@ -56,6 +56,17 @@ class RewardConfig:
     # 拿满分，超过 0.30 m/s 归零 —— 与实测「小跑步态自带 0.24 m/s 前进偏置」
     # 同量级，足以把「别前进」这句话变成有价钱的要求。
     forward_range_floor: float = 0.30
+    # 线性死区**外侧**的线性尾项系数。死区形状 ``max(0, 1 - |err|/range)`` 在
+    # ``|err| > range`` 之后恒为 0、梯度也恒为 0，于是「已经偏出量程」的状态
+    # 完全没有回头路 —— 实测偏航误差 0.44 rad/s 而 ``yaw_max`` 只有 0.15 时，
+    # 这一项整段归零，策略 250k 步都没把自转收回来。补一项
+    # ``-track_tail * clamp(|err|/range - 1, 0, None)`` 让越界之后仍有梯度。
+    # 符号必须是**减**（越界越远越差），反例与依据见 :func:`track_shape`。
+    track_tail: float = 1.0
+    # 超速惩罚的**倍率上界**（``forward_vel`` 的倍数，不是 m/s）。超速惩罚随误差
+    # 线性增长且原本没有上界，平地上「先验 2.05 m/s 对指令 0.45」会把它推到 −2.7 倍，
+    # 单项吃满 −27/步、单回合 −65000，价值函数学不动。取 2.0 ⇒ 最差 −2.0×forward_vel。
+    overspeed_cap: float = 2.0
     orientation: float = -1.2           # [SPEC] roll^2 + pitch^2（平方和）
     torque: float = -1.5e-4             # [SPEC] sum(tau^2)（关节力矩平方和）
     foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
@@ -111,6 +122,29 @@ class RewardConfig:
 # --------------------------------------------------------------------------- #
 
 
+def track_shape(x: float, tail: float) -> float:
+    """指令跟踪的共同形状：``x = |误差| / 量程`` 的单调递减函数。
+
+    ``x <= 1`` 是线性死区 ``1 - x``；``x > 1`` 换成更陡的线性尾项
+    ``-tail * (x - 1)``。三条性质都是必需的：
+
+    * **在 ``x = 1`` 处连续**（两侧都是 0），所以「刚好贴住容差」与「差一点点」
+      的分值一样；
+    * **全程单调递减**。早期的尾项是 ``- tail * (x - 1)**2``（减号），于是
+      ``x > 1`` 之后惩罚先增后减，在 ``x = 1 + 1/(2*tail)`` 取到**极小值** ——
+      那不是「惩罚不够」，而是奖励在主动把误差**推得更大**。实测缩幅值先验的
+      平地上策略稳定在 ``wz = -0.764 rad/s`` 对指令 0（``x = 1.53``），正好越过
+      那个极小点，成功率被 ``tol_wz = 0.5`` 一票否决；
+    * **尾项要够陡**。二次型在刚越界时几乎不罚（``x = 1.53`` 只值 ``-0.28``），
+      压不住已经养成的漂移。线性尾项在同一处值 ``-0.80``（``tail = 1.5``）。
+      偏离超过 ``1 + 1/tail`` 之后由调用处的 ``max(-1.0, ...)`` 兜住，所以惩罚
+      有下界、不会像早期的无界超速项那样把回报压到 −65000。
+    """
+    if x <= 1.0:
+        return 1.0 - x
+    return -tail * (x - 1.0)
+
+
 def compute_reward(env, action: np.ndarray, trunk_contact: bool,
                    foot_contact: np.ndarray | None = None,
                    leg_contact: bool = False,
@@ -139,7 +173,11 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     rc = env.cfg.reward
     cmd = env.cfg.command
     rpy = env.base_rpy
-    lin = env.base_lin_vel_world
+    # 「前进」取**机身系** x 分量，不取世界系。世界系 x 是本位姿导数，机器人自转时
+    # 它会在步态周期内换号；实测巡航策略世界系 x 均值 +0.54 m/s 而机身系 +0.72、
+    # 偏航漂到 −47°，奖励于是默认了「一边转一边走」也是一种跟踪。执行器只产
+    # 机身系的推力，所以「前进」只能是机身系量；偏航对齐由 ``yaw_rate`` 项负责。
+    lin = env.base_lin_vel_body
     target_height = env.nominal_pose
     # 指令跟踪读滤波量还是瞬时量，由观测开关决定（两者必须一致，否则策略看到的
     # 和它被评判的不是同一个数；见下面 1b 的说明）。
@@ -155,11 +193,21 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     #
     # 量程取 ``max(|cmd.vx|, rc.forward_range_floor)`` 把 ``vx=0`` 时的分母撑开，
     # 否则「别前进」这个指令没有价钱。超速惩罚的斜率量程是 ``rc.overspeed_range``。
+    #
+    # 两处都必须**有界**：死区外没有任何下界时（``−（超速量/0.45）`` 可以到 −7 以上），
+    # 平地上「先验 2.05 m/s 对指令 0.45」的固定偏差会把逐步奖励压到 −27/步、
+    # 回报 −65000，价值函数彻底学不动（实测 explained_variance −10~0，策略梯度
+    # 损失只有 ±0.015）。现在 shape 下界到 −1（即 ``forward_vel`` 最差 −10），
+    # 超速倍率上界到 ``rc.overspeed_cap``，于是最差一项是 −15/步，与其它惩罚同量级。
     err = float(lin[0]) - float(cmd.vx)
     fwd_range = max(abs(float(cmd.vx)), float(rc.forward_range_floor))
-    track = max(0.0, 1.0 - abs(err) / fwd_range)
+    track = max(-1.0, track_shape(abs(err) / fwd_range, float(rc.track_tail)))
     if err > 0.0:
-        track -= float(rc.forward_overspeed) * err / float(rc.overspeed_range)
+        over = min(
+            float(rc.forward_overspeed) * err / float(rc.overspeed_range),
+            float(rc.overspeed_cap),
+        )
+        track -= over
     terms["forward_vel"] = rc.forward_vel * float(track)
 
     # 1b) 横向 / 偏航指令跟踪 ---------------------------------------------
@@ -178,22 +226,23 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 判据会变成「在判步态相位」而不是「机器人在往哪走」。滤波时间常数
     # ``cfg.vel_filter_tau`` 压掉一个步态周期，同一个量也进观测以保持马尔可夫性。
     follow = 0.0
+    tail = float(rc.track_tail)
     if cmd.vy_max:
         vy = (env.filtered_lateral_vel if vel_filter else env.base_lin_vel_body[1])
-        follow += rc.lateral_vel * float(
-            max(0.0, 1.0 - abs(vy - cmd.vy) / float(cmd.vy_max))
-        )
+        xy = abs(vy - cmd.vy) / float(cmd.vy_max)
+        follow += rc.lateral_vel * max(-1.0, track_shape(xy, tail))
     if cmd.yaw_max:
         wz = env.filtered_yaw_rate if vel_filter else env.yaw_rate
         yaw_err = abs(wz - cmd.wz)
         # ``wz=0`` 时再补一个零指令基线惩罚：只练横向的级别（``yaw_max=0``）
         # 本来没有任何一项读 wz，策略能以 −0.10~−0.20 rad/s 稳定自转
         # （实测 wz=−0.200）。补上之后，「让我不转」也有价钱。
+        # 系数取 1.5 而不是 1.0：实测三轴指令的平阶级上策略偏航漂到 −47°~−88°，
+        # 而旧的 0.5 只值 −0.7/步，挡不住「转着走」。1.5 让 1 rad/s 的自转值
+        # 满额 ``yaw_rate`` 的九成。
         if cmd.wz == 0.0:
-            yaw_err = 0.5 * (yaw_err + abs(wz))
-        follow += rc.yaw_rate * float(
-            max(0.0, 1.0 - yaw_err / float(cmd.yaw_max))
-        )
+            yaw_err = 1.5 * (yaw_err + abs(wz))
+        follow += rc.yaw_rate * max(-1.0, track_shape(yaw_err / float(cmd.yaw_max), tail))
     terms["command_follow"] = follow
 
     # 2) 姿态稳定奖励 -- 惩罚 roll 与 pitch -----------------------------

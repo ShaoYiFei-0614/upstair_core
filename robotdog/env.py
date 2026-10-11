@@ -184,6 +184,13 @@ class EnvConfig:
     gait_prior: bool = False
     gait: GaitParams = field(default_factory=GaitParams.default_trot)
     gait_gain: float = 1.0
+    # 步态先验的幅值缩放（只缩 ``amp_th``/``amp_ca``，保留高步频）。
+    # ``GaitParams.default_trot()`` 是先验自身 2.05 m/s 的平地小跑，而本任务的
+    # 指令区间是 0.2~0.6 m/s —— 残差必须常驻 −0.5 左右才能压到 0.45，这是一个
+    # 巨大的系统性偏置。实测（200k 步、只改这一个旋钮）把幅值缩到 0.45/0.55 后
+    # |vx 误差| 从 0.597 降到 0.267/0.178，且奖励账从「超速惩罚主导」回到
+    # 「姿态/力矩主导」。取 0.5 兼顾抬腿高度与速度量程。
+    gait_amp_scale: float = 0.5
     kp: tuple[float, float, float] = (30.0, 30.0, 45.0)
     kd: tuple[float, float, float] = (0.6, 0.6, 0.9)
 
@@ -683,7 +690,8 @@ class Go2StairsEnv(gym.Env):
         """
         rc = self.cfg.reward
         cmd_vx = float(self.cfg.command.vx)
-        vx = float(self.base_lin_vel_world[0])
+        # 机身系：这是「往前走没走」的判据，世界系分量在机器人偏航时会换号。
+        vx = float(self.base_lin_vel_body[0])
         terrain = float(self.terrain_height_under_base)
         if self._blocked:
             recovered = terrain > self._blocked_peak + 1e-9

@@ -102,11 +102,7 @@ class StageSpec:
     description: str = ""
     command_vy_max: float = 0.0      # 该阶段横向指令上界 [m/s]
     command_yaw_max: float = 0.0     # 该阶段偏航指令上界 [rad/s]
-    command_vx: float = 0.0          # 该阶段定值前进指令 [m/s]，0 = 用 env 基线
-    flat_success_distance: float = 0.0   # 平地段成功距离 [m]，0 = 用 env 基线
-    # 平地段是否要求真的前进一段才算成功。原地指令课程必须关掉（改成「撑满回合」），
-    # 否则 `command_vx = 0` 时 `is_success` 永远不触发，日志成功率恒为 0。
-    flat_success_needs_progress: bool = True
+    command_vx: tuple[float, float] = (0.0, 0.0)  # 前向指令**采样区间** [m/s]；(x, x) 或 (0, 0) 时用 env 基线定值
     reward_overrides: dict[str, float] = field(default_factory=dict)   # 奖励课程
 
     @property
@@ -208,11 +204,10 @@ def format_seconds(seconds: float) -> str: ...   # 12.3s / 4.5min / 1.20h
 ```
 config.yaml (curriculum: heights_cm / tread / n_up / timesteps / learning_rate
                         / command_vy_max / command_yaw_max / command_vx
-                        / flat_success_distance / flat_success_needs_progress
                         / reward_overrides)
   → robotdog/config.py  config_to_stages()
-      → flat_spec(tread=...)                    # 第 1 级
-      → demo_stairs_spec(step_height=h/100, tread=..., n_up=...)   # 其余 5 级
+      → flat_spec(tread=...)                    # 平阶级（heights_cm 里为 0 的级）
+      → demo_stairs_spec(step_height=h/100, tread=..., n_up=...)   # 其余各级
       → [StageSpec, StageSpec, ...]
   → scripts/train.py    for stage in stages:
       → Trainer.train_stage(stage, venv, warm_start=...)
@@ -268,7 +263,7 @@ write_summary(path, stages, results, meta)
 
 ## 8. 实测与经验教训
 
-* 六级课程的实测数字、每级产物清单，见 `train.md` §1、§2。
+* 八级课程的实测数字、每级产物清单，见 `train.md` §1、§2。
 * 「抽象层被调用方绕过」这条教训的完整背景（旧的 `Curriculum` + `StageTrainer`
   被删除），见 `experience.md` 的死代码清理小节。
 * 配置层如何把 `config.yaml` 的六档高度变成 `StageSpec` 列表，见
@@ -307,11 +302,12 @@ from robotdog.tools.terrain import demo_stairs_spec, flat_spec
 
 stages = [
     StageSpec(name="flat", step_height=0.0, spec=flat_spec(n_up=0, n_down=0),
-              timesteps=100_000, learning_rate=1.5e-4, label="平地",
-              command_vx=0.45, flat_success_distance=2.0),
+              timesteps=100_000, learning_rate=1.5e-4, label="平地（指令跟随）",
+              command_vx=(0.2, 0.6)),
     StageSpec(name="stair3", step_height=0.03,
               spec=demo_stairs_spec(step_height=0.03, tread=0.50, n_up=8),
               timesteps=250_000, learning_rate=1.0e-4, label="3cm",
+              command_vx=(0.2, 0.6),
               command_vy_max=0.30, command_yaw_max=0.35,
               reward_overrides={"foot_lift": 1.0, "probe_lift": 0.6}),
 ]

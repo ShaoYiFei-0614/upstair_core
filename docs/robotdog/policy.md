@@ -52,11 +52,11 @@
 3. 从 .zip 里保存的 obs 维度反推   —— 猜测（会打印一行提示）
 ```
 
-**为什么必须有第 3 条**：`EnvConfig()` 默认 480 维（`history_len=10`、`command` 恒开），
-而本仓 `config.yaml` 训出来是 48 维。拿默认配置去加载会抛
+**为什么必须有第 3 条**：`EnvConfig()` 默认 510 维（`history_len=10`、`command` 恒开），
+而本仓 `config.yaml` 训出来是 51 维。拿默认配置去加载会抛
 `ValueError: Observation spaces do not match`，而用户往往只从别处拷来一个 `.zip`。
 
-**为什么反推是安全的**：四个开关的维度 3 / 2 / 1 / 2 **互不互质**，组合数只有 16 种，
+**为什么反推是安全的**：五个开关的维度 3 / 2 / 1 / 3 / 2 组合数只有 32 种，
 枚举一遍就能唯一确定；`base_lin_vel_body` 默认开，所以把它排在枚举顺序最前面，
 使最简配置优先命中。`base_height` 已从枚举中删除（它在 `ObsConfig.__post_init__` 里
 就是硬错误），所以反推**不可能**给出一个开着 `base_height` 的配置。
@@ -112,9 +112,10 @@ RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy:
 现在配置能改它，两处就必须真的对齐（见 `experience.md` §7.1）。
 
 > 上面 traceback 里的 `480` 来自 `EnvConfig()` 的默认观测（`history_len=10` ×
-> `frame_size=48`）；本仓 `config.yaml` 用 `history_len: 1`，所以现役权重是 48 维。
-> 一份**归档** checkpoint 里还能看到 `460`／`474`（`frame_size=46` 时代），那类权重
-> 与现役观测不兼容，`_obs_config_for_dim` 反推不出来时会直接报错而不是静默降级。
+> `frame_size=48`，那是 `command` 还是 2 维时的数）；现在的默认是 `frame_size=51` ×
+> `history_len=10` = **510**，本仓 `config.yaml` 用 `history_len: 1`，所以现役权重是
+> **51 维**。一份**归档** checkpoint 里还能看到 `460`／`474`／`480`（`frame_size=46/48` 时代），
+> 那类权重与现役观测不兼容，`_obs_config_for_dim` 反推不出来时会直接报错而不是静默降级。
 
 ### 3.7 每个 checkpoint 各记一份地形，而不是只记整条课程
 
@@ -231,11 +232,11 @@ play.Runner.predict(obs)
 | `ObsNorm.clip` | `10.0` | 来自 `VecNormalize.clip_obs`，训练时就是 10.0 |
 | `_TUPLE_FIELDS` | `frozenset({"kp", "kd", "gravity", "friction"})` | JSON 往返后要转回元组的字段 |
 | `_obs_config_for_dim` 的 `history_len` | `10` | 观测块枚举时的固定历史长度 |
-| `_obs_config_for_dim` 的枚举顺序 | `("base_lin_vel_body", "gait_phase", "step_height", "command")` | **四个开关**（`base_height` 已删除）；`product((False, True), repeat=4)`；`base_lin_vel_body` 默认开 ⇒ 最简配置先命中 |
+| `_obs_config_for_dim` 的枚举顺序 | `("base_lin_vel_body", "gait_phase", "step_height", "command", "vel_filter")` | **五个开关**（`base_height` 已删除）；`product((False, True), repeat=5)`；`base_lin_vel_body` 默认开 ⇒ 最简配置先命中 |
 | `save_env_json` 的 report 键 | `{"step_height", "stage"}` | `step_height` 单位 **m**，`stage` 是阶段名（如 `stair15`） |
 | `stair_from_height` 的 `tread` / `n_up` | `0.50` / `8` | 与课程一致 |
 | `stair_from_height` 的 `top_landing` | 硬编码 `1.20` | 与 `demo_stairs_spec` 的课程默认一致 |
-| `EnvConfig()` 默认观测 | `frame_size=48`、`size=480` | 反推失败时的兜底值（`history_len=10`） |
+| `EnvConfig()` 默认观测 | `frame_size=51`、`size=510` | 反推失败时的兜底值（`history_len=10`） |
 | `_rebuild` 覆盖的嵌套字段 | `command: CommandConfig` | JSON 往返后 `command` 是 `dict`，**必须重建**，否则 `set_command_now` 抛 `AttributeError: 'dict' object has no attribute '_now'` |
 
 ## 7. 与其它模块的关系
@@ -300,7 +301,7 @@ from robotdog.policy import (ObsNorm, env_config_for_model, policy_arch,
 
 # 恢复训练时的配置（优先 summary.json，其次 <stem>_env.json，再按观测维度反推）
 cfg = env_config_for_model("runs/walk1/model_final.zip")
-print(cfg.obs.frame_size, cfg.obs.size)          # 48 480（本仓 config.yaml 是 48）
+print(cfg.obs.frame_size, cfg.obs.size)          # 51 510（默认 10 帧；本仓 config.yaml 是 1 帧 ⇒ 51）
 
 # 重建模型要用的结构，以及这份权重当时是在多高的台阶上训的
 print(policy_arch("runs/walk1/model_final.zip"))         # (512, 256)

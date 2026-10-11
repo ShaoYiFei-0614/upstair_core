@@ -199,7 +199,7 @@ cmd /c "git show HEAD:robotdog/env.py > .tmp/env_before.py"
 顺手跑一次幂等的 `.tmp/sync_env_md_lines.py`，它按符号名把 `docs/robotdog/env.md` 里
 成员的定义行号刷成真值。
 
-两支门都**能解析裸文件名**（`` env.py:585 `` 会按「仓根 → `robotdog/` → `scripts/` →
+两支门都**能解析裸文件名**（`` env.py:592 `` 会按「仓根 → `robotdog/` → `scripts/` →
 `docs/` → 全仓唯一同名」找到 `robotdog/env.py`）。这一点是 2026-02 才补上的：在此之前
 它们只试 `ROOT/raw`，于是文档里几十条裸名引用**从未被检查过**。
 
@@ -267,7 +267,7 @@ RESULT: ALL CHECKS PASSED
 
 ### 8.2 步态先验不能去掉
 
-* `env.gait_prior: false` ⇒ 完整六级课程**全 0% 成功、0% 摔倒、每回合跑满 1000 步**，
+* `env.gait_prior: false` ⇒ 完整课程**全 0% 成功、0% 摔倒、每回合跑满 1000 步**，
   `mean|a| ≈ 0.09`（基准 0.18）—— 机器人原地站到超时，一次都不摔。
 * 原因是 `action_scale = 0.30 rad` 是**按残差**设计的；去掉先验后网络要同时从零学步态
   与平衡。真要去掉，得先把 `action_scale` 放大到接近 gait 自身的 1.0 rad 并重训。

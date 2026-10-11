@@ -140,7 +140,7 @@ from robotdog.tools.paths import RUNS_DIR
 | `robotdog/go2_model.py:39` | `from robotdog.tools.terrain import TERRAIN_GEOM_GROUP` |
 | `robotdog/go2_model.py:405` | `from robotdog.tools.paths import GENERATED_DIR`（函数内延迟导入） |
 | `robotdog/policy.py:18` | `from robotdog.tools.terrain import StairSpec` |
-| `robotdog/policy.py:319` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec`（函数内延迟导入） |
+| `robotdog/policy.py:318` | `from robotdog.tools.terrain import demo_stairs_spec, flat_spec`（函数内延迟导入） |
 | `robotdog/training.py:37` | `from robotdog.tools.paths import RUNS_DIR` |
 | `robotdog/training.py:38` | `from robotdog.tools.terrain import StairSpec` |
 | `scripts/train.py:55` | `from robotdog.tools import console  # noqa: E402` |

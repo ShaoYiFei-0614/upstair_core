@@ -278,6 +278,13 @@ def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
 
     if cfg.gait_prior:
         cfg.gait = _load_gait(gait_file)
+        if cfg.gait_amp_scale != 1.0:
+            # 只缩振幅、保留高步频：先验自身 2.05 m/s，而指令区间是 0.2~0.6 m/s，
+            # 不缩振幅残差就得常驻 −0.5。缩振幅后 |vx 误差| 降约 3.4 倍（见 env.py
+            # 的 EnvConfig.gait_amp_scale 注释）。
+            cfg.gait.amp_th *= cfg.gait_amp_scale
+            cfg.gait.amp_ca *= cfg.gait_amp_scale
+            cfg.gait = cfg.gait.normalize()
     return cfg
 
 

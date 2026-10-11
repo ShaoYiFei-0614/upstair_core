@@ -195,26 +195,27 @@ def policy_arch(model_path: str | Path) -> tuple[int, ...] | None:
 def env_config_for_model(model_path: str | Path) -> EnvConfig:
     """恢复能加载 ``model_path`` 的 :class:`EnvConfig`。
 
-    首选模型同目录的 ``summary.json``（精确）。没有时按 ``.zip`` 里保存的观测
-    维度反推是哪几个观测块（会打一行提示）。必须有这条退路，是因为
+    首选与模型同名的 ``<stem>_env.json``（``train.py`` 每个 checkpoint 都存，
+    与这份权重严格对应）。退路才是运行目录的 ``summary.json``：它记录的是
+    **整个课程**最后一份配置，训练中途加载早期 checkpoint 时并不精确，而且
+    ``write_summary`` 写的是 UTF-16（``json`` 读不了）。都没有时按 ``.zip``
+    里保存的观测维度反推是哪几个观测块（会打一行提示）。必须有这条退路，是因为
     ``EnvConfig()`` 的默认观测是 10 帧 × 49 维 = 490 维，而本仓 ``config.yaml``
     用 ``history_len: 1``；直接用默认配置加载本仓权重会抛
     ``ValueError: Observation spaces do not match``。
-    ``train.py`` 每个 checkpoint 都会存一份 ``<stem>_env.json``，正常路径不会走到
-    反推。
 
     反推**不可能**打开 ``obs.base_height``：那个开关在 :class:`ObsConfig` 里
     被硬性禁止（含地形真值，破坏盲走），所以旧架构那些维度要么被无歧义
     还原，要么走 :meth:`_obs_config_for_dim` 返回 ``None`` 的报错分支。
     """
     model_path = Path(model_path)
-    summary = model_path.parent / "summary.json"
-    if summary.is_file():
-        return env_config_from_summary(summary)
-
     env_kw = _config_from_env_json(model_path)
     if env_kw is not None:
         return env_kw
+
+    summary = model_path.parent / "summary.json"
+    if summary.is_file():
+        return env_config_from_summary(summary)
 
     dim = observation_dim(model_path)
     if dim is None:
