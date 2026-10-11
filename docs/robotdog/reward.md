@@ -3,7 +3,7 @@
 ## 1. 一句话定位
 
 本仓库**所有奖励数学的唯一来源**：`RewardConfig` 的 29 个权重/阈值加一个**有状态**的函数
-`compute_reward(env, action, ...)`（`robotdog/reward.py:125`），输出逐步奖励、逐项明细与终止奖励。
+`compute_reward(env, action, ...)`（`robotdog/reward.py:152`），输出逐步奖励、逐项明细与终止奖励。
 
 ## 2. 职责边界
 
@@ -27,7 +27,7 @@
 
 奖励是这套系统里唯一「写错了不会报错、只会几小时后训不出来」的部分。原先它作为
 `Go2StairsEnv._compute_reward` 埋在环境文件中间（该文件现在 1101 行），改一个权重要在
-物理推进、观测拼接、终止判定之间翻找。现在 `env.py:618-629` 只剩一个 `_compute_reward` 转发方法：
+物理推进、观测拼接、终止判定之间翻找。现在 `env.py:714-725` 只剩一个 `_compute_reward` 转发方法：
 
 ```python
 def _compute_reward(self, action, trunk_contact, foot_contact=None,
@@ -50,8 +50,8 @@ def _compute_reward(self, action, trunk_contact, foot_contact=None,
 代价是明细里看不出「原始量有多大」，但那个量在 `info` 里另有一份
 （`base_x` / `forward_vel` / `roll` / `pitch` / `base_z` …）。
 
-**实测**：`robotdog/env.py:618-629` 的 `_compute_reward` 转发方法返回的 `terms` 与
-`robotdog/reward.py:125` 的 `compute_reward()` 的 `terms` 有 **15 个共同键**；`info["reward_terms"]` 再补一个
+**实测**：`robotdog/env.py:714-725` 的 `_compute_reward` 转发方法返回的 `terms` 与
+`robotdog/reward.py:152` 的 `compute_reward()` 的 `terms` 有 **15 个共同键**；`info["reward_terms"]` 再补一个
 `"terminal"`，共 **16 键**。
 
 ### 3.3 终止奖励单列而不是塞进 `terms`（D3）
@@ -121,7 +121,7 @@ class RewardConfig:
     foot_lift: float = 0.9              # [SPEC] 摆动期离地间隙成形
     body_collision: float = -1.2        # [SPEC] 躯干接触地形
     lateral_vel: float = 6.0            # [SPEC] 横向速度指令跟踪（仅在 vy_max > 0 时计入）
-    yaw_rate: float = 4.0               # [SPEC] 偏航角速度指令跟踪（仅在 yaw_max > 0 时计入）
+    yaw_rate: float = 4.0               # [SPEC] 偏航角速度指令跟踪（恒计入，量程取 max(yaw_max, yaw_range_floor)）
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
     foot_lift_step_ratio: float = 1.4   # 取较大者：target = max(target, ratio * step_height)
     foot_lift_gate_speed: float = 0.25  # m/s，三维足端速度门限
@@ -178,8 +178,8 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 | `torque` | `torque * sum(tau²)` |
 | `foot_lift` | `foot_lift * mean(gate * lift)`；`gate = clip(foot_speed / max(foot_lift_gate_speed,1e-6), 0, 1)`，`foot_speed = ‖(feet - _prev_foot_pos)/control_dt‖`（三维），`lift = clip(clearance / lift_target, 0, 1)` |
 | `body_collision` | `body_collision * float(trunk_contact)` |
-| `probe_lift` | 仅当 `rc.probe_lift != 0 and env._blocked` 时非零：`peaks = env._peak_swing_clearance`、`floor = np.maximum(env._probe_best, env.probe_target)`、`gain = np.sum(np.clip(peaks - floor, 0, None))`、`terms["probe_lift"] = probe_lift * gain`，并在 `gain > 0` 时把**逐足地板** `env._probe_best = np.maximum(env._probe_best, peaks)`、`_probe_count += 1`（**势函数塑形**，总量有界、不可刷分）。`env._probe_best` 是**逐足 ndarray**（先前是标量：四足同一步同时抬高时，标量地板会把只抬了一只脚的足也算成进展）；`env.probe_target` 是只读属性（`robotdog/env.py:708`），直接取 `reward.probe_lift_target`（0.06 m），**不乘台阶高** |
-| `command_follow` | **求和**：`vy_max > 0` 时 `x = \|vy − command.vy\| / vy_max`、`follow += lateral_vel * max(-1.0, track_shape(x, track_tail))`；`yaw_max > 0` 时 `x = yaw_err / yaw_max`、`follow += yaw_rate * max(-1.0, track_shape(x, track_tail))`，其中 `yaw_err = \|env.yaw_rate − command.wz\|`，且 `command.wz == 0.0` 时先做 `yaw_err = 1.5 * (yaw_err + \|wz\|)`（零指令基线惩罚）；两者都不开时**恒 0.0**。`vy` 取滤波量还是瞬时量由 `obs.vel_filter` 决定 |
+| `probe_lift` | 仅当 `rc.probe_lift != 0 and env._blocked` 时非零：`peaks = env._peak_swing_clearance`、`floor = np.maximum(env._probe_best, env.probe_target)`、`gain = np.sum(np.clip(peaks - floor, 0, None))`、`terms["probe_lift"] = probe_lift * gain`，并在 `gain > 0` 时把**逐足地板** `env._probe_best = np.maximum(env._probe_best, peaks)`、`_probe_count += 1`（**势函数塑形**，总量有界、不可刷分）。`env._probe_best` 是**逐足 ndarray**（先前是标量：四足同一步同时抬高时，标量地板会把只抬了一只脚的足也算成进展）；`env.probe_target` 是只读属性（`robotdog/env.py:804`），直接取 `reward.probe_lift_target`（0.06 m），**不乘台阶高** |
+| `command_follow` | **求和**：`vy_max > 0` 时 `x = \|vy − command.vy\| / vy_max`、`follow += lateral_vel * max(-1.0, track_shape(x, track_tail))`；偏航项**恒在**（不受 `yaw_max` 门控），`x = yaw_err / max(command.yaw_max, rc.yaw_range_floor)`、`follow += yaw_rate * max(-1.0, track_shape(x, track_tail))`，其中 `yaw_err = \|env.yaw_rate − command.wz\|`，且 `command.wz == 0.0` 时先做 `yaw_err = 1.5 * (yaw_err + \|wz\|)`（零指令基线惩罚）；横向不开且偏航指令也为 0 时仍有偏航那一项。`vy` 取滤波量还是瞬时量由 `obs.vel_filter` 决定 |
 | `leg_collision` | `leg_collision * float(leg_contact)` |
 | `air_time` | `air_time * sum((clip(air - air_time_target, 0, None) - clip(air - air_time_max, 0, None)) * landed)`；`landed = foot_contact & ~_prev_foot_contact`，`air = _foot_air_time`（**本步之前**累积的腾空时间）；`air_time == 0.0` 时恒 `0.0` |
 | `base_height` | `base_height * (base_pos[2] - terrain_height_under_base - nominal_pose)²` |
@@ -190,7 +190,7 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 | `stair_progress` | `stair_progress * max(0.0, env.terrain_height_under_base - env._peak_terrain_height)`，并在 `> 0` 时把 `_peak_terrain_height` 前移（**一次性结算**，站桩拿不到第二次） |
 | `terminal` | 若 `terminated` 为真：`success`（当 `env._reached_top`）否则 `termination`；否则 0.0。**这一项由 `compute_reward` 单独返回、不在 `terms` 里** |
 
-`RewardConfig` 的 **29 个字段**里有 14 个是**参数**而不是键（其余 15 个各自对应 `terms` 里的一个键，
+`RewardConfig` 的 **31 个字段**里有 16 个是**参数**而不是键（其余 15 个各自对应 `terms` 里的一个键，
 加上 `env._compute_reward` 塞回的 `"terminal"` 就是 `info["reward_terms"]` 的 16 个键）：`forward_overspeed`、
 `overspeed_range`、`forward_range_floor`、`track_tail`、`lateral_vel`、`yaw_rate`、
 `foot_lift_target`、`foot_lift_step_ratio`、`foot_lift_gate_speed`、
@@ -199,11 +199,18 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 （前 10 个是门槛/斜率参数：它们只调整别的项的形状，本身不产生 `terms` 键；
 `termination` 是终局值，由 `compute_reward` 单独返回，也不在 `terms` 里）。
 
-> **`command_follow` 必须门控**（一次真实的自伤）：第一版没有 `if cmd.vy_max:` 判断，
-> 直接按 `lateral_vel` / `yaw_rate` 两项计分。实测 5 cm 上 125 步白拿
-> `lateral_vel = +139.73`、`yaw_rate = +28.03` —— 机器人只是在直走，横向/偏航误差恰好落在
-> σ 附近，于是它凭空得到约 +1.0/步，**等于又造了一个「原地拖延」正项**。加上门控后
+> **横向项必须门控，偏航项必须不门控**（两次真实的自伤，方向相反）。
+> 第一版两项都没有 `if cmd.vy_max:` / `if cmd.yaw_max:` 判断，直接按 `lateral_vel` /
+> `yaw_rate` 计分。实测 5 cm 上 125 步白拿 `lateral_vel = +139.73`、
+> `yaw_rate = +28.03` —— 机器人只是在直走，横向/偏航误差恰好落在 σ 附近，于是它凭空
+> 得到约 +1.0/步，**等于又造了一个「原地拖延」正项**。加上门控后
 > `command_follow` 恒为 `+0.000e+00`（逐位精确 0），不含这一项的阶段与加指令之前完全一致。
+> **但门控对偏航是错的**：`yaw_max == 0` 的级别（课程第 1 级）里没有任何一项读 `wz`，
+> 策略学会以 −0.608 rad/s **恒定自转**并把它冻住 —— 后来加上偏航指令也解不开
+> （`.tmp/zz_cmd_response.py` 扫 `wz ∈ [−0.6, +0.6]` 七档，实测斜率 −0.0021、范围
+> −0.608~−0.606，即输出与指令逐位无关）。现在偏航项**恒在**、量程取
+> `max(cmd.yaw_max, rc.yaw_range_floor)`：零指令级别同样有「不转」的价钱，
+> 且 `yaw_max == 0` 时不除零。横向仍门控 —— 它的作动权限小得多，代价不对称。
 > 另外 `yaw_rate` 读的是 `env.yaw_rate`，它是**机体系**偏航角速度 `(Rᵀ qvel[3:6])[2]`，
 > **不是** `qvel[5]`，也不是曾经用过的世界系公式；详见 `docs/robotdog/env.md` 与
 > `experience.md` §16（世界系读数被与指令量程同阶的步态振荡主导，策略只要凑对直流
@@ -224,19 +231,19 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 ## 5. 内部结构与数据流
 
 ```
-robotdog/env.py:951  step()
-    │  物理推进 decimation 次（env.py:960-966）
-    │  trunk_contact, leg_contact = _contact_flags()          env.py:749
-    │  foot_contact = _foot_contact_mask()                    env.py:631
-    │  _track_swing_peak(foot_contact)                        env.py:659
-    │  _update_probe_state(foot_contact)                      env.py:679
-    │  terminated, truncated = _terminated(...)               env.py:851
-    │  低通滤波推进 filtered_lateral_vel / filtered_yaw_rate  env.py:981-983
-    │  if _success_reached(): _reached_top = True             env.py:469
+robotdog/env.py:1053  step()
+    │  物理推进 decimation 次（env.py:1071-1078）
+    │  trunk_contact, leg_contact = _contact_flags()          env.py:844
+    │  foot_contact = _foot_contact_mask()                    env.py:727
+    │  _track_swing_peak(foot_contact)                        env.py:755
+    │  _update_probe_state(foot_contact)                      env.py:775
+    │  terminated, truncated = _terminated(...)               env.py:946
+    │  低通滤波推进 filtered_lateral_vel / filtered_yaw_rate  env.py:1093-1095
+    │  if _success_reached(): _reached_top = True             env.py:561
     ▼
-robotdog/env.py:998  _compute_reward(..., terminated=terminated)   ← 调用点在 env.py:998
+robotdog/env.py:1114  _compute_reward(..., terminated=terminated)   ← 调用点在 env.py:1114
     ▼
-robotdog/reward.py:125  compute_reward(env, action, trunk_contact,
+robotdog/reward.py:152  compute_reward(env, action, trunk_contact,
                                        foot_contact, leg_contact, terminated)
     │  读 env.cfg.reward / env.cfg.command / env.cfg.obs.vel_filter
     │     env.base_rpy / env.base_lin_vel_body / env.data.actuator_force
@@ -254,18 +261,18 @@ robotdog/reward.py:125  compute_reward(env, action, trunk_contact,
     ▼
 return (sum(terms.values()), terms, terminal)
     ▼
-robotdog/env.py:628  terms["terminal"] = terminal
+robotdog/env.py:724  terms["terminal"] = terminal
                      return base + terminal, terms
     ▼
-robotdog/env.py:998  reward, terms = ...；_advance_foot_air_time(foot_contact)   env.py:994
+robotdog/env.py:1114  reward, terms = ...；_advance_foot_air_time(foot_contact)   env.py:1118
                      info["reward_terms"] = terms
 ```
 
 **顺序上的两个关键点**（改动 `step` 时必须保持）：
 
-1. `_success_reached()`（`env.py:469`）必须在 `_compute_reward` **之前**跑，因为
+1. `_success_reached()`（`env.py:561`）必须在 `_compute_reward` **之前**跑，因为
    `_reached_top` 决定 `terminal` 取 `success` 还是 `termination`。
-2. `_advance_foot_air_time()`（`env.py:652`）必须在 `_compute_reward` **之后**跑 ——
+2. `_advance_foot_air_time()`（`env.py:748`）必须在 `_compute_reward` **之后**跑 ——
    `air_time` 项读的是「本步之前」累积的腾空时间，先累加就等于把当步白送出去。
 
 ## 6. 关键常量与默认值
@@ -278,7 +285,7 @@ robotdog/env.py:998  reward, terms = ...；_advance_foot_air_time(foot_contact) 
 | `RewardConfig.forward_range_floor` | `0.30` m/s | `vx = 0` 时归一化误差的量程下限 |
 | `RewardConfig.body_collision` | `-1.2` | 躯干接触地形（**不致命**，唯一的兜底） |
 | `RewardConfig.lateral_vel` | `6.0` | 横向指令跟踪的权重（`vy_max > 0` 才计入 `command_follow`） |
-| `RewardConfig.yaw_rate` | `4.0` | 偏航指令跟踪的权重（`yaw_max > 0` 才计入 `command_follow`） |
+| `RewardConfig.yaw_rate` | `4.0` | 偏航指令跟踪的权重（**恒计入**，量程取 `max(yaw_max, yaw_range_floor)`） |
 | `RewardConfig.foot_lift` | `0.9` | 抬脚成形项上限 |
 | `RewardConfig.foot_lift_target` | `0.08` m | 目标下限；`1.4 × 0.05 = 0.07`，取 `max` 后是 `0.08` |
 | `RewardConfig.foot_lift_step_ratio` | `1.4` | 台阶越高目标越高 |
@@ -292,7 +299,7 @@ robotdog/env.py:998  reward, terms = ...；_advance_foot_air_time(foot_contact) 
 ## 7. 与其它模块的关系
 
 * `robotdog/env.py:38` `from robotdog.reward import RewardConfig, compute_reward` ——
-  `EnvConfig.reward` 的默认工厂（`env.py:235`）与 `_compute_reward` 的转发都靠它。
+  `EnvConfig.reward` 的默认工厂（`env.py:273`）与 `_compute_reward` 的转发都靠它。
   历史上 `RewardConfig` 定义在 `env.py` 里，现在 `env.py` **重导出**它，所以
   `from robotdog.env import RewardConfig` 仍然可用。
 * `robotdog/config.py:296` `_apply(cfg.reward, _section(raw, "reward"), where="reward")`

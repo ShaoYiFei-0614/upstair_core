@@ -173,7 +173,7 @@ def run_teleop(env: Go2StairsEnv, runner, controller, *, seed: int,
 
     while not (terminated or truncated) and step < max_steps:
         cmd = controller(env, step)
-        env.set_command_now(vx=cmd.vx, vy=cmd.vy, yaw_rate=cmd.wz)
+        env.set_command_now(vx=cmd.vx, vy=cmd.vy, yaw_rate=cmd.wz, hold=True)
         # set_command_now 只刷新环境内部「已算好还没被取走」的那一帧，
         # 调用方手里的 obs 还是上一步的指令，必须重取。
         obs = env._observation()

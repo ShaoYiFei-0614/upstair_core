@@ -73,11 +73,15 @@ class RewardConfig:
     body_collision: float = -1.2        # [SPEC] 躯干接触地形
 
     # --- 横向 / 旋转指令跟踪 ----------------------------------------------- #
-    # 只在 ``EnvConfig.command`` 的范围非零时才可能非零（见 ``compute_reward`` 里的
-    # ``cmd.vy_max`` / ``cmd.yaw_max`` 门），所以「只往前走」的阶段与旧行为逐位一致。
-    # 线性死区、按指令量程归一化，所以这两个权重是「完美跟踪每步得多少分」。
+    # 权重是「完美跟踪每步得多少分」。横向项只在 ``cmd.vy_max`` 非零时才参与
+    # （见 ``compute_reward``）；偏航项**恒在**，量程取
+    # ``max(cmd.yaw_max, yaw_range_floor)``。
     lateral_vel: float = 6.0            # 对 vy 指令的线性死区跟踪
     yaw_rate: float = 4.0               # 对 wz 指令的线性死区跟踪
+    # ``yaw_max`` 为 0 时，偏航跟踪项用来归一化误差的**量程下限** [rad/s]，
+    # 与 ``forward_range_floor`` 同一个用意：偏航项不门控，零指令级别也要有
+    # 「不转」的价钱，同时避免除零。取 0.30 与 ``command_vx`` 量程下限同量级。
+    yaw_range_floor: float = 0.30
 
     # --- 摆动足抬升 -------------------------------------------------------- #
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
@@ -215,7 +219,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 它是「相对误差」：完美跟踪拿满分，原地不动降到 ``1 - |cmd|/range``，且
     # 大指令罚得最重 —— 没有「躲在 0 附近」这条路。
     #
-    # 两项被**门控**：对应量程为 0 时该项不参与。不门控的代价已经量过 ——
+    # 横向项被**门控**：``vy_max == 0`` 时不参与。不门控的代价已经量过 ——
     # 「什么都没做」每步也能白拿约 1.0 分（5 cm 上实测 125 步拿了 +139.7），
     # 等于又造一个「原地拖延」的正项。
     #
@@ -231,18 +235,21 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
         vy = (env.filtered_lateral_vel if vel_filter else env.base_lin_vel_body[1])
         xy = abs(vy - cmd.vy) / float(cmd.vy_max)
         follow += rc.lateral_vel * max(-1.0, track_shape(xy, tail))
-    if cmd.yaw_max:
-        wz = env.filtered_yaw_rate if vel_filter else env.yaw_rate
-        yaw_err = abs(wz - cmd.wz)
-        # ``wz=0`` 时再补一个零指令基线惩罚：只练横向的级别（``yaw_max=0``）
-        # 本来没有任何一项读 wz，策略能以 −0.10~−0.20 rad/s 稳定自转
-        # （实测 wz=−0.200）。补上之后，「让我不转」也有价钱。
-        # 系数取 1.5 而不是 1.0：实测三轴指令的平阶级上策略偏航漂到 −47°~−88°，
-        # 而旧的 0.5 只值 −0.7/步，挡不住「转着走」。1.5 让 1 rad/s 的自转值
-        # 满额 ``yaw_rate`` 的九成。
-        if cmd.wz == 0.0:
-            yaw_err = 1.5 * (yaw_err + abs(wz))
-        follow += rc.yaw_rate * max(-1.0, track_shape(yaw_err / float(cmd.yaw_max), tail))
+    # 偏航项**恒在**（不受 ``yaw_max`` 门控），量程取 ``max(yaw_max, yaw_range_floor)``。
+    # 门控的代价实测过：``yaw_max == 0`` 的级别里没有任何一项读 wz，策略学会
+    # 以 −0.608 rad/s **恒定自转**（`.tmp/zz_cmd_response.py` 扫 wz ∈ [−0.6, +0.6]
+    # 七档，实测斜率 −0.0021、范围 −0.608~−0.606，即输出与指令逐位无关），
+    # 而且这个转法在后续级别里冻住 —— 加进偏航指令后它仍在转。底噪 ``floor``
+    # 保证「不转」在零指令级别也有价钱，同时避免 ``yaw_max == 0`` 时除零；
+    # 加惩罚必须**有界**（下界 −1，即最差 −``yaw_rate``），理由同前进项。
+    wz = env.filtered_yaw_rate if vel_filter else env.yaw_rate
+    yaw_err = abs(wz - cmd.wz)
+    # ``wz=0`` 时再补一个零指令基线惩罚（系数 1.5 的理由同前进项：实测三轴指令
+    # 的平阶级上策略偏航漂到 −47°~−88°，旧系数 0.5 只值 −0.7/步，挡不住）。
+    if cmd.wz == 0.0:
+        yaw_err = 1.5 * (yaw_err + abs(wz))
+    yaw_range = max(float(cmd.yaw_max), float(rc.yaw_range_floor))
+    follow += rc.yaw_rate * max(-1.0, track_shape(yaw_err / yaw_range, tail))
     terms["command_follow"] = follow
 
     # 2) 姿态稳定奖励 -- 惩罚 roll 与 pitch -----------------------------

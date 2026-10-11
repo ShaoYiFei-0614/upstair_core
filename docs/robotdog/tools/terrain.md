@@ -373,7 +373,7 @@ pyramid : 平地 → n_up 级上升立面 → 平的 crest → n_down 级下降�
 | 位置 | 使用的符号 | 依赖方向为什么是这样 |
 | --- | --- | --- |
 | `robotdog/go2_model.py:229` | `TERRAIN_GEOM_GROUP` | 生成地面 plane 时也要打同一个 group（`default_floor_geom`） |
-| `robotdog/env.py:329` | `StairSpec, build_terrain_xml` | 环境层持有 spec 并驱动编译（`_build_model()` 调 `build_terrain_xml(self.stair)`） |
+| `robotdog/env.py:387` | `StairSpec, build_terrain_xml` | 环境层持有 spec 并驱动编译（`_build_model()` 调 `build_terrain_xml(self.stair)`） |
 | `robotdog/env.py` | `height_at` | 地形高、`foot_clearance`、支撑面参照（见 §5） |
 | `robotdog/env.py` | `crest_height` | 出生点与**成功判据**（`terrain_height_under_base >= crest_height - 1e-9`） |
 | `robotdog/config.py:326` | `demo_stairs_spec, flat_spec` | `config_to_stages()` 按 `config.yaml` 造阶段表 —— **当前唯一的课程构造路径**（见 `docs/robotdog/config.md`） |

@@ -199,7 +199,7 @@ cmd /c "git show HEAD:robotdog/env.py > .tmp/env_before.py"
 顺手跑一次幂等的 `.tmp/sync_env_md_lines.py`，它按符号名把 `docs/robotdog/env.md` 里
 成员的定义行号刷成真值。
 
-两支门都**能解析裸文件名**（`` env.py:592 `` 会按「仓根 → `robotdog/` → `scripts/` →
+两支门都**能解析裸文件名**（`` env.py:784 `` 会按「仓根 → `robotdog/` → `scripts/` →
 `docs/` → 全仓唯一同名」找到 `robotdog/env.py`）。这一点是 2026-02 才补上的：在此之前
 它们只试 `ROOT/raw`，于是文档里几十条裸名引用**从未被检查过**。
 
@@ -318,9 +318,12 @@ RESULT: ALL CHECKS PASSED
   `terminate_min_height` 现在是 `0.15`（躯干碰撞体最低点在 0.118 m）。
 * **`body_collision` 从 `-4.0` 降到 `-1.2`**：原值让「贴着立面蹭」比站桩还亏，GIF 复盘里
   6/12/15 cm 的策略学会试两下就放弃。
-* **奖励里的指令跟踪项必须门控**（`if cmd.vy_max:` / `if cmd.yaw_max:`）。不加门控时
-  机器人直走就能白拿约 +1.0/步（实测 5 cm 上 125 步拿到 `lateral_vel=+139.73`），
-  **等于又造一个「原地拖延」正项**。`env.yaw_rate` 也不是 `qvel[5]`，见 `experience.md` §13。
+* **指令跟踪项的「门控」要分轴判断，不能一刀切。** 两项都不门控时，机器人直走就能白拿
+  约 +1.0/步（实测 5 cm 上 125 步拿到 `lateral_vel=+139.73`），**等于又造一个「原地拖延」
+  正项**；所以**横向项**保留 `if cmd.vy_max:`。但**偏航项必须不门控**：`yaw_max == 0` 的级别
+  里没有任何一项读 `wz`，策略会以 −0.608 rad/s 恒定自转并冻住，之后再给偏航指令也解不开
+  （扫 `wz ∈ [−0.6, +0.6]` 七档，斜率 −0.0021）。现在偏航项恒在，量程取
+  `max(cmd.yaw_max, reward.yaw_range_floor)`。`env.yaw_rate` 也不是 `qvel[5]`，见 `experience.md` §13。
 * **`probe_lift` 的起算线只跟策略当前能力比，不跟台阶高走。** 实测在 15 cm 立面之前
   被阻挡时，默认步态摆动峰值只到 0.09~0.12 m，而 `action_scale=0.30` 下搜遍固定动作
   最好也只到 0.148 m —— 原来的「`1.6 × 台阶高` = 0.24 m」门槛**不可达、梯度恒为零**。

@@ -158,7 +158,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 #### `kp` / `kd` 是怎么定的
 
 `kp` / `kd` 是**关节 PD** 的增益（`tau = kp*(target-q) - kd*qd`），每条腿三个（hip / thigh / calf）
-再 `tile(..., 4)` 成 12 维（`robotdog/env.py:274-275` 的 `self._kp` / `self._kd`；
+再 `tile(..., 4)` 成 12 维（`robotdog/env.py:293` 的 `self._kp` 与 `robotdog/env.py:294` 的 `self._kd`；
 增益本身的定义在 `robotdog/env.py:194-195` 的 `kp` / `kd` 元组）。它们不是拍脑袋的，而是按**实测关节惯量**
 配到目标带宽与阻尼比上的。用 `mujoco.mj_fullM(model, data, M)`（mujoco 3.12 的签名是
 `mj_fullM(model, data, dst)`）在 `home_qpos` 姿态下取关节空间惯量的对角元 `J`：
@@ -238,7 +238,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 两个关键点：
 
 * **所有奖励数学都在 `robotdog/reward.py`**（`compute_reward(env, ...)`；它会写环境的
-  三个记忆字段，见该模块 docstring），`robotdog/env.py:618-629` 的 `_compute_reward()`
+  三个记忆字段，见该模块 docstring），`robotdog/env.py:714-725` 的 `_compute_reward()`
   只留一个转发方法。为了便于研究与改动，单看那一个文件就够。
 * 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
   （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
@@ -257,22 +257,28 @@ follow = 0
 if vy_max > 0:
     x = abs(vy_actual - vy_cmd) / vy_max
     follow += 6.0 * (max(0.0, 1.0 - x) - 1.5 * max(0.0, x - 1.0))
-if yaw_max > 0:
-    yaw_err = abs(wz_actual - wz_cmd)
-    if wz_cmd == 0.0:
-        yaw_err = 1.5 * (yaw_err + abs(wz_actual))   # 零指令基线惩罚
-    x = yaw_err / yaw_max
-    follow += 4.0 * (max(0.0, 1.0 - x) - 1.5 * max(0.0, x - 1.0))
+yaw_err = abs(wz_actual - wz_cmd)                 # 偏航项恒在，不门控
+if wz_cmd == 0.0:
+    yaw_err = 1.5 * (yaw_err + abs(wz_actual))    # 零指令基线惩罚
+x = yaw_err / max(yaw_max, 0.30)                  # 量程下限 = reward.yaw_range_floor
+follow += 4.0 * (max(0.0, 1.0 - x) - 1.5 * max(0.0, x - 1.0))
 ```
 
-**门控 `if vy_max > 0` 是必须的，不是优化**：不加门控时，机器人直走时
-`vy_actual ≈ 0`、`wz_cmd = 0`，两项误差都只有指令量程的零头，等于**每步白拿接近满分**
+**横向项门控 `if vy_max > 0` 是必须的，不是优化**：不加门控时，机器人直走时
+`vy_actual ≈ 0`，误差只有指令量程的零头，等于**每步白拿接近满分**
 —— 实测 5 cm 上 125 步拿到 `lateral_vel=+139.73`，又是一条「原地拖延」正项。
 加门控后该阶段恒为 `+0.000e+00`（逐位精确零）。权重在 `robotdog/reward.py`：
 `lateral_vel = 6.0`、`yaw_rate = 4.0`；`lateral_vel_sigma` / `yaw_rate_sigma`（各 0.25）
 是改线性死区之前的高斯宽度；这两个字段与 `forward_vel_sigma` 一起**已经全部删除**（`RewardConfig` 里不再有它们）。
 另外 `wz_cmd == 0` 时会给 `yaw_err` 补一个基线惩罚（`yaw_err = 1.5*(yaw_err + |wz|)`）—— 否则「命令我不许转」
 没有任何价钱；系数从 0.5 提到 1.5，是因为实测三轴平阶级上策略偏航漂到 −47°~−88°，而 0.5 只值 −0.7/步。
+
+⚠ **偏航项反过来必须不门控**。`yaw_max == 0` 的级别里没有任何一项读 `wz`，策略学会以
+−0.608 rad/s **恒定自转**：扫 `wz ∈ [−0.6, +0.6]` 七档，实测 vx 恒 +0.365、wz 恒 −0.608，
+斜率 −0.0021 —— 输出与偏航指令逐位无关，而且这个转法在后续级别里冻住。现在偏航项恒在，
+量程取 `max(yaw_max, reward.yaw_range_floor)`（默认 0.30 rad/s，与 `forward_range_floor` 同一个用意：
+零指令级别也要有「不转」的价钱，同时避免除零）。横向仍门控 —— 它的作动权限小得多
+（缩幅值先验下 `hip` 模式 ±0.19 rad/s，横向只有 ±0.10 m/s），代价不对称。
 
 **线性死区外侧的线性尾项**（`reward.track_tail`）是三项跟踪惩罚共用的形状：
 `x = |err| / range`、`shape = max(0, 1-x) - track_tail * max(0, x-1)`。死区形状在
@@ -326,20 +332,24 @@ if yaw_max > 0:
 | `set_command_now(vx=None, vy=None, yaw_rate=None)` | 控制器每个控制步调 | 改**当前值**，立即生效 |
 
 **观测维数在整个课程里必须恒定**（PPO 的网络与 `RolloutBuffer` 都不可变），
-所以 `ObsConfig.command` 恒为 `True`，课程只能改指令**范围**的宽窄、不能开关那 2 维。
-课程表在 `config.yaml` 的 `curriculum` 段（**前三级全是平地**：先只会直走，再小范围
-指令，最后全量程指令；三级都成功之后才上台阶）：
+所以 `ObsConfig.command` 恒为 `True`，课程只能改指令**范围**的宽窄、不能开关那 3 维。
+课程表在 `config.yaml` 的 `curriculum` 段（**前四级全是平地**：第 1 级只练偏航、
+第 2 级只练横向、第 3 级合并、第 4 级加大并恢复超速惩罚；四级都稳了之后才上台阶）：
 
 ```yaml
-heights_cm:            [0.0, 0.0, 0.0, 3.0, 6.0, 9.0]
-command_vx:            [0.45, 0.45, 0.45, 0.0, 0.0, 0.0]
-command_vy_max:        [0.0, 0.15, 0.35, 0.30, 0.35, 0.40]
-command_yaw_max:       [0.0, 0.15, 0.50, 0.35, 0.55, 0.70]
-flat_success_distance: [2.0, 2.0, 2.5, 0.0, 0.0, 0.0]
+heights_cm:      [0.0, 0.0, 0.0, 0.0, 3.0,  6.0,  9.0,  12.0, 15.0]
+command_vx:      [0.2, 0.6]            # 每级都在 [0.2, 0.6] 内采样
+command_vy_max:  [0.0, 0.30, 0.30, 0.30, 0.30, 0.35, 0.40, 0.45, 0.50]
+command_yaw_max: [0.30, 0.25, 0.45, 0.55, 0.45, 0.55, 0.70, 0.80, 0.90]
+curriculum.reward_overrides:
+  forward_overspeed: [0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0]
+  yaw_rate:          [8.0, 6.0, 6.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
 ```
 
-`command_vx` 是**该级定值前进指令**（0 = 沿用 `env.command.vx = 0.55`）；
-`flat_success_distance` 只对平地段生效（指令一放宽就会绕路，长判据会把成功拖成超时）。
+第 1 级**偏航专练**（`command_vy_max = 0`、`yaw_max = 0.30`、超速惩罚关掉、
+`yaw_rate` 权重提到 8.0）：偏航的作动权限在 hip 上（缩幅值先验实测 `hip` 模式
+`u = ±0.6` 给 ∓0.16~0.19 rad/s），要它学出来必须先让「转向」在账面上压过「跑得快」；
+第 2 级才把横向放开，避免两条新轴同时竞争梯度。
 同高度重复出现时阶段名自动变成 `flat` / `flat_2` / `flat_3`，checkpoint 不会互相覆盖。
 
 `scripts/teleop.py` 是控制器演示：自动控制器**可以**读地形与机身位置
@@ -509,13 +519,13 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 
 | 文件 | 行数 | 说明 |
 | --- | --- | --- |
-| `robotdog/env.py` | **1109** | 环境 + 观测 + 指令 + 终止 + 渲染（奖励数学已移出） |
+| `robotdog/env.py` | **1227** | 环境 + 观测 + 指令 + 终止 + 渲染（奖励数学已移出） |
 | `robotdog/go2_model.py` | 467 | MJCF 组装 / 场景编译 / 元信息 |
 | `robotdog/config.py` | **534** | 读 `config.yaml`（含指令课程 / 奖励课程 / 播放阶段） |
 | `robotdog/policy.py` | 339 | 训练产物读取（配置 / 维度 / 结构 / 归一化） |
 | `robotdog/curriculum.py` | **339** | 课程数据类 + 汇总写出 |
 | `robotdog/training.py` | 323 | 向量环境 / PPO / 运行目录 / 权重加载 |
-| `robotdog/reward.py` | **357** | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
+| `robotdog/reward.py` | **379** | **全部奖励数学**（`RewardConfig` + `compute_reward`） |
 | `robotdog/tools/terrain.py` | 287 | 楼梯几何 |
 | `robotdog/gait.py` | 191 | 开环 trot 先验 |
 | `robotdog/tools/paths.py` | **38** | 路径常量（**没有任何函数**） |
@@ -549,28 +559,28 @@ SB3 `BaseCallback` 钩子）、文档化的公开 API（`GaitParams.static()` / 
 > 变成零调用点。但「换地形」本身是真需求（当前课程每级是 `make_vec_env` 新建环境，
 > 不是换地形），所以保留。
 
-### 6.3 `env.py` 为什么还有 1109 行
+### 6.3 `env.py` 为什么还有 1227 行
 
-它不是「奖励算在里面」——奖励数学在 `robotdog/reward.py`（357 行）。`env.py` 的构成是：
+它不是「奖励算在里面」——奖励数学在 `robotdog/reward.py`（379 行）。`env.py` 的构成是：
 
 | 类别 | 行数 | 占比 |
 | --- | --- | --- |
-| 代码 | 556 | 50.1% |
-| docstring | 254 | 22.9% |
-| 注释 | 144 | 13.0% |
-| 空行 | 155 | 14.0% |
+| 代码 | 677 | 55.2% |
+| docstring | 234 | 19.1% |
+| 注释 | 153 | 12.5% |
+| 空行 | 163 | 13.3% |
 
 （分类口径：**注释 > 字符串 > 代码**，空行单列一类，四类相加恰好等于总行数。）
 
-其中 `class Go2StairsEnv`（`robotdog/env.py:247-1109`）一个类占 **863 行**（代码 465，docstring 210），最大的成员是
-`step()`（88 行）、`__init__()`（87 行）、`render()`（59 行）、`reset()`（55 行）、
-`_contact_flags()`（37 行）与 `_obs_frame()`（37 行）。类里共 44 个成员、合计 783 行。
+其中 `class Go2StairsEnv`（`robotdog/env.py:266-1227`）一个类占 **962 行**（代码 562，docstring 238），最大的成员是
+`step()`（103 行）、`__init__()`（97 行）、`reset()`（62 行）、`render()`（59 行）、
+`_obs_frame()`（37 行）与 `_contact_flags()`（37 行）。类里共 46 个成员、合计 880 行。
 
 长的原因有三条，都是**有意的**：
 
 1. **一个 Gymnasium 环境的接口面天生就宽**。`step` / `reset` / `render` / `close` +
    观测 / 终止 / 成功 / 接触 / 高度参照 / 落脚空气时间 / 模型与场景构建 / 楼梯测距，
-   加起来 **44 个方法 + 3 条类级语句**（其中 14 个方法是 `@property` 只读量）。这不是
+   加起来 **46 个方法 + 3 条类级语句**（其中 14 个方法是 `@property` 只读量）。这不是
    「一个类干了很多事」，而是「Gym 环境本来就要求这么多钩子」。
 2. **`render()` 的 59 行是相机与 HUD**，与物理仿真没有关系。它可以搬到 `scripts/play.py`
    或独立的渲染模块，但那样它就得通过 30 多个 `env.<私有属性>` 读状态——**耦合面反而更大**，

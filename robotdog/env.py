@@ -218,17 +218,36 @@ class EnvConfig:
     # 平地阶段的成功判据是**指令跟随**：实测速度与指令之差超过容差就算一次脱靶，
     # 整回合脱靶步占比超过 ``flat_track_miss_ratio`` 就不算成功。
     #
-    # 容差是**实测标定**出来的，不是拍的：在 ``runs/cmdtrack6`` 的平地上确定性
-    # 回放 3 个回合 × 1000 步，横向误差稳定在均 0.049/0.145/0.27 m/s（指令越大
-    # 误差越大），偏航误差均 0.22/0.27/0.35 rad/s —— 所以 0.25 / 0.50 这一档
-    # 是「当时那个策略够得着」的水平。太紧（如 0.15 / 0.30）会把当时的策略判成
-    # 100% 脱靶，PPO 就丢掉了唯一的正信号；太松则「站桩」也算成功。
-    flat_track_tol_vy: float = 0.25         # m/s
-    flat_track_tol_wz: float = 0.50         # rad/s
+    # 容差是**实测标定**出来的，不是拍的：``runs/cmdtrack6`` 的平地上确定性回放
+    # 3 回合 × 1000 步，横向误差稳定在均 0.049/0.145/0.27 m/s（指令越大误差越大），
+    # 偏航误差均 0.22/0.27/0.35 rad/s。而 ``runs/course8`` 的 ``flat_final`` 在
+    # 完整课程配置下实测 ``|vx 误差| 0.16``、``|vy 误差| 0.076``、``|wz 误差| 0.55``
+    # —— 所以这里取「比一个真的在跟的策略再宽 1.4~1.6 倍」：判据必须让会跟的策略
+    # 拿得到正信号，否则 PPO 就丢掉了唯一的正信号（太紧，如 0.15/0.30，会把当时
+    # 的策略判成 100% 脱靶）；太松则「输出常数」也算成功。
+    flat_track_tol_vy: float = 0.30         # m/s
+    flat_track_tol_wz: float = 0.70         # rad/s
     # 前向的容差是常数：前向指令由课程在 [0.2, 0.6] 里采样，不随回合重抽量程。
     # 0.35 比横移松，是因为步态先验带来的周期速度波动主要落在前后方向。
     flat_track_tol_vx: float = 0.35         # m/s
-    flat_track_miss_ratio: float = 0.20
+    # 脱靶步占比的上限。指令每 ``command_hold_steps`` 步阶跃一次，阶跃后的
+    # 过渡段（滤波时间常数 0.2 s ≈ 10 步）天然要算几次脱靶，所以留 30%。
+    flat_track_miss_ratio: float = 0.30
+    # 光有容差不够：**输出常数就能让平均绝对误差最小**（常数输出等于指令分布的
+    # 均值），所以还要求实测量与指令的相关系数至少到这个值（只对指令本身在变的
+    # 轴判定，见 ``_tracking_quality``）。这个量对常数输出恒为 0 —— 实测
+    # ``runs/course9`` 的 flat 策略三轴扫描斜率全在 0.012 以内，重抽之后脱靶率
+    # 立刻从 0.005 涨到 0.973。
+    # 0.30 而不是 0.50：滞后、过渡段与整回合平均都会压低相关系数，阈值的作用是
+    # **排除零响应**，不是给容差加码 —— 容差已经由 ``flat_track_miss_ratio`` 把关。
+    flat_track_min_corr: float = 0.30
+    # 回合内每隔这么多**控制步**重抽一次指令（0 或负数 = 整回合定值）。
+    # 定值指令下「输出常数」是跟踪问题的最优解，成功判据里的相关系数项也会
+    # 因为 cmd_std = 0 变成空操作；重抽之后跟随才是一个真问题。
+    # 100 步 = 2 s：比步态周期（约 0.18 s）长两个数量级，足够让滤波量跟上，
+    # 又比 1000 步的回合短一个数量级，一回合里能出现约 10 次阶跃。
+    # 回放 / 遥操作 / GIF 用 ``set_command_now(..., hold=True)`` 把它关掉。
+    command_hold_steps: int = 100
 
     # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
@@ -301,6 +320,16 @@ class Go2StairsEnv(gym.Env):
         self.filtered_yaw_rate = 0.0
         # 平地指令跟随判据的脱靶步计数，每回合清零（见 ``_success_reached``）。
         self._tracking_miss_count = 0
+        # 指令跟随的**跟踪统计量**（每回合清零）。只累加指令本身在变化的轴上的
+        # 一阶/二阶矩，用来算「实测量是否真的跟着指令变」（见 ``_tracking_quality``）：
+        # 平均误差判据一个人撑不住，因为**输出常数就能把平均误差压到最小**。
+        self._track_n = 0
+        self._track_cmd_sum = np.zeros(3)
+        self._track_cmd_sq = np.zeros(3)
+        self._track_cross = np.zeros(3)
+        self._cmd_age = 0
+        self._track_act_sum = np.zeros(3)
+        self._track_act_sq = np.zeros(3)
 
         self.nominal_pose = float(self.meta.home_qpos[2])  # 0.27 m 站立高度
         # 当前指令 ``[vx, vy, wz]``。**与 ``cfg.command._now`` 是同一个列表**，
@@ -416,7 +445,8 @@ class Go2StairsEnv(gym.Env):
 
     def set_command_now(self, vy: float | None = None,
                         yaw_rate: float | None = None,
-                        vx: float | None = None) -> list[float]:
+                        vx: float | None = None,
+                        *, hold: bool = False) -> list[float]:
         """**立即**写入一条指令，不重新采样（外部控制器的高频入口）。
 
         与 :meth:`set_commands` 的分工：那个改的是「采样范围」，由课程在阶段
@@ -426,7 +456,15 @@ class Go2StairsEnv(gym.Env):
         传了 ``vx`` 时会**同时改写基线** ``cfg.command.vx``，即
         ``vx_max == 0`` 阶段的重置回退值；``vx_max > 0`` 的阶段每回合会重抽
         覆盖它。``vy`` / ``wz`` 只改当前值，它们每回合本来就该重抽。
+
+        ``hold=True`` 表示「这条指令要一直生效，别被回合内的周期重抽覆盖」
+        —— 回放、遥操作与 GIF 都用它；默认 ``False`` 则只写到下一次重抽为止。
         """
+        if hold:
+            # 把年龄顶到不可能到达的值：``step()`` 里的重抽判据就永远不成立。
+            self._cmd_age = 10 ** 9
+        else:
+            self._cmd_age = 0
         self.cfg.command._set_now(vx=vx, vy=vy, wz=yaw_rate)
         if vx is not None:
             self.cfg.command.vx = float(vx)
@@ -466,6 +504,60 @@ class Go2StairsEnv(gym.Env):
                     or err_wz > self.cfg.flat_track_tol_wz
                     or err_vx > self.cfg.flat_track_tol_vx)
 
+    def _record_tracking_stats(self) -> None:
+        """累加三轴「指令 vs 实测」的一阶/二阶矩。
+
+        只在 ``_step_count > 0`` 时调用：第 0 步的 ``base_lin_vel_body`` 还是
+        ``reset`` 之后的零向量，而那时指令已经抽好了 —— 把这一对存进去会让
+        相关系数天然偏低。
+        """
+        act = np.array([float(self.base_lin_vel_body[0]),
+                        float(self.filtered_lateral_vel),
+                        float(self.filtered_yaw_rate)])
+        cmd = np.asarray(self._command, dtype=np.float64)
+        self._track_n += 1
+        self._track_cmd_sum += cmd
+        self._track_cmd_sq += cmd * cmd
+        self._track_act_sum += act
+        self._track_act_sq += act * act
+        self._track_cross += cmd * act
+
+    def _tracking_quality(self) -> tuple[int, float]:
+        """返回 ``(参与判定的轴数, 最差的那个相关系数)``。
+
+        **为什么需要它**：平地成功判据原先只有「平均绝对误差 <= 容差」，
+        而这个量**在输出常数时取到最小**（常数输出等于指令分布的均值），所以
+        策略只要把动作钉死就能拿满成功 —— 实测 ``runs/course9`` 第 1 级的
+        ``flat_final.zip`` 三轴扫描斜率全在 0.012 以内，而它 76% 的回合被
+        判成功。判「跟不跟」必须用**协方差算出的相关系数**：它只认「指令变、
+        实测跟着变」，对常数输出恒为 0。
+
+        取**最差**轴（而不是最好）是刻意的：指令是三轴的，只跟对了其中一轴
+        不能算「按指令走」。只对**指令本身在变化**的轴判定（``std > 0.05``）：
+        ``vx`` 在某些级别是定值基线，那根轴上没有「跟随」可言。
+
+        一根可判的轴都没有时返回 ``0.0``（而不是 −1.0）—— 「没有证据」不能
+        当成「通过」。
+        """
+        n = max(1, self._track_n)
+        cmd_mean = self._track_cmd_sum / n
+        act_mean = self._track_act_sum / n
+        cmd_var = np.maximum(self._track_cmd_sq / n - cmd_mean * cmd_mean, 0.0)
+        act_var = np.maximum(self._track_act_sq / n - act_mean * act_mean, 0.0)
+        cov = self._track_cross / n - cmd_mean * act_mean
+        axes = 0
+        worst = 1.0
+        for i in range(3):
+            if float(np.sqrt(cmd_var[i])) <= 0.05:
+                continue
+            axes += 1
+            denom = float(np.sqrt(cmd_var[i] * act_var[i]))
+            corr = float(cov[i] / denom) if denom > 1e-9 else 0.0
+            worst = min(worst, corr)
+        if axes == 0:
+            return 0, 0.0
+        return axes, worst
+
     def _success_reached(self) -> bool:
         if self.stair.n_up > 0:
             return bool(
@@ -477,7 +569,11 @@ class Go2StairsEnv(gym.Env):
         if self._step_count < self._max_steps - 1:
             return False
         miss = self._tracking_miss_count / max(1, self._step_count)
-        return bool(miss <= self.cfg.flat_track_miss_ratio)
+        if miss > self.cfg.flat_track_miss_ratio:
+            return False
+        # 第二个条件：实测量必须真的**跟着指令变**，不能靠输出常数满足容差。
+        axes, corr = self._tracking_quality()
+        return bool(axes == 0 or corr >= self.cfg.flat_track_min_corr)
 
     # ------------------------------------------------------------------- 属性
 
@@ -892,6 +988,13 @@ class Go2StairsEnv(gym.Env):
         self._command[:] = self._sample_command()
         self._step_count = 0
         self._tracking_miss_count = 0
+        self._track_n = 0
+        self._cmd_age = 0
+        self._track_cmd_sum[:] = 0.0
+        self._track_cmd_sq[:] = 0.0
+        self._track_cross[:] = 0.0
+        self._track_act_sum[:] = 0.0
+        self._track_act_sq[:] = 0.0
         self._reached_top = False
         self._leg_contact_streak = 0
         self._blocked = False
@@ -950,6 +1053,15 @@ class Go2StairsEnv(gym.Env):
     def step(self, action: np.ndarray):
         action = np.asarray(action, dtype=np.float64).clip(-1.0, 1.0)
 
+        # 回合内周期性重抽指令。**这一步不是可选的**：如果整回合只有一条定值
+        # 指令，那么「输出常数」就是跟踪问题的最优解 —— 实测 course9 第 1 级的
+        # flat 策略三轴扫描斜率全在 0.012 以内却拿到 76% 成功率，成功判据里的
+        # 相关系数项在 cmd_std = 0 时恒为空操作。重抽之后「跟得上变化」才有意义。
+        self._cmd_age += 1
+        if self._cmd_age >= self.cfg.command_hold_steps:
+            self._cmd_age = 0
+            self._command[:] = self._sample_command()
+
         # 残差 RL：先验提供一个能用的周期步态，策略提供修正量。观测里报告的
         # 相位就是本步实际使用的那一个，所以转移保持马尔可夫性。
         self._gait_phase = self._gait_t
@@ -983,6 +1095,11 @@ class Go2StairsEnv(gym.Env):
         self.filtered_yaw_rate += alpha * (float(self.yaw_rate) - self.filtered_yaw_rate)
 
         # 脱靶步计数：每步都记（楼梯段不用它判成功，但信息里要报同一个口径）。
+        # 这一步的实测速度要到**下一步**的观测才被策略看到，所以统计量在记账时
+        # 天然晚一拍；``_tracking_quality`` 因此用的是整回合的相关系数，而不是
+        # 逐步配对，晚一拍不影响它。
+        if self._step_count > 0:
+            self._record_tracking_stats()
         if self._tracking_miss():
             self._tracking_miss_count += 1
 
@@ -1032,6 +1149,7 @@ class Go2StairsEnv(gym.Env):
             "tracking_miss_ratio": float(
                 self._tracking_miss_count / max(1, self._step_count)
             ),
+            "tracking_corr": float(self._tracking_quality()[1]),
             "gait_prior": bool(self.cfg.gait_prior),
         }
         return self._observation(), float(reward), terminated, truncated, info

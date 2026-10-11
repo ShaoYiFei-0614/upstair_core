@@ -110,7 +110,7 @@ def run_demo(env, runner, phases, *, seed: int, hold_steps: int, capture: bool,
     step = 0
     for label, vx, vy, wz in phases:
         # 指令在段内恒定、段间跳变 —— 这正是「指哪走哪」要考的东西。
-        env.set_command_now(vy=vy, yaw_rate=wz, vx=vx)
+        env.set_command_now(vy=vy, yaw_rate=wz, vx=vx, hold=True)
         # set_command_now 只刷新环境内部的那一帧，手里的 obs 还带旧指令，必须重取。
         obs = env._observation()
         acc_vy: list[float] = []
@@ -129,7 +129,7 @@ def run_demo(env, runner, phases, *, seed: int, hold_steps: int, capture: bool,
             if terminated or truncated:
                 # 摔倒了就重开一回合，但**继续**按原计划换指令，便于看趋势。
                 obs, _info = env.reset(seed=seed + step)
-                env.set_command_now(vy=vy, yaw_rate=wz, vx=vx)
+                env.set_command_now(vy=vy, yaw_rate=wz, vx=vx, hold=True)
                 obs = env._observation()
         stats.append(PhaseStat(
             label=label, steps=hold_steps, cmd_vy=vy, cmd_wz=wz,

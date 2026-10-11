@@ -499,8 +499,8 @@ mini-batches, there will be a truncated mini-batch of size 256
 | 类型 | 例子 | 为什么不能删 |
 | --- | --- | --- |
 | **字符串派发** | *（本仓目前没有实例）* | `venv.env_method("某个方法", ...)` 把名字藏在字符串里，AST 看不见。这是最容易误删的一类，改 `DummyVecEnv` 相关代码时留意 |
-| **框架回调** | `ProgressCallback._on_step`（`scripts/train.py:96`）、`CheckpointCallback._on_step`（`scripts/train.py:96`） | SB3 的 `BaseCallback` 按固定名字回调，从不被本仓代码显式调用 |
-| **文档化的公开 API** | `GaitParams.static`（`robotdog/gait.py:170`）、`GaitParams.targets`（`robotdog/gait.py:90`）、`policy.Policy`（`robotdog/policy.py:21`）、`StairSpec.down_end_x`（`robotdog/tools/terrain.py:108`）、`Go2StairsEnv.yaw`（`robotdog/env.py:533-534`）、`Go2StairsEnv.set_stair`（`robotdog/env.py:360-366`） | 设计文档把它们的签名与理由逐条写下来了，是给人用的接口面。删掉等于同时删两处文档，而它们各只有 1–5 行 |
+| **框架回调** | `ProgressCallback._on_step`（`scripts/train.py:96`）、`CheckpointCallback._on_step`（`scripts/train.py:119`） | SB3 的 `BaseCallback` 按固定名字回调，从不被本仓代码显式调用 |
+| **文档化的公开 API** | `GaitParams.static`（`robotdog/gait.py:170`）、`GaitParams.targets`（`robotdog/gait.py:90`）、`policy.Policy`（`robotdog/policy.py:21`）、`StairSpec.down_end_x`（`robotdog/tools/terrain.py:108`）、`Go2StairsEnv.yaw`（`robotdog/env.py:629-630`）、`Go2StairsEnv.set_stair`（`robotdog/env.py:389-395`） | 设计文档把它们的签名与理由逐条写下来了，是给人用的接口面。删掉等于同时删两处文档，而它们各只有 1–5 行 |
 
 **留下的判据**：`GaitParams.static()` 是文档里「怎么关掉先验」的**唯一正确写法**（`docs/robotdog/gait.md:434` 的示例直接 `off = GaitParams.static()`），所以哪怕零调用者也要留——删了文档就在教一个不存在的函数。
 
@@ -830,6 +830,16 @@ terms["command_follow"] = follow
 > `lateral_vel_sigma` / `yaw_rate_sigma` 也随之从 `RewardConfig` **删除**——`robotdog/reward.py`
 > 里现在只有 `lateral_vel = 6.0` / `yaw_rate = 4.0` 两个权重。当前形式见 `README.md` §3.3。
 > 上面的代码块是**当时**的样子，不要再照它写。
+
+> **更后续（门控只对了横向，偏航是反的）**：门控把偏航项在 `yaw_max == 0` 的级别里整个关掉了，
+> 而这个级别**没有任何别的项读 `wz`** —— 策略因此学会以 −0.608 rad/s **恒定自转**并把它冻住。
+> 缩幅值先验的训练里，第 1 级（`yaw_max = 0`）跑完的检查点在 `wz ∈ [−0.6, +0.6]` 七档上实测
+> `vx` 恒 +0.365、`wz` 恒 −0.608，**斜率 −0.0021**，也就是输出与偏航指令逐位无关；加上偏航指令
+> 的后一级也解不开（偏航误差均值 0.555 rad/s vs 容差 0.50，动作权限实测是够的：`hip` 模式
+> `u = ±0.6` 给 ∓0.16~0.19 rad/s）。现在的修法是**偏航项恒在**、量程取
+> `max(cmd.yaw_max, reward.yaw_range_floor)`，横向仍门控。教训：**「门控」要按轴判断**，
+> 一个「正确的门控」可能刚好把另一条轴的唯一梯度来源关掉；判据是「这个量在范围为零时还有没有
+> 别的项读它」，不是「范围为零就该关掉」。见 `README.md` §3.3 与 `agent.md` §8.5。
 
 ### 13.4 第二个坑：`yaw_rate` 不是 `qvel[5]`
 

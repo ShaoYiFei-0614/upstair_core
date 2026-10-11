@@ -82,7 +82,7 @@ DummyVecEnv → VecMonitor → VecNormalize
 
 * `set_terrain(venv, stair)`（`env_method("set_stair")` + `reset()` 两行）已随死代码
   清理删除（见 §9）。
-* `Go2StairsEnv.set_stair()` 本身还在（`robotdog/env.py:360-366`），但**零调用点**——
+* `Go2StairsEnv.set_stair()` 本身还在（`robotdog/env.py:418`），但**零调用点**——
   保留的理由见 `experience.md` §9.1。
 * 所以 **`grep env_method` 在本仓只有一处命中**：`scripts/train.py` 的
   `Trainer.make_env()` 在建完这一级的环境后下发指令范围

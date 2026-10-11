@@ -344,7 +344,7 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
     cmd = env.cfg.command
     vx, vy, yaw = (command if command is not None
                    else (float(cmd.vx), float(cmd._now[1]), float(cmd._now[2])))
-    env.set_command_now(vx=float(vx), vy=float(vy), yaw_rate=float(yaw))
+    env.set_command_now(vx=float(vx), vy=float(vy), yaw_rate=float(yaw), hold=True)
     obs = env._observation()
     x0, z0 = float(env.base_pos[0]), float(env.base_pos[2])
     max_steps = int(env.cfg.episode_length_s / env.cfg.control_dt)
