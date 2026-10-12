@@ -30,7 +30,6 @@ from __future__ import annotations
 import functools
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -88,9 +87,6 @@ class SceneOptions:
     solver: str = "Newton"
     # 为僵硬的脚-盒接触提供类似恢复系数的柔软度。
     add_ground_texture: bool = True
-    extra_visual: str = ""
-    nconmax: int | None = None
-    njmax: int | None = None
 
 
 def _go2_inner_xml() -> str:
@@ -136,20 +132,12 @@ def go2_assets() -> dict[str, bytes]:
 
 def _option_xml(opts: SceneOptions) -> str:
     g = " ".join(f"{v:g}" for v in opts.gravity)
-    out = (
+    return (
         f'<option cone="elliptic" impratio="100" timestep="{opts.timestep:g}" '
         f'integrator="{opts.integrator}" gravity="{g}" '
         f'iterations="{opts.iterations}" ls_iterations="{opts.ls_iterations}" '
         f'solver="{opts.solver}"/>'
     )
-    if opts.nconmax is not None or opts.njmax is not None:
-        attrs = ""
-        if opts.nconmax is not None:
-            attrs += f' nconmax="{opts.nconmax}"'
-        if opts.njmax is not None:
-            attrs += f' njmax="{opts.njmax}"'
-        out += f"<size{attrs}/>"
-    return out
 
 
 _GROUND_ASSETS = """
@@ -178,7 +166,6 @@ def build_scene_xml(
     *,
     opts: SceneOptions | None = None,
     floor_geom: str | None = None,
-    include_lights: bool = True,
 ) -> str:
     """组装出可编译的 MJCF 字符串：Go2 + 地面 / 地形 + 灯光。
 
@@ -201,11 +188,10 @@ def build_scene_xml(
     worldbody_additions: list[str] = []
     if floor_geom is not None:
         worldbody_additions.append(floor_geom)
-    if include_lights:
-        worldbody_additions.append(
-            '<light pos="0 0 3" dir="0 0 -1" directional="true" castshadow="false"/>'
-            '<light pos="3 -3 3" dir="-1 1 -1" diffuse="0.35 0.35 0.35" castshadow="false"/>'
-        )
+    worldbody_additions.append(
+        '<light pos="0 0 3" dir="0 0 -1" directional="true" castshadow="false"/>'
+        '<light pos="3 -3 3" dir="-1 1 -1" diffuse="0.35 0.35 0.35" castshadow="false"/>'
+    )
     if terrain_xml:
         worldbody_additions.append(terrain_xml)
 
@@ -215,8 +201,6 @@ def build_scene_xml(
         )
 
     visual = _GROUND_VISUAL if opts.add_ground_texture else ""
-    if opts.extra_visual:
-        visual = visual.replace("</visual>", opts.extra_visual + "</visual>", 1)
 
     return (
         '<mujoco model="go2_stairs">\n'
@@ -247,29 +231,18 @@ def default_floor_geom(z: float = 0.0, size: float = 60.0) -> str:
 
 @dataclass
 class Go2Meta:
-    """编译后的 Go2 场景中解析出来的 id / 索引。"""
+    """编译后的 Go2 场景中解析出来的 id / 索引（只保留环境实际读取的字段）。"""
 
-    joint_names: tuple[str, ...]
-    actuator_names: tuple[str, ...]
-    foot_geom_names: tuple[str, ...]
-
-    joint_ids: np.ndarray
-    actuator_ids: np.ndarray
     foot_geom_ids: np.ndarray
     foot_radius: float
 
     qpos_joint_adr: np.ndarray
     qvel_joint_adr: np.ndarray
-    dof_joint_adr: np.ndarray
-
-    base_body_id: int
-    imu_site_id: int
 
     joint_ranges: np.ndarray  # (12, 2)
     ctrl_ranges: np.ndarray  # (12, 2)
     home_qpos: np.ndarray  # (19,)
     home_joint_angles: np.ndarray  # (12,)
-    total_mass: float
     floor_geom_id: int
     stair_geom_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
 
@@ -311,12 +284,10 @@ def extract_meta(model: mujoco.MjModel) -> Go2Meta:
     foot_radius = float(model.geom_size[foot_geom_ids[0], 0])
 
     base_body_id = _resolve_id(model, mujoco.mjtObj.mjOBJ_BODY, "base")
-    imu_site_id = _resolve_id(model, mujoco.mjtObj.mjOBJ_SITE, "imu")
 
     # 自由关节始终占用最前面的 7 个 qpos / 6 个 qvel。
     qpos_joint_adr = np.array([model.jnt_qposadr[j] for j in joint_ids], dtype=int)
     qvel_joint_adr = np.array([model.jnt_dofadr[j] for j in joint_ids], dtype=int)
-    dof_joint_adr = qvel_joint_adr
 
     joint_ranges = np.array([model.jnt_range[j] for j in joint_ids], dtype=float)
     ctrl_ranges = np.array([model.actuator_ctrlrange[a] for a in actuator_ids], dtype=float)
@@ -341,9 +312,6 @@ def extract_meta(model: mujoco.MjModel) -> Go2Meta:
         if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith("stair_")
     ]
 
-    # 在相关处把机器人自己的 12 个 body 从质量求和中排除。
-    total_mass = float(model.body_mass[1:].sum())
-
     # --- 把机器人的碰撞 geom 拆成躯干 / 腿 -----------------------------------------------
     # Go2 的 MJCF 把纯视觉网格放在 group 2，把每一个碰撞图元放在 group 3，
     # 所以 ``group == 3`` 恰好等价于「能和地形产生接触」。
@@ -362,30 +330,18 @@ def extract_meta(model: mujoco.MjModel) -> Go2Meta:
             leg_ids.append(g)
 
     return Go2Meta(
-        joint_names=JOINT_NAMES,
-        actuator_names=ACTUATOR_NAMES,
-        foot_geom_names=FOOT_GEOM_NAMES,
-        joint_ids=joint_ids,
-        actuator_ids=actuator_ids,
         foot_geom_ids=foot_geom_ids,
         foot_radius=foot_radius,
         qpos_joint_adr=qpos_joint_adr,
         qvel_joint_adr=qvel_joint_adr,
-        dof_joint_adr=dof_joint_adr,
-        base_body_id=base_body_id,
-        imu_site_id=imu_site_id,
         joint_ranges=joint_ranges,
         ctrl_ranges=ctrl_ranges,
         home_qpos=home_qpos,
         home_joint_angles=home_joint_angles,
-        total_mass=total_mass,
         floor_geom_id=int(floor_id),
         stair_geom_ids=np.array(stair_ids, dtype=int),
         trunk_geom_ids=np.array(trunk_ids, dtype=int),
         leg_geom_ids=np.array(leg_ids, dtype=int),
-        nq=model.nq,
-        nv=model.nv,
-        nu=model.nu,
     )
 
 
@@ -394,28 +350,21 @@ def compile_scene(
     *,
     opts: SceneOptions | None = None,
     floor_geom: str | None = None,
-    write_to: Path | None = None,
 ) -> tuple[mujoco.MjModel, Go2Meta, str]:
     """构建并编译一个场景，返回 (model, meta, xml_text)。"""
     if floor_geom is None:
         floor_geom = default_floor_geom()
     xml = build_scene_xml(terrain_xml, opts=opts, floor_geom=floor_geom)
 
-    if write_to is not None:
-        write_to.parent.mkdir(parents=True, exist_ok=True)
-        write_to.write_text(xml, encoding="utf-8")
-
     try:
         model = mujoco.MjModel.from_xml_string(xml, assets=go2_assets())
-    except Exception as exc:  # 把生成的 XML 暴露出来便于调试
-        if write_to is None:
-            from robotdog.tools.paths import GENERATED_DIR
+    except Exception as exc:  # 把生成失败的 XML 落盘，暴露出来便于调试
+        from robotdog.tools.paths import GENERATED_DIR
 
-            GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-            dump = GENERATED_DIR / "failed_scene.xml"
-            dump.write_text(xml, encoding="utf-8")
-            raise RuntimeError(f"MJCF compile failed; dumped to {dump}") from exc
-        raise
+        GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+        dump = GENERATED_DIR / "failed_scene.xml"
+        dump.write_text(xml, encoding="utf-8")
+        raise RuntimeError(f"MJCF compile failed; dumped to {dump}") from exc
 
     meta = extract_meta(model)
     return model, meta, xml

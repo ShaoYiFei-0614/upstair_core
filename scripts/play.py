@@ -295,7 +295,6 @@ class EpisodeOutcome:
     distance: float = 0.0
     height_gain: float = 0.0
     speed: float = 0.0
-    final_x: float = 0.0
     success: bool = False
     fell: bool = False
     timeout: bool = False
@@ -366,7 +365,6 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
     out.distance = round(float(env.base_pos[0]) - x0, 3)
     out.height_gain = round(float(env.base_pos[2]) - z0, 3)
     out.speed = round(out.distance / dt, 3) if dt > 0 else 0.0
-    out.final_x = round(float(env.base_pos[0]), 3)
     out.act_vy = round(float(env.filtered_lateral_vel), 3)
     out.act_yaw = round(float(env.filtered_yaw_rate), 3)
     out.success = bool(info.get("is_success", False))

@@ -137,10 +137,6 @@ class GaitParams:
         a[:, 2] = calf
         return np.clip(a, -1.0, 1.0).ravel()
 
-    def targets(self, t: float, home: np.ndarray) -> np.ndarray:
-        """绝对关节目标角（rad），使用本步态自己的缩放系数。"""
-        return np.asarray(home, dtype=np.float64) + self.radians(t)
-
     def radians(self, t: float) -> np.ndarray:
         """关节角偏置（弧度），形状 ``(12,)``，按执行器顺序排列。
 
@@ -179,11 +175,6 @@ class GaitParams:
         """
         s = (float(v_cmd) - SPEED_TO_SCALE_BIAS) / SPEED_TO_SCALE_SLOPE
         return float(np.clip(s, SPEED_SCALE_MIN, SPEED_SCALE_MAX))
-
-    @staticmethod
-    def speed_for_scale(scale: float) -> float:
-        """``scale_for_speed`` 的正向：该缩放下先验的稳态前进速度 [m/s]。"""
-        return float(SPEED_TO_SCALE_SLOPE) * float(scale) + float(SPEED_TO_SCALE_BIAS)
 
     def with_dynamic_scale(self, scale: float) -> GaitParams:
         """返回一个把动态缩放写成 ``scale`` 的副本（本方法不改自己）。"""

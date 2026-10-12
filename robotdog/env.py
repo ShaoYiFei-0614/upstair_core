@@ -381,6 +381,15 @@ class Go2StairsEnv(gym.Env):
     # ------------------------------------------------------------------- 构建
 
     def _build_model(self) -> None:
+        """编译一次场景。模型在环境生命周期内不变 —— 课程的每一级都是新建
+        环境（``make_vec_env``），不存在「同一个环境换地形」的用法。
+
+        ``mujoco.Renderer`` 绑定到某一个 ``MjModel`` 实例，绝不能比构建它的
+        那个模型活得更久。历史上 ``set_stair()`` 换地形后渲染器仍画*上一块*
+        地形（物理在爬新楼梯、画面是旧世界）；那个唯一会让模型换实例的入口
+        已随死代码清理删除，这条不变量现在由「模型只在 ``__init__`` 编译一次」
+        结构性地保证。
+        """
         opts = SceneOptions(timestep=self.cfg.timestep)
         self.model, self.meta, self.xml = compile_scene(
             build_terrain_xml(self.stair),
@@ -388,29 +397,6 @@ class Go2StairsEnv(gym.Env):
             floor_geom=default_floor_geom(),
         )
         self.data = mujoco.MjData(self.model)
-        # ``mujoco.Renderer`` 绑定到某一个 ``MjModel`` 实例，所以它绝不能比
-        # 构建它的那个模型活得更久 —— 否则 ``set_stair()`` 会一直画*上一块*
-        # 地形。
-        if getattr(self, "_renderer", None) is not None:
-            self._renderer.close()
-            self._renderer = None
-            self._render_size = None
-            self._scene_option = None
-
-    def set_stair(self, stair: StairSpec) -> None:
-        """替换地形。会重新编译模型。
-
-        调用方之后必须调用 ``reset()``：重新编译会替换底层的
-        ``MjModel``/``MjData``，所以旧状态没有意义。
-
-        **当前没有任何调用点**（本轮清理时删掉了唯一调用者
-        ``training.set_terrain()``）：课程的每一级都是新建一个环境
-        （``make_vec_env``），不是复用同一个环境换地形。保留它是因为
-        「换地形」本身是真需求，而且文档把它当公开 API 记录。
-        """
-        self.stair = stair
-        self._build_model()
-        self._reached_top = False
 
     # ------------------------------------------------------------------- 指令
 

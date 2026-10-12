@@ -179,26 +179,6 @@ def _floats(value: Any, n_stages: int, *, where: str, default: float) -> list[fl
     raise SystemExit(f"{where}: 期望数字或列表，实际是 {type(value).__name__}")
 
 
-def _bools(value: Any, n_stages: int, *, where: str, default: bool) -> list[bool]:
-    """把布尔标量/列表归一化成 ``n_stages`` 个布尔（``needs_progress`` 用）。
-
-    与 :func:`_floats` 的差别：**不做线性插值**（布尔插值没有意义），列表长度
-    必须正好是级数或 1。
-    """
-    if value is None:
-        return [default] * n_stages
-    if isinstance(value, bool):
-        return [value] * n_stages
-    if isinstance(value, (list, tuple)) and value:
-        values = [bool(v) for v in value]
-        if len(values) == n_stages:
-            return values
-        if len(values) == 1:
-            return values * n_stages
-        raise SystemExit(f"{where}: 列表长度 {len(values)} 必须等于级数 {n_stages} 或为 1")
-    raise SystemExit(f"{where}: 期望布尔或列表，实际是 {type(value).__name__}")
-
-
 def _vx_ranges(value: Any, n_stages: int, *, where: str
                ) -> list[tuple[float, float]]:
     """把 ``curriculum.command_vx`` 归一化成每级一对 ``(vx_min, vx_max)``。
