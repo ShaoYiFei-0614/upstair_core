@@ -231,9 +231,9 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     terms["forward_vel"] = rc.forward_vel * float(track)
 
     # 1b) 横向 / 偏航指令跟踪 ---------------------------------------------
-    # 与前进项同一种形状（相对误差的线性死区），量程取指令自己的上界，所以
-    # 它是「相对误差」：完美跟踪拿满分，原地不动降到 ``1 - |cmd|/range``，且
-    # 大指令罚得最重 —— 没有「躲在 0 附近」这条路。
+    # 形状同前进项；量程取指令上界**再乘 0.5**（2026-10-12）—— 只取上界时
+    # 什么都不做的机器人白拿 ``+0.5/轴``（实测 +5.4/步，把机器人钉在墙脚），
+    # 减半后 **≈ −0.083/轴**（尾项被 ``max(-1.0, ·)`` 截断）。证明 P1、见 §21.18.5。
     #
     # 横向项被**门控**：``vy_max == 0`` 时不参与。不门控的代价已经量过 ——
     # 「什么都没做」每步也能白拿约 1.0 分（5 cm 上实测 125 步拿了 +139.7），
@@ -249,7 +249,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     tail = float(rc.track_tail)
     if cmd.vy_max:
         vy = (env.filtered_lateral_vel if vel_filter else env.base_lin_vel_body[1])
-        xy = abs(vy - cmd.vy) / float(cmd.vy_max)
+        xy = abs(vy - cmd.vy) / (0.5 * float(cmd.vy_max))
         follow += rc.lateral_vel * max(-1.0, track_shape(xy, tail))
     # 偏航项**恒在**（不受 ``yaw_max`` 门控），量程取 ``max(yaw_max, yaw_range_floor)``。
     # 门控的代价实测过：``yaw_max == 0`` 的级别里没有任何一项读 wz，策略学会
@@ -264,7 +264,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 的平阶级上策略偏航漂到 −47°~−88°，旧系数 0.5 只值 −0.7/步，挡不住）。
     if cmd.wz == 0.0:
         yaw_err = 1.5 * (yaw_err + abs(wz))
-    yaw_range = max(float(cmd.yaw_max), float(rc.yaw_range_floor))
+    yaw_range = 0.5 * max(float(cmd.yaw_max), float(rc.yaw_range_floor))
     follow += rc.yaw_rate * max(-1.0, track_shape(yaw_err / yaw_range, tail))
     terms["command_follow"] = follow
 
