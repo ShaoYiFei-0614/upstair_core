@@ -35,7 +35,12 @@ import numpy as np
 from gymnasium import spaces
 
 from robotdog.gait import GaitParams
-from robotdog.reward import RewardConfig, compute_reward
+from robotdog.reward import (
+    RewardConfig,
+    compute_reward,
+    track_swing_peak,
+    update_probe_state,
+)
 from robotdog.go2_model import (
     SceneOptions,
     compile_scene,
@@ -776,68 +781,6 @@ class Go2StairsEnv(gym.Env):
         )
         self._prev_foot_contact = foot_contact
 
-    def _track_swing_peak(self, foot_contact: np.ndarray) -> None:
-        """维护每只脚「本次摆动期内的最大离地间隙」，在奖励计算**之前**调用。
-
-        为什么要单独维护：落地那一帧脚已经贴回踏面，当时的间隙接近 0，所以
-        「这次摆动到底抬了多高」只能靠摆动期的峰值来判断，落地帧本身看不出
-        来。脚一落地就把峰值清零，为下一次摆动重新计。
-
-        ⚠ **清零必须发生在奖励结算之后，而不是接触的那一帧**。实测踩过这个
-        坑：如果一接触就清零，那么落地帧读到的是「上一帧的峰值」，比整个摆动
-        期的真实峰值低 0.01~0.03 m，探测项的判据会系统性偏严。做法是「落地那
-        一帧保留旧峰值，结算完再清零」。
-        """
-        clearance = self.foot_clearance
-        landed = foot_contact & ~self._prev_foot_contact
-        self._peak_swing_clearance = np.where(
-            landed, self._peak_swing_clearance,
-            np.where(foot_contact, 0.0,
-                     np.maximum(self._peak_swing_clearance, clearance)),
-        )
-
-    def _update_probe_state(self, foot_contact: np.ndarray) -> None:
-        """维护「被阻挡」状态，在物理推进之后、奖励计算**之前**调用。
-
-        判据：**有前进指令，但实测前进速度远低于指令**（比例见
-        ``reward.probe_blocked_frac``）。一旦判定为被阻挡就**锁住**，直到机身
-        下方的地形刷新了本回合的最高高度（真的上去了）或前进速度恢复为止 ——
-        因为机器人撞上立面时会前后晃，不锁住的话这个布尔量会一步一跳。
-
-        ``_blocked_peak`` 是锁住那一刻记录的地形高，用来判断「有没有上去」。
-        解除阻挡时顺带把逐足的 ``_probe_best`` 清零，让下一次被卡住可以重新累积
-        「抬高进展」（否则势函数在整条回合里只增不减，第二次卡住就没有梯度）。
-        """
-        rc = self.cfg.reward
-        cmd_vx = float(self._command[0])         # 采样指令，不是 cfg.command.vx（见 env.md §3.13）
-        # 机身系：这是「往前走没走」的判据，世界系分量在机器人偏航时会换号。
-        vx = float(self.base_lin_vel_body[0])
-        terrain = float(self.terrain_height_under_base)
-        if self._blocked:
-            recovered = terrain > self._blocked_peak + 1e-9
-            if recovered or vx > max(0.5 * cmd_vx, 0.05):
-                self._blocked = False
-                self._probe_best[:] = 0.0
-        if not self._blocked and cmd_vx > 1e-6:
-            if vx < rc.probe_blocked_frac * cmd_vx:
-                self._blocked = True
-                self._blocked_peak = terrain
-                self._probe_best[:] = 0.0
-
-    @property
-    def probe_target(self) -> float:
-        """「试探抬腿」的起算线 [m]（势函数塑形的地板）。
-
-        直接取 ``reward.probe_lift_target``，**不乘台阶高**。原因：实测
-        （``.tmp/calib_probe3.py``）在 15 cm 立面之前被阻挡时，默认步态的摆动
-        峰值只到 0.09~0.12 m；而 ``action_scale=0.30`` 下搜遍固定动作，最好的
-        一种也只到 0.148 m（``.tmp/calib_probe4.py``）。门槛若取
-        ``1.6 × 0.15 = 0.24 m``，梯度恒为零、这一项永远不触发。改成只跟「当前
-        策略自己抬多高」比的 0.06 m 之后，普通步态的上沿被扣掉，剩下的都是
-        真的「比平时抬得更高」。
-        """
-        return float(self.cfg.reward.probe_lift_target)
-
     def set_reward_overrides(self, overrides: dict[str, float] | None) -> None:
         """把一组奖励覆盖值叠到 ``cfg.reward`` 上（课程逐级调整奖励的入口）。
 
@@ -864,25 +807,6 @@ class Go2StairsEnv(gym.Env):
                     f"未知的奖励字段：{key}；可用字段见 RewardConfig.__dataclass_fields__"
                 )
             setattr(self.cfg.reward, key, value)
-
-    def _contact_fatal(self, trunk_contact: bool, leg_contact: bool) -> bool:
-        """接触地形是否会结束回合 —— 现在**恒为 False**。
-
-        历史上这里对躯干接触计数：连续 ``terminate_contact_steps`` 步就判
-        摔倒。实测证明那条规则从未生效过，而且随时可能误杀（见
-        ``experience.md`` §12）：躯干碰撞体最低点在 0.118 m，而高度阈值
-        ``terminate_min_height`` 比它还高，所以躯干一碰地，高度判据早就触发
-        了；反过来，躯干在 ``h ≈ 0.28 m`` 的完全安全姿态下贴着立面蹭可以
-        连续到 8 步，只差 2 步就会被判死 —— 那正是「机身上台架天然要蹭上去」
-        的情形。
-
-        保留这个方法是为了让 ``_terminated`` 的调用形状不变，也为了留住
-        膝盖/胫部接触的连续计数（诊断用，永不致命 —— 因它而终止回合会抹掉
-        高台阶恰恰需要的那个信号）。代价由 ``reward.body_collision``（逐步、
-        有界）承担，不由终止承担。
-        """
-        self._leg_contact_streak = self._leg_contact_streak + 1 if leg_contact else 0
-        return False
 
     def _support_height(self) -> float:
         """四足下方最低的地形高度 —— 支撑面。
@@ -929,7 +853,23 @@ class Go2StairsEnv(gym.Env):
             )
         return self._support_height()
 
-    def _terminated(self, trunk_contact: bool, leg_contact: bool) -> tuple[bool, bool]:
+    def _terminated(self, leg_contact: bool) -> tuple[bool, bool]:
+        """摔倒（terminated）与超时（truncated）判定。
+
+        摔倒只看**高度与倾角**。「躯干接触地形连续 N 步就判摔」的历史规则已
+        删除：实测它从未生效过且随时误杀（``experience.md`` §12）—— 躯干碰撞
+        体最低点在 0.118 m，而高度阈值 ``terminate_min_height``（0.15）比它还
+        高，所以躯干一碰地，高度判据早就先触发了；反过来，躯干在
+        ``h ≈ 0.28 m`` 的完全安全姿态下贴着立面蹭可以连续到 8 步，只差 2 步
+        就会被那条规则判死 —— 那正是「机身上台架天然要蹭上去」的情形。躯干
+        接触的代价由 ``reward.body_collision``（逐步、有界）承担，不由终止
+        承担。
+
+        ``leg_contact``（膝/胫蹭立面）在这里只推进 ``_leg_contact_streak``
+        连续计数 —— 纯诊断，**永不致命**（因它而终止回合会抹掉高台阶恰恰
+        需要的那个信号）。
+        """
+        self._leg_contact_streak = self._leg_contact_streak + 1 if leg_contact else 0
         rpy = self.base_rpy
         height = self.base_pos[2] - self._fall_reference_height()
         fell = (
@@ -937,9 +877,8 @@ class Go2StairsEnv(gym.Env):
             or abs(rpy[0]) > self.cfg.terminate_max_tilt
             or abs(rpy[1]) > self.cfg.terminate_max_tilt
         )
-        contact_fatal = self._contact_fatal(trunk_contact, leg_contact)
         truncated = self._step_count >= self._max_steps
-        return bool(fell or contact_fatal), truncated
+        return bool(fell), truncated
 
     # ------------------------------------------------------------ Gymnasium
 
@@ -1078,12 +1017,12 @@ class Go2StairsEnv(gym.Env):
 
         self._step_count += 1
         trunk_contact, leg_contact, foot_contact = self._contact_scan()
-        # 这两步必须在奖励计算之前：``_track_swing_peak`` 提供「本次摆动抬了
-        # 多高」，``_update_probe_state`` 提供「现在是不是撞着立面推不动」，
-        # 而 ``probe_lift`` 项要同时用到它们。
-        self._track_swing_peak(foot_contact)
-        self._update_probe_state(foot_contact)
-        terminated, truncated = self._terminated(trunk_contact, leg_contact)
+        # 这两步必须在奖励计算之前：它们维护 ``probe_lift`` 项要用的势函数
+        # 状态（本次摆动抬了多高、是否撞着立面推不动）。状态机的数学也住在
+        # ``robotdog/reward.py`` —— 探测机制整体同居一处。
+        track_swing_peak(self, foot_contact)
+        update_probe_state(self)
+        terminated, truncated = self._terminated(leg_contact)
 
         # 低通滤波必须在奖励之前推进：``command_follow`` 读的就是这两个量，
         # 观测里报的也是它们（见 ``ObsConfig.vel_filter``）。

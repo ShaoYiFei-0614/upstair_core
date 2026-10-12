@@ -6,13 +6,17 @@
 ``robotdog/env.py`` 里整块搬出来，是为了能在一个屏幕里读完、单独改、单独做数值
 实验，而不必在 800 行的环境文件里翻找。
 
-本模块由两半构成：
+本模块由三部分构成：
 
 * :class:`RewardConfig` —— 全部权重与阈值（``config.yaml`` 的 ``reward`` 段）。
 * :func:`compute_reward` —— 奖励数学本体：输入是环境状态，输出是**逐步奖励**、
   **逐项明细**与**终止奖励**，不做任何物理推进。它**不是纯函数** —— 几个势函数
   项要靠环境上的记忆字段（``_peak_terrain_height`` / ``_probe_best`` /
   ``_probe_count``）做到「总量有界、不可刷分」，所以会写这几个字段。
+* :func:`track_swing_peak` / :func:`update_probe_state` —— ``env.step`` 在奖励
+  结算**之前**调用的两个势函数状态机（摆动峰值记录、「被阻挡」判定）。它们与
+  :func:`compute_reward` 读写同一批记忆字段，所以与奖励数学同居一处，而不是
+  散在环境文件里。
 
 关于逐项明细：:func:`compute_reward` 返回的 ``terms`` 里，每一项**都已经乘过它的
 权重**，所以 ``sum(terms.values())`` 就是未经终止奖励的总奖励。想看「这个回合是谁
@@ -103,7 +107,7 @@ class RewardConfig:
     # 起算线不能取 ``ratio × 台阶高``：实测在 15 cm 台阶前被阻挡时，默认步态的
     # 摆动峰值只到 0.09~0.12 m，而 ``action_scale=0.30`` 下能搜到的最好固定动作
     # 也只到 0.148 m。起算线一旦取 1.6×15cm = 0.24，梯度恒为零、这一项永远不触发。
-    # 所以起算线只跟「当前策略自己能抬多高」比 —— 见 ``env.probe_target``。
+    # 所以起算线只跟「当前策略自己能抬多高」比 —— 见 ``RewardConfig.probe_lift_target``。
     probe_lift: float = 1.0             # 抬高进展的权重
     probe_lift_target: float = 0.06     # m，进展的起算线（普通步态峰值带的上沿）
     probe_blocked_frac: float = 0.30    # 实测前进速度 < 该比例 × 指令速度 ⇒ 被阻挡
@@ -359,10 +363,10 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 8) 被阻挡时的试探抬腿 ------------------------------------------------
     # 门控（全部满足才可能给分）：
     #   ① 本回合已经被判定为「被阻挡」（``env._blocked``）—— 由
-    #      ``_update_probe_state()`` 在物理推进之后维护，判据是「有前进指令
+    #      ``update_probe_state()`` 在物理推进之后维护，判据是「有前进指令
     #      但实测前进速度远低于指令」，而且一旦锁住就持续到机身下方的地形
     #      刷新了新高度（真的上去了）才解除；
-    #   ② 本步的摆动峰值越过起算线 ``env.probe_target``。实测默认先验的峰值
+    #   ② 本步的摆动峰值越过起算线 ``rc.probe_lift_target``。实测默认先验的峰值
     #      带是 0.06~0.12 m（``.tmp/calib_probe3.py``），而 ``action_scale=0.30``
     #      下搜到的最好固定动作能到 0.148 m（``.tmp/calib_probe4.py``）——
     #      所以起算线取 0.06 m 这个「普通步态的上沿」，留出可优化的空间。
@@ -380,7 +384,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # （等于奖励普通步态），要么太高（一次都不触发）。见 experience.md §15。
     if rc.probe_lift != 0.0 and env._blocked:
         peaks = env._peak_swing_clearance
-        floor = np.maximum(env._probe_best, env.probe_target)
+        floor = np.maximum(env._probe_best, float(rc.probe_lift_target))
         gain = float(np.sum(np.clip(peaks - floor, 0.0, None)))
         if gain > 0.0:
             env._probe_best = np.maximum(env._probe_best, peaks)
@@ -397,6 +401,60 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
         terminal = rc.success if env._reached_top else rc.termination
 
     return float(sum(terms.values())), terms, float(terminal)
+
+
+# --------------------------------------------------------------------------- #
+# 势函数状态机（env.step 在奖励结算**之前**调用）
+# --------------------------------------------------------------------------- #
+
+def track_swing_peak(env, foot_contact: np.ndarray) -> None:
+    """维护每只脚「本次摆动期内的最大离地间隙」（``env._peak_swing_clearance``）。
+
+    为什么要单独维护：落地那一帧脚已经贴回踏面，当时的间隙接近 0，所以
+    「这次摆动到底抬了多高」只能靠摆动期的峰值来判断，落地帧本身看不出
+    来。脚一落地就把峰值清零，为下一次摆动重新计。
+
+    ⚠ **清零必须发生在奖励结算之后，而不是接触的那一帧**。实测踩过这个
+    坑：如果一接触就清零，那么落地帧读到的是「上一帧的峰值」，比整个摆动
+    期的真实峰值低 0.01~0.03 m，探测项的判据会系统性偏严。做法是「落地那
+    一帧保留旧峰值，结算完再清零」。
+    """
+    clearance = env.foot_clearance
+    landed = foot_contact & ~env._prev_foot_contact
+    env._peak_swing_clearance = np.where(
+        landed, env._peak_swing_clearance,
+        np.where(foot_contact, 0.0,
+                 np.maximum(env._peak_swing_clearance, clearance)),
+    )
+
+
+def update_probe_state(env) -> None:
+    """维护「被阻挡」状态（``env._blocked``），在物理推进之后、奖励结算之前调用。
+
+    判据：**有前进指令，但实测前进速度远低于指令**（比例见
+    ``reward.probe_blocked_frac``）。一旦判定为被阻挡就**锁住**，直到机身
+    下方的地形刷新了本回合的最高高度（真的上去了）或前进速度恢复为止 ——
+    因为机器人撞上立面时会前后晃，不锁住的话这个布尔量会一步一跳。
+
+    ``_blocked_peak`` 是锁住那一刻记录的地形高，用来判断「有没有上去」。
+    解除阻挡时顺带把逐足的 ``_probe_best`` 清零，让下一次被卡住可以重新累积
+    「抬高进展」（否则势函数在整条回合里只增不减，第二次卡住就没有梯度）。
+    """
+    rc = env.cfg.reward
+    cmd_vx = float(env._command[0])          # 采样指令，不是 cfg.command.vx（见 env.md §3.13）
+    # 机身系：这是「往前走没走」的判据，世界系分量在机器人偏航时会换号。
+    vx = float(env.base_lin_vel_body[0])
+    terrain = float(env.terrain_height_under_base)
+    if env._blocked:
+        recovered = terrain > env._blocked_peak + 1e-9
+        if recovered or vx > max(0.5 * cmd_vx, 0.05):
+            env._blocked = False
+            env._probe_best[:] = 0.0
+    if not env._blocked and cmd_vx > 1e-6:
+        if vx < rc.probe_blocked_frac * cmd_vx:
+            env._blocked = True
+            env._blocked_peak = terrain
+            env._probe_best[:] = 0.0
 
 
 # --------------------------------------------------------------------------- #
