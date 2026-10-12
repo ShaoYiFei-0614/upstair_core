@@ -136,6 +136,20 @@ def _resolve_norm(model_path: Path) -> Path | None:
     return cand if cand.is_file() else None
 
 
+def read_json_or(path: Path | None, default: Any) -> Any:
+    """读一个 JSON 文件；不存在 / 解析失败返回 ``default``。
+
+    训练记录（``summary.json`` / ``plan.json``）是**可选数据**：老运行可能没有,
+    半路夭折的运行可能写坏了 —— 读不到就按「没有记录」处理,而不是让回放崩掉。
+    """
+    if path is None or not path.is_file():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
 def resolve_target(run: str) -> PlayTarget:
     """从运行名 / 目录 / zip 解析出模型、归一化统计和它训练时的配置。"""
     model_path = _resolve_model(run)
@@ -565,15 +579,7 @@ def _stages_from_run(run_root: Path | None) -> list[dict[str, Any]]:
 
     返回原始 dict 列表（缺字段由调用方兜底），读不到就返回空列表。
     """
-    if run_root is None:
-        return []
-    summary = run_root / "summary.json"
-    if not summary.exists():
-        return []
-    try:
-        raw = json.loads(summary.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    raw = read_json_or(None if run_root is None else run_root / "summary.json", {})
     return [st for st in (raw.get("stages", []) or []) if st.get("name")]
 
 
@@ -585,15 +591,7 @@ def _plan_entries(run_root: Path | None) -> dict[str, dict[str, Any]]:
     环境的实施记录，也是唯一记了逐级 ``reward_overrides`` 的地方。旧运行没有
     这个文件，所以调用方必须能退回 ``summary.json``。读不到就返回空 dict。
     """
-    if run_root is None:
-        return {}
-    plan = run_root / "plan.json"
-    if not plan.exists():
-        return {}
-    try:
-        raw = json.loads(plan.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    raw = read_json_or(None if run_root is None else run_root / "plan.json", None)
     if isinstance(raw, list):           # 早期形状：带 name 字段的列表
         return {str(x["name"]): x for x in raw if isinstance(x, dict) and x.get("name")}
     if isinstance(raw, dict):

@@ -30,7 +30,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +53,7 @@ from play import (  # noqa: E402
     FRAME_STRIDE,
     FRAME_WIDTH,
     open_runner,
+    read_json_or,
     resolve_target,
     write_gif,
 )
@@ -214,11 +214,8 @@ DEFAULT_DEMO_LIMITS = (0.25, 0.35)
 
 def _stage_limits(path: Path, height: float) -> tuple[float, float] | None:
     """从 ``plan.json`` / ``summary.json`` 里按台阶高取 ``(vy_max, yaw_max)``。"""
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    data = read_json_or(path, None)
+    if data is None:
         return None
     rows = data.get("stages") if isinstance(data, dict) else data
     if not isinstance(rows, list):

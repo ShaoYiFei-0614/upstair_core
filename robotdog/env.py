@@ -721,26 +721,53 @@ class Go2StairsEnv(gym.Env):
         terms["terminal"] = terminal
         return base + terminal, terms
 
-    def _foot_contact_mask(self) -> np.ndarray:
-        """逐足布尔量：这个足端 geom 此刻是否接触地形？
+    def _contact_scan(self) -> tuple[bool, bool, np.ndarray]:
+        """一次遍历 ``data.ncon`` 同时判定三类「与地形的接触」。
 
+        返回 ``(trunk_contact, leg_contact, foot_contact_mask)``。原先这是两个
+        方法（``_contact_flags`` / ``_foot_contact_mask``）各扫一遍接触列表，
+        而它们判定的是同一批接触对，合并成一次扫描。
+
+        ``trunk_contact`` —— 躯干碰撞体之一（焊在 ``base`` body 上的 box /
+        cylinder / sphere）正在接触地形。这是真正的摔倒，也是默认唯一致命的
+        接触。
+
+        ``leg_contact`` —— 髋 / 大腿 / 小腿的碰撞形状在躯干没接触时接触了
+        地形。在楼梯上，这几乎总是爬升途中胫部蹭到立面：它每步扣
+        ``leg_collision``，但回合继续运行，这正是保留试错的原因。
+
+        ``foot_contact_mask`` —— 逐足布尔量：这个足端 geom 此刻是否接触地形。
         **信息来源：仿真器的接触真值。** 真机上对应的是「用关节力矩残差 / 电流
         尖峰估计足端触地」，这是标准的 sim-to-real 做法，所以它不是特权信息 ——
         但它**只进奖励与腾空时间统计，绝不进观测**（``reward.py`` 的 ``air_time``
         项与 ``clearance`` 的分布都靠它区分摆动相与支撑相）。
         """
-        foot_ids = [int(g) for g in self.meta.foot_geom_ids]
+        foot_index = {int(g): k for k, g in enumerate(self.meta.foot_geom_ids)}
         terrain = {int(self.meta.floor_geom_id)} | {
             int(g) for g in self.meta.stair_geom_ids
         }
-        mask = np.zeros(len(foot_ids), dtype=bool)
+        trunk = {int(g) for g in self.meta.trunk_geom_ids}
+        legs = {int(g) for g in self.meta.leg_geom_ids}
+        trunk_hit = False
+        leg_hit = False
+        mask = np.zeros(len(foot_index), dtype=bool)
         for i in range(self.data.ncon):
             c = self.data.contact[i]
             g1, g2 = int(c.geom1), int(c.geom2)
-            for k, fg in enumerate(foot_ids):
-                if (g1 == fg and g2 in terrain) or (g2 == fg and g1 in terrain):
-                    mask[k] = True
-        return mask
+            if g1 in terrain and g2 not in terrain:
+                other = g2
+            elif g2 in terrain and g1 not in terrain:
+                other = g1
+            else:
+                continue
+            if other in trunk:
+                trunk_hit = True
+            elif other in legs:
+                leg_hit = True
+            k = foot_index.get(other)
+            if k is not None:
+                mask[k] = True
+        return trunk_hit, leg_hit, mask
 
     def _advance_foot_air_time(self, foot_contact: np.ndarray) -> None:
         """累加腾空时间；每个控制步调用一次，在奖励计算之后。"""
@@ -837,44 +864,6 @@ class Go2StairsEnv(gym.Env):
                     f"未知的奖励字段：{key}；可用字段见 RewardConfig.__dataclass_fields__"
                 )
             setattr(self.cfg.reward, key, value)
-
-    def _contact_flags(self) -> tuple[bool, bool]:
-        """机器人 geom 与地形接触时的 (trunk_contact, leg_contact)。
-
-        ``trunk_contact`` —— 躯干碰撞体之一（焊在 ``base`` body 上的 box /
-        cylinder / sphere）正在接触地形。这是真正的摔倒，也是默认唯一致命的
-        接触。
-
-        ``leg_contact`` —— 髋 / 大腿 / 小腿的碰撞形状在躯干没接触时接触了
-        地形。在楼梯上，这几乎总是爬升途中胫部蹭到立面：它每步扣
-        ``leg_collision``，但回合继续运行，这正是保留试错的原因。
-
-        **只进奖励与终止判定，不进观测。** 真机上躯干碰地靠 IMU 的冲击尖峰 +
-        关节力矩异常即可检测，级别上等同于一阶故障判据。
-        """
-        trunk = {int(g) for g in self.meta.trunk_geom_ids}
-        legs = {int(g) for g in self.meta.leg_geom_ids}
-        if not trunk and not legs:
-            return False, False
-        terrain = {int(self.meta.floor_geom_id)} | {
-            int(g) for g in self.meta.stair_geom_ids
-        }
-        trunk_hit = False
-        leg_hit = False
-        for i in range(self.data.ncon):
-            c = self.data.contact[i]
-            g1, g2 = int(c.geom1), int(c.geom2)
-            if g1 in terrain:
-                other = g2
-            elif g2 in terrain:
-                other = g1
-            else:
-                continue
-            if other in trunk:
-                trunk_hit = True
-            elif other in legs:
-                leg_hit = True
-        return trunk_hit, leg_hit
 
     def _contact_fatal(self, trunk_contact: bool, leg_contact: bool) -> bool:
         """接触地形是否会结束回合 —— 现在**恒为 False**。
@@ -1000,7 +989,7 @@ class Go2StairsEnv(gym.Env):
         self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
-        self._prev_foot_contact = self._foot_contact_mask()
+        self._prev_foot_contact = self._contact_scan()[2]
         # 步态先验时钟，单位为自回合开始起的秒数。观测里报告的相位就是本步
         # 实际使用的那一个。
         self._gait_t = 0.0
@@ -1088,8 +1077,7 @@ class Go2StairsEnv(gym.Env):
             mujoco.mj_step(self.model, self.data)
 
         self._step_count += 1
-        trunk_contact, leg_contact = self._contact_flags()
-        foot_contact = self._foot_contact_mask()
+        trunk_contact, leg_contact, foot_contact = self._contact_scan()
         # 这两步必须在奖励计算之前：``_track_swing_peak`` 提供「本次摆动抬了
         # 多高」，``_update_probe_state`` 提供「现在是不是撞着立面推不动」，
         # 而 ``probe_lift`` 项要同时用到它们。
@@ -1168,6 +1156,16 @@ class Go2StairsEnv(gym.Env):
     #: :meth:`render` 能识别的相机预设。
     CAMERAS = ("side", "track", "chase", "front", "top")
 
+    #: 各相机的 ``(azimuth, elevation, distance)``。注视点在 :meth:`render` 里
+    #: 按相机名取：``side`` 固定在楼梯入口，其余跟随机身。
+    _CAMERA_VIEW = {
+        "side": (90.0, -12.0, 4.0),
+        "track": (90.0, -9.0, 2.5),
+        "chase": (135.0, -22.0, 3.0),
+        "front": (180.0, -10.0, 3.0),
+        "top": (90.0, -85.0, 4.5),
+    }
+
     def render(self, camera: str = "side", *, width: int = 640, height: int = 480):
         """离屏渲染当前状态；``camera`` 取值见 :attr:`CAMERAS`。
 
@@ -1195,35 +1193,18 @@ class Go2StairsEnv(gym.Env):
                 self._scene_option.geomgroup[g] = 1
         mujoco.mjv_defaultFreeCamera(self.model, self._render_cam)
         base = self.base_pos
-        if camera == "side":
-            self._render_cam.azimuth = 90.0
-            self._render_cam.elevation = -12.0
-            self._render_cam.distance = 4.0
-            self._render_cam.lookat[:] = (self.stair.start_x + 1.0, 0.0, 0.3)
-        elif camera == "track":
-            self._render_cam.azimuth = 90.0
-            self._render_cam.elevation = -9.0
-            self._render_cam.distance = 2.5
-            self._render_cam.lookat[:] = (
-                float(base[0]) + 0.35, float(base[1]), float(base[2]) + 0.02)
-        elif camera == "chase":
-            self._render_cam.azimuth = 135.0
-            self._render_cam.elevation = -22.0
-            self._render_cam.distance = 3.0
-            self._render_cam.lookat[:] = (
-                float(base[0]) + 0.6, float(base[1]), float(base[2]) + 0.10)
-        elif camera == "front":
-            self._render_cam.azimuth = 180.0
-            self._render_cam.elevation = -10.0
-            self._render_cam.distance = 3.0
-            self._render_cam.lookat[:] = (
-                float(base[0]) + 1.2, float(base[1]), float(base[2]) + 0.10)
-        else:  # 顶视
-            self._render_cam.azimuth = 90.0
-            self._render_cam.elevation = -85.0
-            self._render_cam.distance = 4.5
-            self._render_cam.lookat[:] = (
-                float(base[0]) + 0.8, float(base[1]), float(base[2]))
+        azimuth, elevation, distance = self._CAMERA_VIEW[camera]
+        self._render_cam.azimuth = azimuth
+        self._render_cam.elevation = elevation
+        self._render_cam.distance = distance
+        # ``side`` 固定看整段楼梯入口，其余注视点跟随机身。
+        self._render_cam.lookat[:] = {
+            "side":  (self.stair.start_x + 1.0, 0.0, 0.3),
+            "track": (float(base[0]) + 0.35, float(base[1]), float(base[2]) + 0.02),
+            "chase": (float(base[0]) + 0.6, float(base[1]), float(base[2]) + 0.10),
+            "front": (float(base[0]) + 1.2, float(base[1]), float(base[2]) + 0.10),
+            "top":   (float(base[0]) + 0.8, float(base[1]), float(base[2])),
+        }[camera]
         self._renderer.update_scene(
             self.data, camera=self._render_cam, scene_option=self._scene_option)
         return self._renderer.render()

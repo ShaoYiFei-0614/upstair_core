@@ -312,7 +312,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 足端落地的那一步结算。
     if rc.air_time != 0.0:
         if foot_contact is None:
-            foot_contact = env._foot_contact_mask()
+            foot_contact = env._contact_scan()[2]
         landed = foot_contact & ~env._prev_foot_contact
         air = env._foot_air_time
         credit = np.clip(air - rc.air_time_target, 0.0, None)
