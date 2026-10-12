@@ -1,0 +1,28 @@
+{
+  "_provenance": {
+    "objective": "stairs_in_band",
+    "note": "3 cm × 8 级、踏面 50 cm 上，零残差先验 4/4 成功、上楼均速 0.48 m/s（落在指令带 0.2~0.6 内）、6 cm 3/3 到顶。",
+    "search": ".tmp/gait_search.py 3 --trials 150 --episodes 1 --out .tmp/gait_3cm_band.json",
+    "search_score": 7.0,
+    "cleared_heights_cm": [3, 6],
+    "ceiling_note": "9 cm 起失效（第一道立面越不过去），天花板落在 6~9 cm 之间",
+    "leg_pattern": "walk (FL, FR, RL, RR) = (0, π, π/2, 3π/2)",
+    "why_not_trot": "同高度下 trot 的带内速度与可靠性互斥：amp 0.80/freq 6.0 能 4/4 成功但上楼 0.962 m/s（带外）；amp 0.75/freq 7.0 在带内（0.555）却只有 2/4。换成 walk 腿相位后 4/4 且带内。",
+    "speed_track_warning": "必须配 gait_speed_track=false。开着它时 scale_for_speed 在整条 0.2~0.6 指令带上都返回 SPEED_SCALE_MIN=0.46（该下沿来自平地标定），本先验被裁到 46% 后同样爬不上去（实测 0/2、被阻挡 1.00）。"
+  },
+  "freq": 5.7416479578851884,
+  "amp_th": 0.38419718007562176,
+  "amp_ca": 0.83930188157493,
+  "ph_th": 1.5597913484749046,
+  "ph_ca": 2.266353796748935,
+  "off_th": 0.08650135911273761,
+  "off_ca": -0.16069811842507006,
+  "calf_shape": "sin",
+  "action_scale": 1.0,
+  "leg_phase": [
+    0.0,
+    3.141592653589793,
+    1.5707963267948966,
+    4.71238898038469
+  ]
+}

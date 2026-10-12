@@ -187,7 +187,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 它会在步态周期内换号；实测巡航策略世界系 x 均值 +0.54 m/s 而机身系 +0.72、
     # 偏航漂到 −47°，奖励于是默认了「一边转一边走」也是一种跟踪。执行器只产
     # 机身系的推力，所以「前进」只能是机身系量；偏航对齐由 ``yaw_rate`` 项负责。
-    lin = env.base_lin_vel_body
+    v_fwd = _forward_speed(env)
     target_height = env.nominal_pose
     # 指令跟踪读滤波量还是瞬时量，由观测开关决定（两者必须一致，否则策略看到的
     # 和它被评判的不是同一个数；见下面 1b 的说明）。
@@ -219,7 +219,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 时，``|err|`` 恒 ≥0.35，``track_shape`` 一步就撞到 −1 下界，
     # ``forward_vel`` 每一步都吃满 −10；而观测与成功判据用的是真实采样值 ——
     # 奖励和判据指着两个不同的目标，策略自然学不动。
-    err = float(lin[0]) - float(env._command[0])
+    err = float(v_fwd) - float(env._command[0])
     track = max(-1.0, track_shape(abs(err) / float(rc.forward_track_window),
                                   float(rc.track_tail)))
     if err > 0.0:
@@ -346,10 +346,10 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 站着不动」每一步都白拿 +0.083/步（15 cm），这是「原地拖延」局部最优
     # 的第二根支柱（见 experience.md §12）。改成按最大值结算后，累计总量
     # 仍是 ``stair_progress × 爬升高度``，与走多少步无关 —— 但站着不动再也
-    # 拿不到新的钱。
-    climbed = max(0.0, env.terrain_height_under_base - env._peak_terrain_height)
+    # 拿不到新的钱。⚠ 2026-10-12：参照面由**躯干 x** 改成**四足支撑面**（见 experience.md §2.7）。
+    climbed = max(0.0, env._support_height() - env._peak_terrain_height)
     if climbed > 0.0:
-        env._peak_terrain_height = env.terrain_height_under_base
+        env._peak_terrain_height = env._support_height()
     terms["stair_progress"] = rc.stair_progress * float(climbed)
 
     # 8) 被阻挡时的试探抬腿 ------------------------------------------------
@@ -393,3 +393,41 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
         terminal = rc.success if env._reached_top else rc.termination
 
     return float(sum(terms.values())), terms, float(terminal)
+
+
+# --------------------------------------------------------------------------- #
+# 俯仰补偿（只服务前进项）
+# --------------------------------------------------------------------------- #
+
+def _forward_speed(env) -> float:
+    """前进项该跟踪的速度 —— **按地形分两个参照系**。
+
+    平地段：**机身系**前进速度。那里「前方」就是鼻子，机器人可以自由转向，转向本身
+    是指令的一部分。
+
+    楼梯级：**课程方向**（世界系 +x）的水平速度。楼梯是按 ``start_x`` 沿 +x 铺开的
+    **一条课程**，所以 ``vx`` 只能是「沿课程前进的速度」。
+
+    ⚠ 为什么楼梯级必须换参照系（2026-10-12，见 ``experience.md`` §21.14）：跟踪
+    机身系速度时「前方」是鼻子指哪算哪，而出生点背后是**无障碍平地** —— 训练出来的
+    策略学会**掉头 173° 背对楼梯、以指令带内的速度走开**：世界系 vx −0.22 而机身系
+    +0.34，``forward_vel`` 照付 **+7480**，一整回合净赚 +10667，而爬完整条 15 cm
+    楼梯只值 ``success 50 + stair_progress 1200×1.20 ≈ +1490``。奖励在指反方向。
+
+    离线预验（同一批真实轨迹上两种参照的回合累计）：
+
+        真爬上去（3 / 6 cm 成功）       +2301 / +2731  →  +2363 / +2655（只差 2%）
+        掉头走开（stair15 / 12 训练后） +7480 / +6248  →  **−7222 / −5561**
+        卡在立面前（stair9）            −5150          →  −5490
+
+    即**只打漏洞、不打正解**。
+
+    历史上这里还有一层「俯仰投影补偿」（把机身系速度换算到水平面内沿机头的方向）。
+    课程方向是**世界系**量、本来就不含俯仰投影误差，所以那层在楼梯级被完全取代；
+    留在平地上只有约 1% 的效应，却会破坏「平地逐位不变」这条可测断言，故一并删除。
+    （它当时的推导还犯过一个符号错误 —— 只除以 ``cos``、漏掉 ``− v_world[2]·e_x[2]``，
+    实测比原始读数更差，记录在 ``experience.md`` §21.10。）
+    """
+    if env.stair.n_up > 0:
+        return float(env.base_lin_vel_world[0])
+    return float(env.base_lin_vel_body[0])

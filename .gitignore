@@ -21,6 +21,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# 本地 Claude Code 配置（含本机权限放行），按机器不同，不进版本库
+.claude/settings.local.json
+
 # 编辑器 / 系统
 .vscode/
 .idea/

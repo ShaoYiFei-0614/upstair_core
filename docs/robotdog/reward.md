@@ -66,7 +66,9 @@ def _compute_reward(self, action, trunk_contact, foot_contact=None,
 ### 3.4 `foot_lift` 用目标下限 + 台阶比例（D4）
 
 `lift_target = max(foot_lift_target, foot_lift_step_ratio * step_height)`。5 cm 时
-两项恰好相等（`0.08 = 1.4 × 0.05`，取 `max` 得 `0.08`），所以把目标改成随地形缩放
+两项在这里恰好都是 `0.08`（`1.4 × 0.05 = 0.07`，取 `max(0.08, 0.07)` 仍是 `0.08`——
+**别把这句写成 `0.08 = 1.4 × 0.05`，那个等式是假的**，同文 §6 的字段表写的是对的那种
+说法），所以把目标改成随地形缩放
 **不会**让已经学会的 3~5 cm 阶段回退；而 9 cm 以上时目标才真正抬高（`1.4 × 0.09 =
 0.126`）。
 
@@ -178,7 +180,7 @@ shape = max(0, 1 - x) - track_tail * max(0, x - 1)
 
 | key | 公式 |
 | --- | --- |
-| `forward_vel` | `forward_vel * track`，其中 `err = lin[0] - env._command[0]`（**本步真正采样的指令**，不是 `command.vx`）、`x = \|err\| / rc.forward_track_window`（**绝对**误差窗口 `0.25` m/s，不随指令大小归一化）、`track = max(-1.0, track_shape(x, rc.track_tail))`；`err > 0`（超速）时再减 `min(rc.forward_overspeed * err / rc.overspeed_range, rc.overspeed_cap)`。**线性死区 + 线性尾项 + 有界超速惩罚**：死区在 `\|err\| > forward_track_window` 之后恒 0、梯度消失，尾项让越界仍有梯度，超速是主动选择所以单独有价钱。`forward_track_window = 0.25`、`track_tail = 1.5`（`config.yaml`）、`overspeed_cap = 2.0` 都在 `RewardConfig` |
+| `forward_vel` | `forward_vel * track`，其中 `err = _forward_speed(env) - env._command[0]`（**本步真正采样的指令**，不是 `command.vx`；`_forward_speed` **按地形分两个参照系**（2026-10-12）：**楼梯级返回 `base_lin_vel_world[0]`**（课程方向 —— 楼梯是按 `start_x` 沿 +x 铺开的一条课程），**平地级返回 `base_lin_vel_body[0]`**（那里「前方」就是鼻子，转向本身就是指令的一部分）。楼梯级必须换参照系，否则「掉头背对楼梯走开」完全满足机身系跟踪 —— 实测那样一整回合净赚 +10667，而爬完整条 15 cm 楼梯只值 ≈+1490。离线预验：真爬上去只差 2%，掉头走开由 +7480 翻成 −7222。见 `experience.md` §21.14）、`x = \|err\| / rc.forward_track_window`（**绝对**误差窗口 `0.25` m/s，不随指令大小归一化）、`track = max(-1.0, track_shape(x, rc.track_tail))`；`err > 0`（超速）时再减 `min(rc.forward_overspeed * err / rc.overspeed_range, rc.overspeed_cap)`。**线性死区 + 线性尾项 + 有界超速惩罚**：死区在 `\|err\| > forward_track_window` 之后恒 0、梯度消失，尾项让越界仍有梯度，超速是主动选择所以单独有价钱。`forward_track_window = 0.25`、`track_tail = 1.5`（`config.yaml`）、`overspeed_cap = 2.0` 都在 `RewardConfig` |
 | `orientation` | `orientation * (rpy[0]² + rpy[1]²)` |
 | `torque` | `torque * sum(tau²)` |
 | `foot_lift` | `foot_lift * mean(gate * lift)`；`gate = clip(foot_speed / max(foot_lift_gate_speed,1e-6), 0, 1)`，`foot_speed = ‖(feet - _prev_foot_pos)/control_dt‖`（三维），`lift = clip(clearance / lift_target, 0, 1)` |

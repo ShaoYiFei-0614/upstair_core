@@ -310,7 +310,7 @@ class Go2StairsEnv(gym.Env):
         self._prev_action = np.zeros(self.num_act, dtype=np.float64)
         self._last_action = np.zeros(self.num_act, dtype=np.float64)
         self._step_count = 0
-        # 本回合机身正下方地形曾达到的最大高度，用于「爬升进展」的一次性
+        # 本回合**四足支撑面**曾达到的最大高度（2026-10-12 起；原为机身正下方地形），
         # 结算（见 ``robotdog/reward.py`` 的 ``stair_progress``）。
         self._peak_terrain_height = 0.0
         self._reached_top = False
@@ -797,7 +797,7 @@ class Go2StairsEnv(gym.Env):
         「抬高进展」（否则势函数在整条回合里只增不减，第二次卡住就没有梯度）。
         """
         rc = self.cfg.reward
-        cmd_vx = float(self.cfg.command.vx)
+        cmd_vx = float(self._command[0])         # 采样指令，不是 cfg.command.vx（见 env.md §3.13）
         # 机身系：这是「往前走没走」的判据，世界系分量在机器人偏航时会换号。
         vx = float(self.base_lin_vel_body[0])
         terrain = float(self.terrain_height_under_base)
@@ -994,7 +994,7 @@ class Go2StairsEnv(gym.Env):
         mujoco.mj_forward(self.model, self.data)
 
         self.nominal_pose = float(self.meta.home_qpos[2])
-        self._peak_terrain_height = self.terrain_height_under_base
+        self._peak_terrain_height = self._support_height()   # 足端支撑面，不是躯干 x（见 §2.7）
         self._prev_action = np.zeros(self.num_act)
         self._last_action = np.zeros(self.num_act)
         self._command[:] = self._sample_command()

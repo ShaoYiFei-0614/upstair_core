@@ -4,7 +4,7 @@
 
 **配置层**：把仓根的 `config.yaml` 读成两个已经可直接使用的东西 ——
 :class:`~robotdog.env.EnvConfig`（一个环境实例的全部参数）和
-:class:`~robotdog.curriculum.StageSpec` 列表（八级课程），让 `scripts/train.py` 与
+:class:`~robotdog.curriculum.StageSpec` 列表（当前九级课程），让 `scripts/train.py` 与
 `scripts/play.py` 不必再暴露一堆命令行开关。
 
 ## 2. 职责边界
@@ -191,8 +191,10 @@ raw: dict
 
 默认课程（不写 `curriculum` 段时）来自 `robotdog/curriculum.py` 的
 `STAGE_HEIGHTS_CM`（`(0.0, 0.0, 0.0, 3.0, 6.0, 9.0, 12.0, 15.0)`）与
-`DEFAULT_TREAD`/`DEFAULT_N_UP`（`0.50` m / `8` 级），总预算 1,850,000 步。
-`config.yaml` 显式给出的八级与这套默认值一致。
+`DEFAULT_TREAD`/`DEFAULT_N_UP`（`0.50` m / `8` 级），**默认**总预算 1,850,000 步。
+⚠ 2026-10-12 起 `config.yaml` **不再与这套默认值一致**：它显式给出**九级**、
+总预算 2,408,192 步，并给 3 / 6 cm 各只留 4,096 步 —— 真值以 `config.yaml` 为准
+（重新分配的理由记在 `experience.md` §21）。
 
 ## 7. 与其它模块的关系
 

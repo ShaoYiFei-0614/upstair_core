@@ -15,8 +15,8 @@
 
   策略只学「怎么改」先验，不学怎么抬腿。
 
-课程固定八级：**平地（直走）→ 平地（小指令）→ 平地（全量程指令）→ 3 cm → 6 cm →
-9 cm → 12 cm → 15 cm**，每级在上一级的权重上继续练。前三级故意留在平地，因为
+课程固定九级：**平地（直走）→ 平地（小指令）→ 平地（全量程指令）→ 平地 → 3 cm →
+6 cm → 9 cm → 12 cm → 15 cm**，每级在上一级的权重上继续练。前四级故意留在平地，因为
 「跟着指令横移/转向」与「爬台阶」互不干扰；混在一起学时跟踪会被爬楼的压力淹没。
 入口脚本有三个：
 `scripts/train.py`（训练）、`scripts/play.py`（评估 / 渲染 GIF）、`scripts/teleop.py`
@@ -86,7 +86,9 @@ upstair_core/
   config.yaml                            ★ 全部超参（脚本不再从命令行输入）
   requirements.txt
   artifacts/
-    trot_stairs.json                     trot 开环先验（唯一不可重建的 artifact）
+    trot_stairs.json                     ★ 当前出货先验（trot；搜索脚本未入库 ⇒ 不可重建）
+    walk_stairs.json                     实测**发现**（不是出货配置）：walk 腿相位，满幅下
+                                         零残差即可通 3/4/5/6 cm —— 正因如此被降级，见 experience.md §21
   models/unitree_go2/                    vendored Go2 MJCF + 网格 + scene.xml
   robotdog/                              库代码（分层见 docs/README.md）
     __init__.py      包入口（只重导出工具层，导入时不修控制台）
@@ -217,7 +219,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 
 | 项 | 默认 | 口径 |
 | --- | --- | --- |
-| `forward_vel` | **+10.0** | 机身系 `vx` 对指令的**绝对**误差窗口线性死区：`err = vx - env._command[0]`、`x = \|err\| / forward_track_window`（常数窗口 `0.25` m/s，**不随指令大小归一化**）、`shape = max(0,1-x) - track_tail*max(0,x-1)`，超速侧（`err > 0`）再减 `forward_overspeed * err / overspeed_range`（有 `overspeed_cap` 上界）。目标取**本步真实采样的指令** `env._command[0]`，不是 `cfg.command.vx` —— 后者只是「采样范围为空」时的回退定值，`set_commands` 不改它、会一直停在出厂值上：课程 `vx ∈ [0.05,0.20]` 而 `cfg.command.vx = 0.55` 时旧写法恒 `\|err\| ≥ 0.35`、`shape` 一步撞死在下界 −1、`forward_vel` 每步恒 −10；修正后同一条零残差回合的回报从 **−8429.7 升到 +1571.5**。**读机身系不读世界系**：世界系 x 是位姿导数，机器人自转时会在步态周期内换号 |
+| `forward_vel` | **+10.0** | 机身系速度对指令的**绝对**误差窗口线性死区（2026-10-12 起速度口径换成 `_forward_speed(env)` = **楼梯级用课程方向**（`base_lin_vel_world[0]`，楼梯是按 `start_x` 沿 +x 铺开的一条课程）／**平地级用机身系**（`base_lin_vel_body[0]`）：`err = _forward_speed(env) - env._command[0]`、`x = \|err\| / forward_track_window`（常数窗口 `0.25` m/s，**不随指令大小归一化**）、`shape = max(0,1-x) - track_tail*max(0,x-1)`，超速侧（`err > 0`）再减 `forward_overspeed * err / overspeed_range`（有 `overspeed_cap` 上界）。目标取**本步真实采样的指令** `env._command[0]`，不是 `cfg.command.vx` —— 后者只是「采样范围为空」时的回退定值，`set_commands` 不改它、会一直停在出厂值上：课程 `vx ∈ [0.05,0.20]` 而 `cfg.command.vx = 0.55` 时旧写法恒 `\|err\| ≥ 0.35`、`shape` 一步撞死在下界 −1、`forward_vel` 每步恒 −10；修正后同一条零残差回合的回报从 **−8429.7 升到 +1571.5**。**楼梯级刻意读世界系 x**：因为「前方」在楼梯上只能是课程方向 —— 只跟踪机身系时，掉头背对楼梯走开就是最优解（实测一整回合 +10667，而爬完整条 15 cm 楼梯只值 ≈+1490）。平地段仍读机身系，那里转向是指令的一部分。见 `experience.md` §21.14 |
 | `command_follow` | 见下 | 横向 / 偏航指令的跟踪项，**只在对应指令范围非零时才计**（见下方说明） |
 | `orientation` | -1.2 | `roll² + pitch²` |
 | `torque` | -1.5e-4 | `Σ tau²` |
@@ -231,9 +233,9 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 | `leg_collision` | -0.25 | 小腿/大腿碰地，逐帧 |
 | `body_collision` | -1.2 | 躯干碰地，逐帧（同一次清理里从 -4.0 降到 -1.2；GIF 复盘显示 -4.0 把「贴着立面蹭」罚得比站桩还狠） |
 | `alive` | +0.15 | 每步存活（**故意小**：0.4 时占「站桩」回合回报的 49%） |
-| `stair_progress` | +3.0 | **一次性结算**：只在刷新本回合最高台阶时付 `max(0, 新最高 - 旧最高)`（站桩拿不到第二次） |
+| `stair_progress` | **+1200.0** | **一次性结算**：只在刷新本回合最高台阶时付 `max(0, 新最高 - 旧最高)`（站桩拿不到第二次）。2026-10-12 由 `+3.0` 提到这个量级 —— 原值下**爬完整条 15 cm 楼梯只值 +3.60**，而 9 cm 上站着不动一回合净账 −371、`command_follow` 一项就白付 +4616，爬升在账面上没有梯度（`experience.md` §21） |
 | `success` | **+50.0** | 一次性，到达顶端平台 |
-| `termination` | **-15.0** | 一次性，摔倒/终止 |
+| `termination` | **-5000.0** | 一次性，摔倒/终止（必须远大于「单步奖励量程 × 回合步数」，否则「早摔倒」会成为最优解） |
 
 两个关键点：
 
@@ -243,7 +245,7 @@ target = clip(target, act_low, act_high)          # 不 clip 到 ±1
 * 奖励账目恒等：`_compute_reward()` 返回的 `reward` 恒等于 `sum(reward_terms.values())`
   （`terms["terminal"]` 记 `+success` 或 `-termination`），所以 tensorboard 里的逐项
   拆解可以安全地相加。
-* **成功/终止的权重被刻意放大**（`success=+50.0` / `termination=-15.0`，都在
+* **成功/终止的权重被刻意放大**（`success=+50.0` / `termination=-5000.0`，都在
   `robotdog/reward.py:101-102`）。这是实测能让 PPO 残差
   幅度增长的最强杠杆。
 
@@ -394,7 +396,8 @@ curriculum.reward_overrides:
 ```
 
 按 `config.yaml` 的 `curriculum` 段串行训练（默认平地 → 平地 → 平地 → 3 → 6 → 9 → 12 → 15 cm），
-每级在上一级的权重上 warm-start。默认预算合计 **1,850,000 步**（平地 100k + 7 × 250k），
+每级在上一级的权重上 warm-start。默认预算合计 **2,408,192 步**（平地 150k + 3 × 250k
++ 3 cm / 6 cm 各 4,096 + 9 / 12 / 15 cm 各 500k；2026-10-12 重新分配，见 `experience.md` §21），
 8 环境单进程约 320~400 步/s。
 
 **脚本只认两个开关**，其余全部来自 `config.yaml`：
@@ -503,7 +506,7 @@ GIF 用 Pillow 写，**全片共用一套调色板**（先取 16 帧拼缩略 mo
 * 地形由**权重自带的 `<模型>_env.json`** 决定；老权重（在本轮配置化之前训的）没有这个
   文件，会退回 `stair_from_height` 的默认 3 cm，需要手动在 `config.yaml` 里写
   `play.stage_height_cm`。相机/分辨率/帧率/缩放则**没有** yaml 开关，见 §4.3。
-* **本仓的课程是固定八级**，没有自动晋级/回退、没有域随机化、没有高度带混合。
+* **本仓的课程是固定九级**，没有自动晋级/回退、没有域随机化、没有高度带混合。
 * **单次训练的成功率不可当结论用**。同一份 `config.yaml` 只换 `run.seed`，3 cm 单级
   的 250,000 步训练在 **36%~72%** 之间摆动（三次运行的实测，见 `experience.md` §14）。
   比两个改动之前，必须在同一 seed 集合上各跑至少 3 次；判据以 GIF 里的姿态为主。

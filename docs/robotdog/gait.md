@@ -23,7 +23,7 @@
 * **不含闭环**：不读 qpos/qvel、不做平衡、不知道台阶，相位纯由外部累加的时间 `t` 决定；
 * 不做 PD 控制、不写 `mjData`、不碰 MuJoCo；
 * 不决定「先验开不开」——`gait_prior` / `gait` / `gait_gain` 都是 `EnvConfig` 的字段，
-  `_gait_action()`（`robotdog/env.py:1141`）才决定要不要用它；
+  `_gait_action()`（`robotdog/env.py:1045`）才决定要不要用它；
 * 不决定观测里有没有步态时钟——那是 `ObsConfig.gait_phase`（`robotdog/env.py:67`，
   观测块在 `robotdog/env.py:687-688`）；
 * **不做相位随机化**：`gait_phase_randomize` 字段已从 `EnvConfig` 删除，
@@ -72,7 +72,7 @@ target = home + gait_gain * gait.radians(t) + action_scale * action
 ```
 
 `gait.action_scale` 说「先验动作多大」（它是搜索出来的一部分），
-`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:1033-1051` 的 `_target_from_action()`）。
+`cfg.action_scale` 说「策略能偏离多少」（`robotdog/env.py:1059-1077` 的 `_target_from_action()`）。
 `gait_gain` 默认 `1.0` 且**没有 CLI 开关**，只能改 `cfg`。
 
 **被否决的方案**：共用一个 `action_scale`（先验与策略同权）。否决原因就是上面那条实测：
@@ -284,7 +284,7 @@ EnvConfig()
 Go2StairsEnv.step(action)                                    # robotdog/env.py:1079
   → self._gait_phase = self._gait_t                          # env.py:1093（本步实际用的相位）
   → self._target_from_action(action)                         # env.py:1094
-    → self._gait_action()                                    # env.py:1054
+    → self._gait_action()                                    # env.py:1045
        若 not cfg.gait_prior 或 cfg.gait_gain == 0.0 → zeros(12)
        否则 → cfg.gait_gain * cfg.gait.radians(self._gait_phase)
               → GaitParams.radians(t)                        # gait.py:94
@@ -293,8 +293,8 @@ Go2StairsEnv.step(action)                                    # robotdog/env.py:1
                     → GaitParams.leg_phases(t)               # gait.py:77
                     → GaitParams._calf_wave(p + ph_ca)       # gait.py:68
   → target = home + _gait_action() + cfg.action_scale * action
-  → np.clip(target, act_low, act_high)                       # env.py:1100
-  → self._gait_t += cfg.control_dt                           # env.py:270（20 ms）
+  → np.clip(target, act_low, act_high)                       # env.py:1077
+  → self._gait_t += cfg.control_dt                           # env.py:1095（20 ms）
 ```
 
 **观测里的步态时钟**（`ObsConfig.gait_phase=True`，每帧 2 维）：
@@ -487,7 +487,7 @@ JSON 文件自身的其它键：`objective="stairs"`、`target_speed=null`、`st
   `ValueError: {path} has no 'top' entries` 或 `IndexError` 上炸掉。
 * **两个 `action_scale` 同名但不同义**：`GaitParams.action_scale`（出货值 `1.0`）是
   「先验幅度」，`EnvConfig.action_scale`（`0.30`）是「策略权限」。源码里没有任何一处把
-  两者相加或相乘后再 clip；`_target_from_action()` 的真实实现（`robotdog/env.py:1033-1051`）是
+  两者相加或相乘后再 clip；`_target_from_action()` 的真实实现（`robotdog/env.py:1059-1077`）是
   `target = clip(home + gait_gain*gait.radians(t) + cfg.action_scale*action, act_low, act_high)`
   ——clip 的是最终关节目标（用 MJCF 关节限位），没有「先求和再 clip 到 ±1」这一步。
   `grep "action_scale"` 会同时命中两处，对账时注意区分。以代码为准。

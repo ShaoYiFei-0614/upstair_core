@@ -253,15 +253,20 @@ RESULT: ALL CHECKS PASSED
 
 ### 8.1 观测
 
-* 当前 `config.yaml`：`history_len: 1` ⇒ **48 维**（每帧 `base_frame_size=42` + `base_lin_vel_body` 3 + `step_height` 1 + **指令块 2**）。
-* 观测是**盲走**的：48 维全部有真机出处（关节编码器 / IMU / 上一步动作 /
+* 当前 `config.yaml`：`history_len: 1` ⇒ **51 维**（每帧 `base_frame_size=42` +
+  `base_lin_vel_body` 3 + `step_height` 1 + **指令块 3** + `vel_filter` 2）。
+  关掉 `obs.vel_filter` 则是 49 维。**本节旧版写的「48 维、指令块 2 维」是错的**；
+  真值以 `ObsConfig.frame_size` 为准 —— 每次改动跑 `.tmp/check_cfg_walk.py`
+  会自检 `cfg.obs.size == 51`。
+* 观测是**盲走**的：51 维全部有真机出处（关节编码器 / IMU / 上一步动作 /
   本体感觉估计 / 上层指令）+ 一个标量任务参数 `step_height`；没有触觉、没有射线、没有接触力读数。
   逐项出处与「哪些量是真值但只进奖励」见 §8.6。
 * **`obs.base_height` 被硬性禁止**（`ObsConfig.__post_init__` 抛 `ValueError`）：
   它含地形真值。见 §8.6。
-* **`obs.command` 恒真**：那 2 维是 `[vy, wz]` 指令（`vx` 定值、不进观测）。PPO 的网络与
-  RolloutBuffer 维数不可变，所以**课程只能改指令范围不能开关这 2 维**。
-* **单帧（48 维）不亏**：课程内每级都不差，3 cm 62% → 92%、6 cm 0% → 22%；课程外
+* **`obs.command` 恒真**：那 3 维是 `[vx, vy, wz]` **三轴**速度指令 —— `vx` 也在观测
+  里，不是定值。PPO 的网络与 RolloutBuffer 维数不可变，所以**课程只能改指令范围、
+  不能开关这 3 维**。
+* **单帧（51 维）不亏**：课程内每级都不差，3 cm 62% → 92%、6 cm 0% → 22%；课程外
   3 cm / 5 cm 都是 100%（10 帧基准是 50% / 0%）。50 Hz 下相邻帧几乎相同，10 帧绝大部分冗余。
   代价是失去帧内的隐式速度信息。
 
@@ -269,8 +274,11 @@ RESULT: ALL CHECKS PASSED
 
 * `env.gait_prior: false` ⇒ 完整课程**全 0% 成功、0% 摔倒、每回合跑满 1000 步**，
   `mean|a| ≈ 0.09`（基准 0.18）—— 机器人原地站到超时，一次都不摔。
-* 原因是 `action_scale = 0.30 rad` 是**按残差**设计的；去掉先验后网络要同时从零学步态
-  与平衡。真要去掉，得先把 `action_scale` 放大到接近 gait 自身的 1.0 rad 并重训。
+* 原因是 `action_scale` 是**按残差**设计的；去掉先验后网络要同时从零学步态与平衡。
+  真要去掉，得先把 `action_scale` 放大到接近 gait 自身的 1.0 rad 并重训。
+  ⚠ 当前值是 **0.60 rad**，不是本节旧版写的 0.30；依据在 `config.yaml` 的
+  `env.action_scale` 注释里（速度参数化后要够到指令带低档，得靠 ≈0.42~0.53 rad 的
+  常值偏置刹车，0.30 的上限根本压不下来）。
 * 这条已经写进 `config.yaml` 的注释里，**不要再当成一个"可以试试的开关"**。
 
 ### 8.3 能力带与健康指标
@@ -280,6 +288,11 @@ RESULT: ALL CHECKS PASSED
 * `mean|a|` 是判断"学习是否真的发生"的关键量：**≈ 0.42 代表真的在学**，0.02~0.10 意味着
   策略被压回站桩。11 cm 一直过不去，且开环调参先验（18 组 × 3 高度）**全部失败** ——
   缺的是摆动相里的向前落脚，不是抬腿高度。
+* **⚠ 2026-10-12 的边界更新**：`artifacts/walk_stairs.json`（walk 腿相位）在**满幅零残差**
+  下就能让 3/4/5/6 cm 全通、上楼速度还落在指令带内；但**先验不得成为楼梯的解**（用户要求），
+  所以它被降级为实测发现、出货先验仍是 trot。与此同时实测到一件反直觉的事：
+  **在先验已经够用的级上继续训 RL，会把它弄坏**（3 cm 由 4/4 掉到 0/5）。完整数据、
+  量级失衡的标定与新的课程预算见 `experience.md` §21。
 
 ### 8.4 删代码时的三类假死
 
@@ -307,7 +320,7 @@ RESULT: ALL CHECKS PASSED
   hip/thigh 用 `(30, 0.6)`、calf 用 `(45, 0.9)`；对应阻尼比 0.30 / 0.31 / 0.53。
   推导表在 `README.md` §3.1。
 * **归档 checkpoint 与新代码不兼容**：`runs/course22_ref/*` 是 660 维、
-  `runs/course22_improved/*` 是 740 维、`runs/normab_*` 是 420 维，而当前是 48 维；
+  `runs/course22_improved/*` 是 740 维、`runs/normab_*` 是 420 维，而当前是 51 维；
   且它们**都没有 `_env.json`**。**加载它们会 shape mismatch，这是预期行为，不是回归。**
   端到端评估只能用本轮自己训出来的 run（如 `runs/ab_base`、`runs/ab_hist1`）。
 * `robotdog/training.py` 的 `load_policy()` **会把 `*_vecnormalize.pkl` 装回模型自带的
@@ -335,7 +348,7 @@ RESULT: ALL CHECKS PASSED
 本仓是**盲走**的。任何人碰 `_obs_frame()` / `reward.py` / `_fall_reference_height()`
 之前，先看这张表 —— 「这个量是真机拿得到的吗」是本仓最容易悄悄搞错的一件事。
 
-**`_obs_frame()` 里的 48 维，逐项都有真机出处：**
+**`_obs_frame()` 里的 51 维（打开 `obs.vel_filter` 后），逐项都有真机出处：**
 
 | 观测块 | 维 | 真机出处 |
 |---|---|---|
@@ -345,12 +358,14 @@ RESULT: ALL CHECKS PASSED
 | `base_ang_vel_body` | 3 | IMU 陀螺 |
 | `_last_action` | 12 | 上一步自己下发的指令 |
 | `base_lin_vel_body` | 3 | 本体感觉估计（腿式里程计） |
-| `[vy, wz]` 指令 | 2 | **上层控制器下发的指令**（遥控） |
+| `[vx, vy, wz]` 指令 | 3 | **上层控制器下发的指令**（遥控 / 上游规划器） |
+| `filtered_lateral_vel` / `filtered_yaw_rate` | 2 | 本体感觉估计再低通（`obs.vel_filter`；本仓 `config.yaml` 打开） |
 | `step_height` | 1 | **任务参数，不是传感器读数** |
 
 `step_height` 是唯一一个非传感器项，但它是**标量任务参数**：真机上可以随任务下发
-（「现在爬 8 cm 的楼梯」），所以可接受。它**不含**「下一级立面在哪」。指令那 2 维同理：
-它是别人给机器人的目标，不是机器人偷看的环境真值。
+（「现在爬 8 cm 的楼梯」），所以可接受。它**不含**「下一级立面在哪」。指令那 3 维同理：
+它是别人给机器人的目标，不是机器人偷看的环境真值；`vel_filter` 那 2 维是本体感觉
+估计量的低通值，同样不含地形真值。
 
 **五个使用真值、但只进奖励/终止、绝不进观测的量**（这是允许的：奖励与终止本来就
 是上帝视角；**一旦写进 `_obs_frame` 就破坏盲走**）：
