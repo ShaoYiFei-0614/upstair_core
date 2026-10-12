@@ -229,11 +229,11 @@ def _stage_limits(path: Path, height: float) -> tuple[float, float] | None:
 
 
 def command_limits(stair, raw: dict, model_path) -> tuple[float, float, str]:
-    """本回合驱动的那一级的 ``(vy_max, yaw_max, 来源)``。
+    """本回合驱动那一级的 ``(vy_max, yaw_max, 来源)``。
 
-    优先级：``plan.json``（训练**实际下发**的值）→ ``summary.json``（训练记录）
-    → 当前 ``config.yaml`` 的同名级 → 演示默认值。权重自带的 ``_env.json`` 只记
-    ``config.yaml`` 的基线（``vy_max``/``yaw_max`` 常常是 0），不能当训练量程用。
+    优先级：plan.json（训练实际下发值）→ summary.json（训练记录）→ 当前
+    config.yaml 同名级 → 演示默认值。权重自带的 ``_env.json`` 只记配置基线，
+    **不能**当训练量程用。
     """
     height = round(float(stair.step_height), 6)
     root = Path(model_path).parent

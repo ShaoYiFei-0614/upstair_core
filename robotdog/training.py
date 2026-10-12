@@ -1,19 +1,9 @@
 """训练基础设施：向量化环境 + PPO + 运行目录 + 模型加载。
 
-**单进程约束**：沙箱禁止 Windows 命名管道，``SubprocVecEnv`` / ``multiprocessing``
-会 ``PermissionError: [WinError 5]``，所以「并行 8 个环境」只能实现为
-``DummyVecEnv(8)``——同一进程里顺序推进 8 个环境。``mj_step`` 不释放 GIL，换线程池
-没有收益。实测 250~400 向量步/秒。
-
-**观测归一化必须开**：关节速度（±20 rad/s）与关节角（±3 rad）量纲差三个数量级，
-不归一化时 critic 完全拟合不动。
-
-**奖励归一化默认开**：早期版本默认关闭（理由是课程切换地形后奖励尺度会漂移）。
-但本项目的奖励里侧向惩罚项曾经主导每一步（实测 ``straight_line`` 一项占 72.7%，
-``forward_vel`` 只贡献 +0.356），挣扎中的策略每回合回报接近 -6000，critic 的
-``explained_variance`` 长期停在 0.01 附近，PPO 于是把策略压回「几乎不动」的极小
-残差。打开奖励归一化后残差才开始增长。唯一例外是 warm-start 一个**未归一化**训出来
-的权重：那时统计量对不上，应当关掉。
+**单进程约束**：沙箱禁止 Windows 命名管道，``SubprocVecEnv`` 不可用，只能
+``DummyVecEnv`` 串行推进；``mj_step`` 不释放 GIL，线程池没有收益。
+**观测归一化必须开、奖励归一化默认开**：不归一化时关节速度与关节角量纲差三个
+数量级、critic 拟合不动；惩罚主导时残差学不起来。实测依据见 ``experience.md`` §4。
 """
 
 from __future__ import annotations
@@ -116,14 +106,10 @@ def build_ppo(
 ) -> PPO:
     """构造 PPO。
 
-    ``log_std_init=-2.0``（归一化动作单位下 std ≈ 0.135）很关键：默认的 0.0 意味着
-    std = 1.0，即残差每一步都把关节目标顶满 ±``action_scale``，对站立的四足来说就是
-    纯噪声。但也不能设得过小——如果残差恒为 0，策略就退化成「纯开环步态」，永远学不会
-    爬楼梯（旧课程里出现过 ``mean|a| = 0.011``、``|a| < 0.05`` 占 99.9% 的退化）。
-
-    ``batch_size`` 与 ``n_steps * n_envs`` 不整除时 SB3 会 warn。训练时 8 环境
-    （2048）整除，但**推理时只建 1 个环境**（256）就会触发；那条警告对只做
-    ``predict`` 的场景没有意义，这里直接压掉。
+    ``log_std_init=-2.0``（归一化动作单位下 std ≈ 0.135）是折中：默认 0.0 让残差
+    每步顶满 ``action_scale``、等于纯噪声；过小则残差恒零、退化成纯开环步态。
+    ``batch_size`` 与样本数不整除时 SB3 会 warn —— 对只做 ``predict`` 的推理场景
+    无意义，定向压掉。
     """
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*mini-batch size.*",
@@ -164,17 +150,11 @@ def load_policy(
 ) -> tuple[PPO, ObsNorm | None]:
     """加载一个 checkpoint，返回 ``(模型, 观测归一化统计)``。
 
-    归一化统计来自同目录同名的 ``*_vecnormalize.pkl``。**不还原它，策略就会拿到按
-    ``mean=0 / var=1`` 归一化的输入，而训练时看到的是真统计**——等于换了一套输入
-    坐标系，确定性评估会从 100% 掉到 0%。所以这里做两件事：
-
-    1. 读裸 pickle，把 ``obs_rms.mean/var`` 拷成 :class:`~robotdog.policy.ObsNorm`
-       返回给调用方（``VecNormalize`` 对象本身不能随便访问属性，多读一个不存在的
-       名字就 ``RecursionError``）；
-    2. 用 :func:`restore_vecnormalize` 把同一份统计量**装回模型自带的 VecEnv**。
-       少了这一步，``model.get_env()`` 拿到的包装器还是 ``mean=0 / var=1``，经它
-       评估等于喂未归一化的观测 —— 同一个权重走 ``model.get_env()`` 和走裸
-       ``Go2StairsEnv`` 会给出相反结论（3 cm 上前者 0% 摔倒、后者 100% 成功）。
+    统计量来自同目录同名的 ``*_vecnormalize.pkl``，**必须装回模型自带的
+    ``VecNormalize``**（``restore_vecnormalize``）—— 只返回一份拷贝而不装回的话，
+    ``model.get_env()`` 路径等于喂未归一化的观测，与裸 env 路径给出相反的评测
+    结论（experience.md §5.9）。网络结构用 checkpoint 里保存的那一套
+    （``policy_arch``），不用默认值建网。
     """
     model_path = Path(model_path)
     if not model_path.is_file() and model_path.with_suffix(".zip").is_file():

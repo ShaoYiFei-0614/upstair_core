@@ -1,28 +1,14 @@
 """由 Unitree Go2 的 MJCF 加上自定义地形组装出 MuJoCo 场景。
 
-vendored 的 `models/unitree_go2/go2.xml` 永不被修改。本模块改为读取它，
-把地形几何注入 worldbody，再把结果编译成一个自包含的 MJCF 字符串。
+vendored 的 ``models/unitree_go2/go2.xml`` 永不被修改。本模块读取它，把地形几何
+注入 worldbody，再把结果编译成自包含的 MJCF 字符串。注入点（都在 Go2 文档内部）：
+``<asset>`` 追加地面纹理/材质、``<worldbody>`` 追加地形与灯光、``<option>``
+覆盖 timestep / integrator / gravity。
 
-元素注入点（都在 Go2 文档内部）：
-    <asset>      -> 地面额外需要的 texture/material          （追加）
-    <worldbody>  -> 地形 geom、灯光                          （追加）
-    <option>     -> timestep / integrator / gravity 覆盖     （修改）
-
-`<include>` 被刻意弃用：MuJoCo 把相对资源目录解析到*主*文件上，而从字符串
-编译时根本没有主文件目录可解析。
-
-网格资源与非 ASCII 路径
------------------------
-本工作区位于 ``D:\\项目\\RobortDog\\upstair_core``。MuJoCo 的资源读取器通过
-Windows ANSI 代码页解析窄字符（``const char*``）文件名，所以把 ``meshdir``
-指向中文路径会失败并报出::
-
-    Error opening file 'D:/<mojibake>/models/unitree_go2/assets/base_0.obj'
-
-``mujoco.MjVfs`` 只向 Python 暴露 ``close()``，所以自定义 VFS 回调不可用。
-受支持的修法是 ``MjModel.from_xml_string`` 接受的 ``assets`` 映射：它直接从
-内存提供文件内容，完全不碰文件系统。所以我们保留原本的相对路径
-``meshdir="assets"``，并始终传入 :func:`go2_assets`。
+``<include>`` 被刻意弃用：MuJoCo 把相对资源目录解析到*主*文件上，而从字符串
+编译时没有主文件目录可解析。网格资源经 :func:`go2_assets` 从内存提供 ——
+本工作区路径含中文，MuJoCo 的窄字符文件读取会失败，内存 assets 完全绕开
+文件系统（见其 docstring）。
 """
 
 from __future__ import annotations
@@ -211,12 +197,8 @@ def build_scene_xml(
 
 
 def default_floor_geom(z: float = 0.0, size: float = 60.0) -> str:
-    """位于高度 ``z`` 的一块带贴图的无限平面。
-
-    这块平面带 ``group=TERRAIN_GEOM_GROUP``，这样 :mod:`robotdog.tools.touch`
-    里的前向测距能看到地面，却永远看不到机器人。选这个 group 要小心 ——
-    MuJoCo 默认隐藏 group 3-5，选错会让整个世界从渲染里消失。
-    """
+    """位于高度 ``z`` 的带贴图地面平面（group 同 :data:`TERRAIN_GEOM_GROUP`，
+    保证渲染可见且接触判定与楼梯同口径）。"""
     return (
         f'<geom name="floor" type="plane" pos="0 0 {z:g}" size="{size:g} {size:g} 0.05" '
         f'condim="3" friction="0.9 0.005 0.0001" material="groundplane" '

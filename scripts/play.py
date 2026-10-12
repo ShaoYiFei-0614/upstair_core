@@ -245,14 +245,11 @@ def draw_hud(frame: np.ndarray, lines: Sequence[str]) -> np.ndarray:
 
 
 def write_gif(path: Path, frames: Sequence[np.ndarray]) -> Path:
-    """把 RGB 帧编码成 GIF（帧率 :data:`GIF_FPS`、缩小 :data:`GIF_SCALE`），全片共用一套调色板。
+    """把 RGB 帧编码成 GIF（全片共用一套调色板）。
 
-    先取若干帧拼成缩略 mosaic 求全局调色板，再逐帧用它量化。逐帧各自
-    ``quantize()`` 会让同一只狗在不同帧里换颜色（GIF 只有 256 色，必须共用）。
-
-    内存上**不能**先把所有帧转成 RGB 一起留着：一回合 200 帧 × 1920×1080 的
-    RGB 就是约 6 GB（曾因此 ``MemoryError``）。所以按「逐帧转 → 立刻量化成 P 模式
-    → 丢掉 RGB」的流式做法，峰值只有单帧成本，而调色板只从抽样的 16 帧缩略图求。
+    先取若干帧拼缩略 mosaic 求全局调色板，再逐帧套用 —— 逐帧各自量化会让同一只
+    狗在不同帧里换色。按「逐帧转 → 立刻量化成 P 模式 → 丢掉 RGB」流式处理，
+    峰值内存只有单帧成本。
     """
     if not frames:
         raise ValueError("没有帧可以写入 GIF")
@@ -335,22 +332,12 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
                 max_frames: int = 0) -> EpisodeOutcome:
     """跑一个回合；``capture=True`` 时每 ``FRAME_STRIDE`` 步取一帧。
 
-    ``max_frames`` 给定时先按它反算一个「至少 ``FRAME_STRIDE`` 的步幅」，只到那时
-    才取帧。渲染帧是 960×540 的 uint8（一帧约 1.5 MB），回合可能拖到 500 步以上，
-    而一回合只占 GIF 里的一小段 —— 不设上限时逐阶段累积会把内存吃光（曾因此
-    ``MemoryError``）。``0`` 表示不限制（``cmd_demo`` / ``teleop`` 那种单个短片用）。
+    ``max_frames`` 给定时按它反算稀疏步幅（渲染帧很大，不设上限曾把内存吃光）；
+    ``0`` 表示不限制。
 
-    ⭐ 回合开始后**必须把指令钉住**，而且 :meth:`Go2StairsEnv.set_command_now`
-    要在 ``reset()`` **之后**调 —— ``reset()`` 会按 ``command_vy_max`` /
-    ``command_yaw_max`` 重抽指令，把之前写进去的覆盖掉。不钉的话，同一个权重
-    每次回放的指令都不一样，GIF 里机器人一会儿横着走一会儿转圈，看的人会误以为
-    它「不听指挥」；钉住之后回放是确定的，也与 ``.tmp/eval_run.py`` 的评估口径一致。
-
-    ``command`` 给定时用它（顺序 ``vx, vy, yaw_rate``），否则沿用 ``cfg.command``
-    当前那一条。**每个课程阶段的量程不同**，所以调用方应当用
-    :func:`robotdog.config.command_for_stage` 挑一条该级量程内的指令。
-
-    ``reset()`` 返回的 ``obs`` 是在钉指令**之前**算出来的，所以要用
+    ⭐ 回合开始后**必须把指令钉住**，且 :meth:`Go2StairsEnv.set_command_now` 要在
+    ``reset()`` **之后**调 —— reset 会按量程重抽、覆盖之前写入的指令；钉住之后
+    回放是确定的。``reset()`` 返回的 obs 是钉指令之前算的，要用
     :meth:`Go2StairsEnv._observation` 重取一份。
     """
     obs, _ = env.reset(seed=seed)
@@ -527,9 +514,8 @@ def _default_height_cm(play: dict[str, Any], target: PlayTarget) -> float | None
     """播放用哪条楼梯。
 
     优先 ``config.yaml`` 的 ``play.stage_height_cm``（显式覆盖）；否则读权重旁
-    ``<模型>_env.json`` 里记的该 checkpoint 训练时的台阶高（**每个 checkpoint 的
-    地形都不一样**，只有最后一级是 15 cm）；再没有就返回 ``None``，由
-    ``stair_from_height(None)`` 落到裸 ``StairSpec()`` 的默认（5 cm × 8 级）。
+    ``<模型>_env.json`` 记录的该 checkpoint 训练时台阶高（每个 checkpoint 的地形
+    都不一样）；都没有返回 ``None``，落到裸 ``StairSpec()`` 的默认（5 cm × 8 级）。
     """
     if play.get("stage_height_cm") is not None:
         return float(play["stage_height_cm"])
@@ -569,27 +555,20 @@ def _gif_dir_for(gifs_root: Path, stage: RenderStage) -> Path:
 
 
 def _stages_from_run(run_root: Path | None) -> list[dict[str, Any]]:
-    """从运行目录的 ``summary.json`` 读「训练时真正跑过哪些阶段、每级什么口径」。
+    """从运行目录 ``summary.json`` 读「训练时真正跑过哪些阶段、每级什么口径」。
 
-    为什么需要它：``auto`` 原来只按**当前** ``config.yaml`` 的课程名去对
-    ``checkpoints/<名字>_final.zip``，于是「改过课程再去看老运行」会静默漏渲染
-    （cmdtrack6 是按 6 级全平地的临时课程训的，用当前课程的 6 级名去对只剩 3 个能对上，
-    另外 3 级的 GIF 无声消失）。这里直接读训练记录，名字、高度、**逐级指令量程与
-    成功口径**都是当时的真值。
-
-    返回原始 dict 列表（缺字段由调用方兜底），读不到就返回空列表。
+    不按当前 config.yaml 对阶段名：改过课程再看老运行会静默漏渲染。训练记录里的
+    名字、高度、逐级口径都是当时的真值。读不到返回空列表。
     """
     raw = read_json_or(None if run_root is None else run_root / "summary.json", {})
     return [st for st in (raw.get("stages", []) or []) if st.get("name")]
 
 
 def _plan_entries(run_root: Path | None) -> dict[str, dict[str, Any]]:
-    """读 ``runs/<run>/plan.json``：**每一级实际生效的**指令量程与奖励覆盖。
+    """读 ``runs/<run>/plan.json``：每一级**实际生效**的指令量程与奖励覆盖。
 
-    为什么它优先于 ``summary.json``：后者记的是「这一级跑了多久、学得怎么样」，
-    逐级量程虽然也有，但它是从阶段表抄来的；``plan.json`` 是训练时真正下发到子
-    环境的实施记录，也是唯一记了逐级 ``reward_overrides`` 的地方。旧运行没有
-    这个文件，所以调用方必须能退回 ``summary.json``。读不到就返回空 dict。
+    它优先于 ``summary.json``（后者从阶段表抄来；这是唯一记了逐级
+    ``reward_overrides`` 的地方）。旧运行没有这个文件，调用方必须能退回。
     """
     raw = read_json_or(None if run_root is None else run_root / "plan.json", None)
     if isinstance(raw, list):           # 早期形状：带 name 字段的列表
@@ -600,14 +579,11 @@ def _plan_entries(run_root: Path | None) -> dict[str, dict[str, Any]]:
 
 
 def _spec_from_json(obj: Any) -> StageSpec | None:
-    """按 ``summary.json`` / ``plan.json`` 里记的**逐级下发值**重建 :class:`StageSpec`。
+    """按训练记录里的**逐级下发值**重建 :class:`StageSpec`（只用来查口径）。
 
-    只用它来查「这一级当时的下发值」（指令量程、预算、学习率）——
-    地形仍然由权重自带的 ``env.json`` 决定（``stair=...`` 传进环境），所以这里
-    的 ``spec`` 字段只是个占位，不参与回放。
-
-    返回 ``None`` 表示这份记录还没有这些字段（本仓 2026-06 之前的运行都没有），
-    调用方应当退回 ``config.yaml`` 的同名级，并**明确告诉用户**这是推断值。
+    地形仍由权重自带的 ``env.json`` 决定，这里 ``spec`` 字段只是占位。
+    返回 ``None`` 表示记录缺这些字段（老运行），调用方应退回当前课程并**明确
+    告诉用户**这是推断值。
     """
     if "command_vy_max" not in obj:
         return None
@@ -645,28 +621,15 @@ def _stage_plan(cfg: dict[str, Any], play: dict[str, Any], target: PlayTarget,
                 run: str, only: str | None) -> list[RenderStage]:
     """``gif`` 模式要渲染哪些阶段（地形 × 指令）。
 
-    ⭐ **平地级必须也在内**：``config_to_stages`` 前几级就是平地（``flat`` /
-    ``flat_2`` …），它们带横向/偏航指令，是判断「跟不跟指令」的唯一画面证据；
-    只渲染台阶段会看不到指令跟踪这一半的能力。
+    ⭐ **平地级必须在内** —— 它们带横向/偏航指令，是判断「跟不跟指令」的唯一
+    画面证据，只渲染台阶级会漏掉指令跟踪这一半能力。
 
-    ``play.stages``：
+    ``play.stages``：``auto``（缺省）优先用运行目录的训练记录（summary.json +
+    plan.json 的逐级下发值，都是当时的真值），没有记录退回当前课程并打印 ⚠；
+    ``curriculum`` 强制全部级；其他 = 阶段名或高度列表。
 
-    ``"auto"``（缺省）
-        运行目录里有 ``summary.json`` 就用它记的**训练阶段**（名字、高度、逐级指令
-        量程与成功口径都是当时的真值），否则退回「当前课程里能对上
-        ``checkpoints/<阶段>_final.zip`` 的那几级」，再退到当前课程全部级。
-    ``"curriculum"``
-        强制渲染当前配置课程的全部级。
-    其他
-        阶段名列表，或高度列表（cm）。
-
-    ⭐ **回放口径必须来自训练记录**：``command_vx`` / ``command_vy_max`` /
-    ``command_yaw_max`` 都是**课程逐级下发**的，不是全局配置。拿 ``config.yaml``
-    的当前值去评老运行，判出来的成功/失败与训练时不是同一件事 —— 实测踩过：
-    cmdtrack6 前两级的训练口径是「``vx=0`` 原地、撑满回合算成功」，而当前
-    ``config.yaml`` 给的是「``vx=0.45``、前进 2 m 算成功」，于是 GIF 上凭
-    「没走够 2 米」给一个明明在跟指令的级判 20% 成功率。
-    2026-06 之后 ``summary.json`` 会记这些字段；更早的运行只能退回当前课程并打印 ⚠。
+    ⭐ **回放口径必须来自训练记录**：逐级量程是课程下发的，拿当前 config.yaml
+    的基线去评老运行，成败判定与训练时不是同一件事（experience.md §17）。
     """
     stages = config_to_stages(cfg)
     by_name = {st.name: st for st in stages}

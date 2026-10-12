@@ -28,43 +28,17 @@ DEFAULT_STAIR_FRICTION: tuple[float, float, float] = (0.9, 0.005, 0.0001)
 DEFAULT_STAIR_RGBA = "0.62 0.60 0.55 1"
 #: 为地形（楼梯**以及**地面）保留的 MuJoCo geom group。
 #:
-#: 把全部地形几何放进一个专用 group，前向探针（``robotdog/env.py`` 的楼梯测距）
-#: 就能「向前看」而看不到机器人自己的前腿：``mj_ray`` 接受一个 *geom group mask*，
-#: 只开这一组的掩码构造性地让探针看不见机器人。
-#:
-#: **取 Group 1，而且这个值承担双重载荷：**
-#:
-#: 1. Unitree 的 MJCF 把 ``group="2"`` 分给纯视觉 geom，把 ``group="3"`` 分给
-#:    每一个碰撞 geom（躯干盒、膝部圆柱以及四个脚球），所以 2 和 3 已被占用；
-#:    没有显式 group 的 geom 落在 group 0。
-#: 2. MuJoCo 的 ``mjv_defaultOption`` 出厂就是 ``geomgroup = [1, 1, 1, 0, 0, 0]``
-#:    —— **group 3、4、5 默认被隐藏。** 于是把楼梯打在 group 4 上，它在每一个
-#:    离屏渲染里都不可见，而物理完全不受影响：画面上是狗在爬空气，HUD 却愉快地
-#:    报告高度增益。（真的发生过；这就是这个常量被钉死在 1 的由来。）
-#:    group 1 落在默认可见范围内，所以楼梯不用改渲染器就能显示。
-#:
-#: :meth:`robotdog.env.Go2StairsEnv.render` 还会额外强制打开*全部六个* group，
-#: 所以改这个常量不会再悄悄把地形藏起来。
+#: 必须落在 MuJoCo 渲染默认可见的组里（默认隐藏 3–5；Go2 的 MJCF 占用 2/3）——
+#: 选错组会得到「物理在爬楼梯、画面里狗在爬空气」的世界（experience.md §1.2）。
+#: :meth:`robotdog.env.Go2StairsEnv.render` 还会强制打开全部六个组。
 TERRAIN_GEOM_GROUP = 1
 
-#: 平的 crest / 顶层平台 *向回*伸进最后一级上升台阶的长度（单位：踏面）。
-#: 它必须 > 0，原因是 MuJoCo 的一个真实陷阱：
+#: 平的 crest / 顶层平台*向回*伸进最后一级上升台阶的长度（单位：踏面）。
 #:
-#: crest 与最后一级踏面高度完全相同，所以两块 box 共面。当它们只是*相邻*
-#: （crest 恰好从 ``up_end_x`` 开始）时，彼此贴合的端面是一条零高度的缝。
-#: 球心落在这条缝上的脚球，对两个竖直面都是**零**穿透，但对两个顶面还有
-#: 几十毫米距离，而 MuJoCo 沿*最小穿透轴*求解「球在盒内」的接触 —— 于是两块
-#: box 都在水平方向推这只脚，方向相反。两个推力相互抵消，z 方向没有任何东西
-#: 支撑脚，脚就被夹住：x 被钉死，下沉到踏面以下 30-40 mm，而且因为接触法线
-#: 是水平的，``touch.riser_graze`` 每一步都被点亮。在 8 cm x 8 级楼梯上实测
-#: （``.tmp/stall_probe.py``）：两只前脚在剩余 700 个控制步里冻结在
-#: ``x = 5.500 == up_end_x``，也就是说机器人爬完整段楼梯后，直到 20 s 上限
-#: 都停在终点线前 0.114 m —— 这正是高台阶训练长期卡在 20-40 % 的原因。
-#:
-#: 让 crest 向最后一级台阶内部回伸，会把它的后侧面埋进那一级内部，于是共面的
-#: 那对表面消失，只剩真正的立面。实心块的*并集*不变，所以解析剖面、向下射线
-#: 投射与每一个渲染像素都完全一致。
-CREST_SEAM_OVERLAP = 1.0  # 单位：踏面
+#: 必须 > 0：crest 与最后一级踏面高度相同、共面，仅相邻时贴合端面是一条零高度
+#: 的缝，脚球落上去会被两块 box 沿最小穿透轴水平对推、z 向无支撑而夹死
+#: （experience.md §1.1）。回伸让共面对消失，实心块并集不变。
+CREST_SEAM_OVERLAP = 1.0
 
 
 @dataclass
@@ -94,19 +68,11 @@ class StairSpec:
     name_prefix: str = "stair"
 
     def __post_init__(self) -> None:
-        """拒绝会生成非法 MJCF 或算术上无意义的参数。
+        """拒绝会生成非法 MJCF 或算术上无意义的参数（零高度台阶 → MuJoCo
+        编译期错、tread ≤ 0 → height_at 除零、n_down > 0 且 landing ≤ 0 →
+        下降段与上升段重叠）。
 
-        这些组合过去都不会在这里报错，而是各自以更晚、更难懂的方式失败：
-
-        * ``n_up > 0`` 且 ``step_height <= 0`` —— 生成 ``n_up`` 个**零高度**的
-          box，MuJoCo 在编译期抛 ``ValueError: size 2 must be positive in
-          geom``（错误信息里只有 geom 名字，看不到是 ``step_height`` 没给）。
-        * ``tread <= 0`` —— :meth:`height_at` 的 ``// self.tread`` 直接
-          ``ZeroDivisionError: float floor division by zero``。
-        * ``n_down > 0`` 且 ``landing <= 0`` —— 下降段与上升段重叠。
-
-        注意 ``flat_spec()`` 走的正是 ``n_up = n_down = 0``（它把两个级数设为
-        0 而不是把 ``step_height`` 设为 0），所以平地段不受这些校验影响。
+        注意 ``flat_spec()`` 走 ``n_up = n_down = 0``，平地不受这些校验影响。
         """
         if self.n_up > 0 and self.step_height <= 0.0:
             raise ValueError(
@@ -165,8 +131,8 @@ class StairSpec:
                  (cx, self.center_y, top / 2.0), (hx, hy, top / 2.0))
             )
 
-        # 两段之间的平 crest。``ov`` 向回伸进最后一级上升台阶，使两块共面的
-        # box 相互重叠而不是仅仅相邻 —— 它避开的那种「脚被夹死」的陷阱见 CREST_SEAM_OVERLAP。
+        # 两段之间的平 crest。``ov`` 向回伸进最后一级上升台阶，避开「共面接缝
+        # 夹脚」陷阱（见 CREST_SEAM_OVERLAP 的 docstring）。
         ov = CREST_SEAM_OVERLAP * self.tread
         if self.n_down > 0:
             top = self.crest_height
@@ -248,12 +214,9 @@ class StairSpec:
 def flat_spec(**kw) -> StairSpec:
     """平地。
 
-    三个字段必须一起归零：``n_up = n_down = 0`` 让 :meth:`StairSpec.step_blocks`
-    一个方块都不生成；``step_height = 0`` 则让地形观测里的台阶高读数真的是 0
-    （否则会留下 ``StairSpec`` 的 5 cm 默认值，观测里凭空多出一个台阶）。
-
-    ``top_landing`` 归零是可选的优化：``n_up = 0`` 时 :meth:`step_blocks` 的
-    收尾分支本来就被 :meth:`StairSpec.__post_init__` 之外的 ``n_up > 0`` 判据挡住。
+    三个字段必须一起归零：``n_up = n_down = 0`` 让几何一个方块都不生成；
+    ``step_height = 0`` 让观测里的台阶高读数真的是 0（否则会留 ``StairSpec``
+    的默认值，观测里凭空多出一个台阶）。
     """
     kw.setdefault("n_up", 0)
     kw.setdefault("n_down", 0)

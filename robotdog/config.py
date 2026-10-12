@@ -80,11 +80,9 @@ def _section(raw: Mapping[str, Any], name: str) -> dict[str, Any]:
 
 
 #: 非 dataclass 段（``ppo:`` / ``run:`` / ``play:`` / ``curriculum:``）的合法键。
-#: 这些段是脚本自己 ``.get()`` 出来的，没有 ``_apply`` 那种「按 dataclass 字段
-#: 校验」的结构 —— 不额外查一遍的话，``net_arch`` 写成 ``net_arc`` 只会静默用上
-#: 默认值（实测：``config_to_ppo({"ppo": {"ent_coeff": 999.0}})`` 原样返回，
-#: ``config_to_stages({"curriculum": {"height_cm": [...]}})`` 静默退回默认六级）。
-#: 打错键必须当场报错，这是「config.yaml 是唯一超参入口」的前提。
+#: 这些段是脚本自己 ``.get()`` 出来的，没有 ``_apply`` 的字段校验 —— 不查一遍
+#: 就会静默用上默认值。打错键必须当场报错，这是「config.yaml 是唯一超参入口」
+#: 的前提。
 SECTION_KEYS: dict[str, frozenset[str]] = {
     "ppo": frozenset({
         "device", "net_arch", "n_steps", "batch_size", "n_epochs", "gamma",
@@ -227,13 +225,9 @@ def _vx_ranges(value: Any, n_stages: int, *, where: str
 def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
     """把 ``env:`` + ``reward:`` 两段写进 :class:`EnvConfig`。
 
-    没写的键保持 dataclass 默认值，所以配置文件只需要列出你想改的项。
-    未知的键（打错的字段名）会报错并列出现有字段。
-
-    顺带把 ``ppo:`` / ``run:`` / ``play:`` / ``curriculum:`` 四个**不是 dataclass**
-    的段的键也查一遍（见 :data:`SECTION_KEYS`）—— 它们是脚本自己 ``.get()`` 的，
-    没有别的地方会拦住拼错的键。``config_to_env`` 是三个脚本共同的第一步，
-    所以校验放在这里，``robotdog/config.py`` 不必再导出第二个入口。
+    没写的键保持 dataclass 默认值；未知的键（打错的字段名）报错并列出现有字段。
+    顺带把四个非 dataclass 段的键也校验一遍（见 :data:`SECTION_KEYS`）——
+    ``config_to_env`` 是三个脚本共同的第一步，校验放这里就够了。
     """
     _check_section_keys(raw)
     env = _section(raw, "env")
@@ -377,16 +371,11 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
     return stages
 
 
-#: 回放时横向/偏航指令取量程的哪个比例。
-#: 用满量程（``1.0``）能看出「能不能跟上极限指令」，但早期课程的量程很小、
-#: 满量程反而接近噪声；取 ``0.8`` 是「几乎拉满但仍留一点余量」的折中。
+#: 回放时横向/偏航指令取量程的哪个比例（几乎拉满但留一点余量）。
 PLAY_COMMAND_FRAC: float = 0.8
 
-#: 每个回合最多写进 GIF 多少帧。渲染帧是 960×540 的 uint8（一帧约 1.5 MB），
-#: 训练和渲染同时跑时内存很紧：一回合 500 步按 ``FRAME_STRIDE=2`` 就是 250 帧，
-#: 但摔倒前若一直站着，回合能拖到 500 帧以上，逐阶段累积就会 ``MemoryError``。
-#: 上限一到就按当前帧数反算步幅、稀疏取帧 —— 宁可 GIF 短一点，也不能在
-#: 渲染中途崩掉（2026 年 6 月那次 ``MemoryError`` 就是没有这个上限）。
+#: 每个回合最多写进 GIF 多少帧（渲染帧很大，逐阶段累积曾把内存吃光；超限后
+#: 按当前帧数反算步幅稀疏取帧）。
 PLAY_GIF_MAX_FRAMES: int = 300
 
 
@@ -394,14 +383,10 @@ def command_for_stage(stage: StageSpec, *, frac: float = PLAY_COMMAND_FRAC,
                       vx: float | None = None) -> tuple[float, float, float]:
     """给一个课程阶段挑一条**有代表性**的回放指令 ``(vx, vy, yaw_rate)``。
 
-    为什么要按阶段挑：课程里每一级的指令量程不同（平地预热级从
-    ``vy_max=0.1`` 逐级放到 ``0.4``，楼梯级全是 0），同一个固定指令在不同级
-    上含义完全不同 —— 拿 ``vy=0.4`` 去播放只要量程 0.1 的第 1 级，等于问它
-    「跟一个你从没见过的指令」，看画面会误判成「策略不会横移」。
-
+    每级的指令量程不同，同一个固定指令在不同级上含义完全不同 —— 必须按阶段挑。
     规则：量程为 0 的方向给 0（该级本来就不练这个方向）；有量程的方向给
-    ``frac × 量程``。``vx`` 显式给定时覆盖阶段的前进指令；否则取该级采样区间的
-    中点 —— 回放要的是一条「落在训练分布中央」的典型指令，而不是某一个端点。
+    ``frac × 量程``；``vx`` 显式给定时覆盖，否则取该级采样区间的中点（回放要的是
+    落在训练分布中央的典型指令，不是端点）。
     """
     if vx is None:
         lo, hi = stage.command_vx
@@ -480,13 +465,11 @@ def config_to_run(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def config_to_play(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """``play:`` 段，补上渲染默认值。
+    """``play:`` 段，补上默认值。
 
-    ⚠ 这里**没有**相机/分辨率/帧率/缩放那四个键：渲染参数固定在
-    ``scripts/play.py`` 的模块常量里（``CAMERA_GIF`` / ``FRAME_WIDTH`` /
-    ``FRAME_HEIGHT`` / ``GIF_FPS`` / ``GIF_SCALE``），写进 yaml 只会让人以为
-    调它有意义。所以 ``config.yaml`` 的 ``play:`` 段若残留这四个键，
-    ``_section`` / ``_apply`` 那套「未知键报错」会在别处先炸 —— 直接删掉即可。
+    相机/分辨率/帧率/缩放**没有**这四个键：渲染参数固定在 ``scripts/play.py``
+    的模块常量里，写进 yaml 只会让人以为调它有意义（残留的键会被「未知键报错」
+    拦下，直接删掉即可）。
     """
     play = _section(raw, "play")
     play.setdefault("episodes_gif", 10)

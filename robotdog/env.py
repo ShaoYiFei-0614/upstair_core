@@ -76,12 +76,8 @@ class ObsConfig:
     base_frame_size: int = 42
 
     def __post_init__(self) -> None:
-        # 这条不是「默认关掉」，而是**禁止打开**。机身相对正下方地形的高度里含
-        # 地形真值（原实现是 ``base_pos[2] - _height_reference()``，而
-        # ``_height_reference()`` 就是 ``terrain_height_under_base``）。盲走策略
-        # 一旦拿到它就不再是盲走。原来这里只有一行注释，结果它被打开过 ——
-        # 所以改成硬错误，并连带删掉了 `_obs_frame` 里那条分支与
-        # `_height_reference()` 本身。
+        # 含地形真值、破坏盲走 —— 构造即拒绝，而不是默认关掉（该分支与实现已
+        # 整体删除；「约定不是保证」，experience.md §11）。
         if self.base_height:
             raise ValueError(
                 "obs.base_height 必须为 false：这一项是『机身相对正下方地形的高度』，"
@@ -173,41 +169,19 @@ class EnvConfig:
     episode_length_s: float = 20.0
     action_scale: float = 0.30              # rad，策略权限
 
-    # --- 指令（外部控制器接口）-------------------------------------------- #
-    # 三个量：前向 vx（定值）、横向 vy、偏航角速度 wz。横向与偏航是随机指令，
-    # 每回合从 [-max, +max] 里采样，随课程按阶段放宽（``config_to_stages``）。
-    # 它们是**盲走允许的信息**：指令由操作者/上游规划器给出，不含地形真值，
-    # 与 ``command_vx`` 同源（见 agent.md §8.6 的信息来源清单）。
+    # --- 指令（外部控制器接口）：盲走允许的信息（操作者/上游规划器给出，不含
+    # 地形真值）。横向与偏航每回合从 [-max, +max] 采样，量程随课程放宽。
     command: CommandConfig = field(default_factory=CommandConfig)
-    # 横向速度 / 偏航角速度的低通时间常数 [s]。见 ``ObsConfig.vel_filter``：
-    # 小跑步态本身带 ±0.37 rad/s 的偏航摆动，瞬时量根本不是「机器人在往哪走」，
-    # 0.2 s（10 个控制步）足以压掉一个步态周期而仍能跟上指令变化。
+    # 横向速度 / 偏航角速度的低通时间常数 [s]（压掉步态周期、跟上指令变化）。
     vel_filter_tau: float = 0.2
 
     # --- 开环步态之上的残差 RL --------------------------------------------- #
-    # PD 目标变为 home + gait_gain * gait.radians(t) + action_scale * action
+    # PD 目标 = home + gait_gain * gait.radians(t) + action_scale * action
     gait_prior: bool = False
     gait: GaitParams = field(default_factory=GaitParams.default_trot)
     gait_gain: float = 1.0
-    # 步态先验的幅值缩放（只缩 ``amp_th``/``amp_ca``，保留高步频）。
-    # ``GaitParams.default_trot()`` 是先验自身 2.05 m/s 的平地小跑，而本任务的
-    # 指令区间是 0.2~0.6 m/s —— 残差必须常驻 −0.5 左右才能压到 0.45，这是一个
-    # 巨大的系统性偏置。实测（200k 步、只改这一个旋钮）把幅值缩到 0.45/0.55 后
-    # |vx 误差| 从 0.597 降到 0.267/0.178，且奖励账从「超速惩罚主导」回到
-    # 「姿态/力矩主导」。取 0.5 兼顾抬腿高度与速度量程。
-    gait_amp_scale: float = 1.0
-    # 速度参数化：让**先验的步幅幅值跟着当前指令缩放**，于是先验自己去指令
-    # 附近的速度，策略只剩平衡与微调 —— 速度这才真正成为控制量。
-    #
-    # 为什么必须这么做：原先验是一条固定轨迹，自然速度由机械结构决定。实测
-    # （`.tmp/zz_prior_calib.py`）幅值缩放 `s` 与稳态速度是
-    # `v(s) = 2.4975·s − 0.4657`，而**行走支的下沿是 s=0.46 ⇒ v=0.70 m/s**，
-    # s∈[0.34,0.44] 全部摔倒。于是「先验自己走 0.79、指令要 0.45」这种组合
-    # 只能靠策略常驻刹车，而刹车需要大腿偏置约 −0.5 rad，`action_scale=0.30`
-    # 下要动作 −1.67，超出 ±1 限幅 —— 实测策略退化成一个常值动作（|action|
-    # 恒 0.92，速度锁死 0.39）而完全不理指令。打开这个开关后，先验按标定曲线
-    # 跟随指令，残差需求回到 ±0.1 rad 量级。
-    gait_speed_track: bool = True
+    gait_amp_scale: float = 1.0         # 全局幅值缩放（只缩 amp 保留步频，缩后过 normalize()）
+    gait_speed_track: bool = True       # 速度参数化：先验幅值按当前指令缩放（doc/gait.md）
     kp: tuple[float, float, float] = (30.0, 30.0, 45.0)
     kd: tuple[float, float, float] = (0.6, 0.6, 0.9)
 
@@ -218,8 +192,6 @@ class EnvConfig:
     #   "base" -> 机身下方的地形（阶梯函数，会产生幽灵摔倒）
     terminate_height_ref: str = "support"
     # 摔倒的高度阈值：机身高度（base_z 减参照面）低于它就判摔倒。
-    # 取值依据见 experience.md §12：躯干碰撞体最低点在 0.118 m，所以
-    # 0.15 留了 3.2 cm 余量，同时比原来的 0.13 更早抓到「趴下去」。
     terminate_min_height: float = 0.15
     terminate_max_tilt: float = 1.0         # rad，roll 或 pitch
     terminate_on_success: bool = True
@@ -232,38 +204,16 @@ class EnvConfig:
 
     # --- 成功 -------------------------------------------------------------- #
     spawn_back: float = 0.55                # 第一个立面前方的米数
-    # 平地阶段的成功判据是**指令跟随**：实测速度与指令之差超过容差就算一次脱靶，
-    # 整回合脱靶步占比超过 ``flat_track_miss_ratio`` 就不算成功。
-    #
-    # 容差是**实测标定**出来的，不是拍的：``runs/cmdtrack6`` 的平地上确定性回放
-    # 3 回合 × 1000 步，横向误差稳定在均 0.049/0.145/0.27 m/s（指令越大误差越大），
-    # 偏航误差均 0.22/0.27/0.35 rad/s。而 ``runs/course8`` 的 ``flat_final`` 在
-    # 完整课程配置下实测 ``|vx 误差| 0.16``、``|vy 误差| 0.076``、``|wz 误差| 0.55``
-    # —— 所以这里取「比一个真的在跟的策略再宽 1.4~1.6 倍」：判据必须让会跟的策略
-    # 拿得到正信号，否则 PPO 就丢掉了唯一的正信号（太紧，如 0.15/0.30，会把当时
-    # 的策略判成 100% 脱靶）；太松则「输出常数」也算成功。
+    # 平地阶段的成功判据是**指令跟随**：脱靶步占比与「实测量真的跟着指令变」的
+    # 相关系数双门槛（常数输出能把平均误差压到最小，骗不过相关系数）。容差按
+    # 「真在跟的策略实测误差的 1.4~1.6 倍」标定，依据见 experience.md §18。
     flat_track_tol_vy: float = 0.30         # m/s
     flat_track_tol_wz: float = 0.70         # rad/s
-    # 前向的容差是常数：前向指令由课程在 [0.2, 0.6] 里采样，不随回合重抽量程。
-    # 0.35 比横移松，是因为步态先验带来的周期速度波动主要落在前后方向。
-    flat_track_tol_vx: float = 0.35         # m/s
-    # 脱靶步占比的上限。指令每 ``command_hold_steps`` 步阶跃一次，阶跃后的
-    # 过渡段（滤波时间常数 0.2 s ≈ 10 步）天然要算几次脱靶，所以留 30%。
-    flat_track_miss_ratio: float = 0.30
-    # 光有容差不够：**输出常数就能让平均绝对误差最小**（常数输出等于指令分布的
-    # 均值），所以还要求实测量与指令的相关系数至少到这个值（只对指令本身在变的
-    # 轴判定，见 ``_tracking_quality``）。这个量对常数输出恒为 0 —— 实测
-    # ``runs/course9`` 的 flat 策略三轴扫描斜率全在 0.012 以内，重抽之后脱靶率
-    # 立刻从 0.005 涨到 0.973。
-    # 0.30 而不是 0.50：滞后、过渡段与整回合平均都会压低相关系数，阈值的作用是
-    # **排除零响应**，不是给容差加码 —— 容差已经由 ``flat_track_miss_ratio`` 把关。
-    flat_track_min_corr: float = 0.30
-    # 回合内每隔这么多**控制步**重抽一次指令（0 或负数 = 整回合定值）。
-    # 定值指令下「输出常数」是跟踪问题的最优解，成功判据里的相关系数项也会
-    # 因为 cmd_std = 0 变成空操作；重抽之后跟随才是一个真问题。
-    # 100 步 = 2 s：比步态周期（约 0.18 s）长两个数量级，足够让滤波量跟上，
-    # 又比 1000 步的回合短一个数量级，一回合里能出现约 10 次阶跃。
-    # 回放 / 遥操作 / GIF 用 ``set_command_now(..., hold=True)`` 把它关掉。
+    flat_track_tol_vx: float = 0.35         # m/s（比横移松：步态的周期速度波动主要在前后向）
+    flat_track_miss_ratio: float = 0.30     # 上限含指令阶跃过渡段的天然脱靶份额
+    flat_track_min_corr: float = 0.30       # 只对指令本身在变的轴判定；作用是排除零响应
+    # 回合内每隔这么多**控制步**重抽一次指令（0 或负数 = 整回合定值）。定值指令
+    # 下「输出常数」是最优解；回放/遥操作用 set_command_now(hold=True) 关掉。
     command_hold_steps: int = 100
 
     # --- 观测 / 奖励 ------------------------------------------------------- #
@@ -314,8 +264,7 @@ class Go2StairsEnv(gym.Env):
         self._hist: deque[np.ndarray] = deque(maxlen=self.cfg.obs.history_len)
         self._last_action = np.zeros(self.num_act, dtype=np.float64)
         self._step_count = 0
-        # 本回合**四足支撑面**曾达到的最大高度（2026-10-12 起；原为机身正下方地形），
-        # 结算（见 ``robotdog/reward.py`` 的 ``stair_progress``）。
+        # 本回合四足支撑面曾达到的最大高度（由 reward.py 的 stair_progress 结算）。
         self._peak_terrain_height = 0.0
         self._reached_top = False
         self._leg_contact_streak = 0
@@ -326,19 +275,15 @@ class Go2StairsEnv(gym.Env):
         self._probe_best = np.zeros(len(self.meta.foot_geom_ids))
         self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
 
-        # 低通滤波后的横向速度 / 偏航角速度（见 ``ObsConfig.vel_filter`` 与
-        # ``reward.py`` 的 ``command_follow``）。一阶 IIR：
-        # ``y += alpha * (x - y)``，``alpha = dt / tau`` 且限制在 (0, 1]。
-        # ``reset()`` 里用第一步的瞬时值做初值，避免开头几十毫秒从 0 慢慢爬。
+        # 低通滤波后的横向速度 / 偏航角速度：一阶 IIR，``alpha = dt / tau``，
+        # 初值取 reset 时的瞬时值（避免开头几十毫秒从 0 慢慢爬）。
         tau = max(1e-6, float(self.cfg.vel_filter_tau))
         self._vel_alpha = min(1.0, self.cfg.control_dt / tau)
         self.filtered_lateral_vel = 0.0
         self.filtered_yaw_rate = 0.0
         # 平地指令跟随判据的脱靶步计数，每回合清零（见 ``_success_reached``）。
         self._tracking_miss_count = 0
-        # 指令跟随的**跟踪统计量**（每回合清零）。只累加指令本身在变化的轴上的
-        # 一阶/二阶矩，用来算「实测量是否真的跟着指令变」（见 ``_tracking_quality``）：
-        # 平均误差判据一个人撑不住，因为**输出常数就能把平均误差压到最小**。
+        # 跟踪统计量（每回合清零；供 _tracking_quality 算相关系数，见其 docstring）。
         self._track_n = 0
         self._track_cmd_sum = np.zeros(3)
         self._track_cmd_sq = np.zeros(3)
@@ -364,13 +309,8 @@ class Go2StairsEnv(gym.Env):
         self._scene_option = None
         self._render_size = None
 
-        # ``observation_space`` 在构造时就冻住了 ``cfg.obs.size``，而
-        # ``reset()`` 返回的是「``_obs_frame()`` 的真实宽度 × history_len」。两者
-        # 唯一的同步机制是 ``ObsConfig`` 的开关与 ``cfg.obs.size`` 一致 —— 一旦
-        # 有人构造完再动开关，这个错会一路拖到 PPO 内部，以
-        # ``ValueError: Observation spaces do not match`` 的形式爆出来。所以这里
-        # 就地验一次：现造一帧（``_obs_frame`` 只依赖已经初始化好的属性），拿真实
-        # 宽度直接和冻结的观测空间比。
+        # observation_space 在构造时冻结，而真实观测宽度由 obs 开关现算 ——
+        # 构造之后再动开关会拖到 PPO 内部才爆，所以就地现造一帧核对一次。
         frame_size = int(self._obs_frame().shape[0])
         real_size = frame_size * int(self.cfg.obs.history_len)
         frozen = int(self.observation_space.shape[0])
@@ -386,14 +326,10 @@ class Go2StairsEnv(gym.Env):
     # ------------------------------------------------------------------- 构建
 
     def _build_model(self) -> None:
-        """编译一次场景。模型在环境生命周期内不变 —— 课程的每一级都是新建
-        环境（``make_vec_env``），不存在「同一个环境换地形」的用法。
+        """编译场景；模型在环境生命周期内不变（每一级课程都是新建环境）。
 
-        ``mujoco.Renderer`` 绑定到某一个 ``MjModel`` 实例，绝不能比构建它的
-        那个模型活得更久。历史上 ``set_stair()`` 换地形后渲染器仍画*上一块*
-        地形（物理在爬新楼梯、画面是旧世界）；那个唯一会让模型换实例的入口
-        已随死代码清理删除，这条不变量现在由「模型只在 ``__init__`` 编译一次」
-        结构性地保证。
+        ``mujoco.Renderer`` 绑定到具体的 ``MjModel``、不能比模型活得久 ——
+        「只在 ``__init__`` 编译一次」由结构保证这一不变量。
         """
         opts = SceneOptions(timestep=self.cfg.timestep)
         self.model, self.meta, self.xml = compile_scene(
@@ -494,9 +430,8 @@ class Go2StairsEnv(gym.Env):
     def _tracking_miss(self) -> bool:
         """本控制步的三轴速度是否脱靶（实测与指令之差超过容差）。
 
-        只读**滤波后**的横向/偏航速度：瞬时值在小跑步态下被步态摆动主导
-        （实测 ``std`` 可达 0.37 rad/s），用它判跟随等于在判步态相位。前向用
-        机身系瞬时速度，因为小跑的 ``vx`` 本来就是平滑的。
+        横向/偏航只读**滤波后**的量（瞬时值被步态摆动主导，等于在判步态相位）；
+        前向用机身系瞬时速度（本来平滑）。
         """
         cmd = self.cfg.command
         err_vx = abs(float(self.base_lin_vel_body[0]) - float(self._command[0]))
@@ -507,12 +442,8 @@ class Go2StairsEnv(gym.Env):
                     or err_vx > self.cfg.flat_track_tol_vx)
 
     def _record_tracking_stats(self) -> None:
-        """累加三轴「指令 vs 实测」的一阶/二阶矩。
-
-        只在 ``_step_count > 0`` 时调用：第 0 步的 ``base_lin_vel_body`` 还是
-        ``reset`` 之后的零向量，而那时指令已经抽好了 —— 把这一对存进去会让
-        相关系数天然偏低。
-        """
+        """累加三轴「指令 vs 实测」的一阶/二阶矩（只在 ``_step_count > 0`` 时调：
+        第 0 步的速度还是 reset 后的零向量，混进去会压低相关系数）。"""
         act = np.array([float(self.base_lin_vel_body[0]),
                         float(self.filtered_lateral_vel),
                         float(self.filtered_yaw_rate)])
@@ -525,21 +456,12 @@ class Go2StairsEnv(gym.Env):
         self._track_cross += cmd * act
 
     def _tracking_quality(self) -> tuple[int, float]:
-        """返回 ``(参与判定的轴数, 最差的那个相关系数)``。
+        """返回 ``(参与判定的轴数, 最差轴的相关系数)``。
 
-        **为什么需要它**：平地成功判据原先只有「平均绝对误差 <= 容差」，
-        而这个量**在输出常数时取到最小**（常数输出等于指令分布的均值），所以
-        策略只要把动作钉死就能拿满成功 —— 实测 ``runs/course9`` 第 1 级的
-        ``flat_final.zip`` 三轴扫描斜率全在 0.012 以内，而它 76% 的回合被
-        判成功。判「跟不跟」必须用**协方差算出的相关系数**：它只认「指令变、
-        实测跟着变」，对常数输出恒为 0。
-
-        取**最差**轴（而不是最好）是刻意的：指令是三轴的，只跟对了其中一轴
-        不能算「按指令走」。只对**指令本身在变化**的轴判定（``std > 0.05``）：
-        ``vx`` 在某些级别是定值基线，那根轴上没有「跟随」可言。
-
-        一根可判的轴都没有时返回 ``0.0``（而不是 −1.0）—— 「没有证据」不能
-        当成「通过」。
+        平均绝对误差在「输出常数」时取最小，判跟随必须用相关系数（对常数输出
+        恒为 0）。取**最差**轴（只跟对一轴不算按指令走）；只判指令本身在变的轴
+        （std > 0.05，定值基线轴上没有「跟随」可言）；没有可判轴时返回 0.0 ——
+        「没有证据」不能当「通过」。
         """
         n = max(1, self._track_n)
         cmd_mean = self._track_cmd_sum / n
@@ -633,19 +555,12 @@ class Go2StairsEnv(gym.Env):
 
     @property
     def yaw_rate(self) -> float:
-        """偏航角速度，**机体系 z 轴分量**（rad/s），是偏航速率指令要跟踪的量。
+        """偏航角速度，**机体系 z 轴分量**（rad/s）—— 偏航指令要跟踪的量。
 
-        为什么用机体系而不是世界系：这一项要拿去和「平稳的偏航指令」比较，而奖励
-        信号的噪声底必须远小于要跟踪的量程。世界系 z 角速度
-        ``wz + tan(pitch) * (cos(yaw) * wx + sin(yaw) * wy)`` 在数学上同样是偏航
-        速率，但四足步态下躯干以几十赫兹小幅摆动，那个 ``tan(pitch)`` 乘积项就能
-        贡献约 0.28 rad/s —— 与指令量程（±0.70）同阶，等于把一半权重扔进了策略
-        根本控制不到的通道（三种独立方法实测见 ``experience.md`` §16）。
-
-        机体系读数的抖动与 ``qvel[5]`` 同阶（≈0.16），计算更便宜，而且**更贴近
-        真机**：机载陀螺直接给的就是机体系角速度，真机不需要先做欧拉角换算。
-
-        只读陀螺与姿态，不引入任何地形信息，所以可以进奖励。
+        不用世界系公式（``wz + tan(pitch)·(cos yaw·wx + sin yaw·wy)``）：它被与
+        指令量程同阶的步态振荡污染，等于把一半权重扔进策略控制不到的通道
+        （experience.md §16）。机体系读数便宜、抖动小、贴近真机陀螺口径；
+        不引入地形信息，可进奖励。
         """
         wx, wy, wz = quat_to_mat(self.base_quat).T @ self.data.qvel[3:6]
         return float(wz)
@@ -654,11 +569,9 @@ class Go2StairsEnv(gym.Env):
     def foot_clearance(self) -> np.ndarray:
         """每只足端*表面*与其下方地形之间的间隙（m）。
 
-        ``geom_xpos`` 是足端球的球心，所以在与地形高度比较之前必须减去半径。
-
-        **这是特权信息，只进奖励。** 它要和 ``stair.height_at()`` 相减，真机上
-        拿不到这个数值；策略能学到的只是「按 ``step_height`` 这一个可观测量把脚
-        抬够高」这一条相关性。**没有**任何观测项直接等于它。
+        ``geom_xpos`` 是足端球的球心，比较前先减去半径。
+        **特权信息，只进奖励**（foot_lift、probe_lift 的摆动峰值）：策略只能
+        学到「按 ``step_height`` 抬够高」这条相关性，没有任何观测项直接等于它。
         """
         feet = self.foot_pos
         return feet[:, 2] - self.meta.foot_radius - self._terrain_height(feet[:, 0])
@@ -681,10 +594,7 @@ class Go2StairsEnv(gym.Env):
         ]
         if obs_cfg.base_lin_vel_body:
             parts.append(self.base_lin_vel_body)
-        # 注意：这里**故意没有** base_height 分支。它原本是
-        # ``base_pos[2] - _height_reference()``，而 ``_height_reference()`` 就是
-        # 机身正下方的地形高度 —— 那会把地形真值塞进观测。``ObsConfig`` 的
-        # ``__post_init__`` 现在直接禁止打开该开关，所以这条分支已整体删除。
+        # 这里故意没有 base_height 分支：它含地形真值，ObsConfig 构造期已禁止。
         if obs_cfg.gait_phase:
             theta = 2.0 * np.pi * self.cfg.gait.freq * self._gait_phase
             parts.append(np.array([np.sin(theta), np.cos(theta)]))
@@ -696,15 +606,8 @@ class Go2StairsEnv(gym.Env):
             # 三轴速度指令。允许进观测：它来自操作者或上游规划器，不含地形真值。
             parts.append(np.asarray(self._command, dtype=np.float64).copy())
         if obs_cfg.vel_filter:
-            # ⭐ 滤波后的横向速度 / 偏航角速度（低通时间常数 ``cfg.vel_filter_tau``）。
-            #
-            # 为什么必须和奖励一起看：奖励读的是同一个量（见 reward.py 的
-            # ``command_follow``）。瞬时 ``yaw_rate`` 在小跑步态下会被步态本身
-            # 的摆动主导 —— 实测 ``mean = -0.027 rad/s`` 而 ``std = 0.370``，
-            # 也就是说「机器人其实没有转」，但瞬时值每秒扫过指令区间几十次，
-            # 判据照样每步给分（实测 ``command_follow = +0.81/步``，而净位移
-            # Δy 只有 +0.05 m）。只改奖励不改观测会把滤波器的内部状态藏起来、
-            # 破坏马尔可夫性，所以这两项必须成对出现。
+            # 滤波后的横向速度 / 偏航角速度。奖励的 command_follow 读同一批量 ——
+            # 只改奖励不改观测会把滤波器状态藏起来、破坏马尔可夫性，必须成对出现。
             parts.append(np.array([self.filtered_lateral_vel, self.filtered_yaw_rate]))
         return np.concatenate(parts).astype(np.float64)
 
@@ -784,22 +687,9 @@ class Go2StairsEnv(gym.Env):
     def set_reward_overrides(self, overrides: dict[str, float] | None) -> None:
         """把一组奖励覆盖值叠到 ``cfg.reward`` 上（课程逐级调整奖励的入口）。
 
-        ``scripts/train.py`` 在每一级建完环境之后用
-        ``venv.env_method("set_reward_overrides", stage.reward_overrides)`` 调用，
-        所以**同一个进程里每一级都能有自己的一套奖励**。传 ``None`` 或 ``{}``
-        等价于「不动」。
-
-        ⚠ **就地改**：它 ``setattr`` 到 ``self.cfg.reward`` 上，且**只覆盖传进来的
-        键**。所以「每一级互相独立」这件事不能靠本方法自动获得 —— 调用方必须
-        保证两点（``scripts/train.py`` 的 ``make_env`` 现在都做了）：
-        (1) 每一级的子环境拿到的是**自己的 cfg 副本**（``copy.deepcopy``），否则
-        这一级的范围/奖励会写穿到下一级的 ``config.yaml`` 基线里；(2) 覆盖是
-        **从基线叠**，即先 ``set_reward_overrides(asdict(基线))`` 再叠本级的键，
-        否则上一级覆盖过、这一级没覆盖的键会残留成上一级的值。
-
-        为什么不做成「新建 RewardConfig」：那样每一级都要把所有字段抄一遍，
-        而实际上大多数级只改一两项；叠加重载让 ``config.yaml`` 里只写要改的
-        那几个键就够了。
+        就地改、只覆盖传入的键。调用方必须保证：每级子环境持有**自己的 cfg
+        深拷贝**，且**先叠基线再叠本级键**（否则上一级覆盖过、本级没覆盖的键
+        会残留上一级的值）—— ``scripts/train.py`` 的 ``make_env`` 都做了。
         """
         for key, value in (overrides or {}).items():
             if not hasattr(self.cfg.reward, key):
@@ -809,39 +699,26 @@ class Go2StairsEnv(gym.Env):
             setattr(self.cfg.reward, key, value)
 
     def _support_height(self) -> float:
-        """四足下方最低的地形高度 —— 支撑面。
+        """四足下方最低的地形高度 —— 真正撑住机器人的支撑面。
 
-        与 :meth:`terrain_height_under_base` 相对照，后者是躯干 x 位置的
-        阶梯函数。
-
-        **这是特权信息，只服务终止判定。** 它读 ``stair.height_at()``（地形几何
-        真值），真机上要靠高程图或触地估计才能得到；因为只用于「判断摔没摔」，
-        而 RL 的终止信号本来就是上帝视角，所以没有问题 —— 但**绝不能**把它写进
-        ``_obs_frame``。
+        **特权信息**（读 ``stair.height_at()`` 真值）：只服务终止判定与
+        stair_progress，绝不能写进 ``_obs_frame``（盲走契约，见 agent.md §8.6）。
         """
         heights = self._terrain_height(self.foot_pos[:, 0])
         return float(np.min(heights)) if heights.size else self.terrain_height_under_base
 
     def _support_height_mean(self) -> float:
-        """四足下方地形高度的均值。
-
-        ``support``（最小值）在最后一只脚落地时一帧就跳一整个立面；均值把这个
-        跳变摊到四次 ``h/4`` 增量上。它*并不*只是更宽松 —— 跨越过程中均值高于
-        最小值，所以会更早触发；它消除的是单帧的不连续。
-        """
+        """四足下方地形高度的均值：把「最后一只脚落地时一帧跳一整个立面」的
+        单帧不连续摊平（并非更宽松 —— 跨越过程中均值高于最小值，会更早触发）。"""
         heights = self._terrain_height(self.foot_pos[:, 0])
         return float(np.mean(heights)) if heights.size else self.terrain_height_under_base
 
     def _fall_reference_height(self) -> float:
-        """摔倒判据用来衡量躯干的地形高度。
+        """摔倒判据的地形参照面（**特权信息**，绝不进观测）。
 
-        **只用于终止判定，绝不进观测。** 它读 ``stair.height_at()``，即地形几何
-        真值；这在 RL 里是允许的（奖励与终止本来就是「上帝视角」），但一旦被写进
-        ``_obs_frame`` 就不再是盲走。三条分支的存在是为了选一个**帧间连续**的参照：
-
-        ``"support"`` 用四足下方最低的地形，那才是真正撑住机器人的那个面；
-        *机身*下方的地形是躯干 x 位置的阶梯函数，相邻两帧之间会跳一整个立面，
-        从而产生幽灵摔倒。
+        ``"support"``（默认）= 四足下方最低地形，那才是真正撑住机器人的面；
+        机身下方地形是躯干 x 的阶梯函数，相邻帧跳一整个立面会产生幽灵摔倒
+        （experience.md §1.4）。``"support_mean"`` 为可选的平滑口径。
         """
         mode = str(self.cfg.terminate_height_ref).strip().lower()
         if mode == "support_mean":
@@ -854,20 +731,11 @@ class Go2StairsEnv(gym.Env):
         return self._support_height()
 
     def _terminated(self, leg_contact: bool) -> tuple[bool, bool]:
-        """摔倒（terminated）与超时（truncated）判定。
+        """摔倒（高度 + 倾角）与超时判定。
 
-        摔倒只看**高度与倾角**。「躯干接触地形连续 N 步就判摔」的历史规则已
-        删除：实测它从未生效过且随时误杀（``experience.md`` §12）—— 躯干碰撞
-        体最低点在 0.118 m，而高度阈值 ``terminate_min_height``（0.15）比它还
-        高，所以躯干一碰地，高度判据早就先触发了；反过来，躯干在
-        ``h ≈ 0.28 m`` 的完全安全姿态下贴着立面蹭可以连续到 8 步，只差 2 步
-        就会被那条规则判死 —— 那正是「机身上台架天然要蹭上去」的情形。躯干
-        接触的代价由 ``reward.body_collision``（逐步、有界）承担，不由终止
-        承担。
-
-        ``leg_contact``（膝/胫蹭立面）在这里只推进 ``_leg_contact_streak``
-        连续计数 —— 纯诊断，**永不致命**（因它而终止回合会抹掉高台阶恰恰
-        需要的那个信号）。
+        接触类信号**不**终止回合：躯干接触的代价由 ``reward.body_collision``
+        （逐步、有界）承担；「连续接触 N 步判摔」的历史规则从未生效且会误杀
+        上台架时的正常蹭立面（experience.md §12.4）。膝/胫接触只推进诊断计数。
         """
         self._leg_contact_streak = self._leg_contact_streak + 1 if leg_contact else 0
         rpy = self.base_rpy
@@ -991,10 +859,8 @@ class Go2StairsEnv(gym.Env):
     def step(self, action: np.ndarray):
         action = np.asarray(action, dtype=np.float64).clip(-1.0, 1.0)
 
-        # 回合内周期性重抽指令。**这一步不是可选的**：如果整回合只有一条定值
-        # 指令，那么「输出常数」就是跟踪问题的最优解 —— 实测 course9 第 1 级的
-        # flat 策略三轴扫描斜率全在 0.012 以内却拿到 76% 成功率，成功判据里的
-        # 相关系数项在 cmd_std = 0 时恒为空操作。重抽之后「跟得上变化」才有意义。
+        # 回合内周期性重抽指令：定值指令下「输出常数」是最优解，重抽之后
+        # 「跟得上变化」才有意义（见 command_hold_steps 与 experience.md §18）。
         self._cmd_age += 1
         if self._cmd_age >= self.cfg.command_hold_steps:
             self._cmd_age = 0
@@ -1017,9 +883,7 @@ class Go2StairsEnv(gym.Env):
 
         self._step_count += 1
         trunk_contact, leg_contact, foot_contact = self._contact_scan()
-        # 这两步必须在奖励计算之前：它们维护 ``probe_lift`` 项要用的势函数
-        # 状态（本次摆动抬了多高、是否撞着立面推不动）。状态机的数学也住在
-        # ``robotdog/reward.py`` —— 探测机制整体同居一处。
+        # 奖励结算之前推进势函数状态（状态机数学在 reward.py，见 doc/reward.md）。
         track_swing_peak(self, foot_contact)
         update_probe_state(self)
         terminated, truncated = self._terminated(leg_contact)
@@ -1031,10 +895,8 @@ class Go2StairsEnv(gym.Env):
             float(self.base_lin_vel_body[1]) - self.filtered_lateral_vel)
         self.filtered_yaw_rate += alpha * (float(self.yaw_rate) - self.filtered_yaw_rate)
 
-        # 脱靶步计数：每步都记（楼梯段不用它判成功，但信息里要报同一个口径）。
-        # 这一步的实测速度要到**下一步**的观测才被策略看到，所以统计量在记账时
-        # 天然晚一拍；``_tracking_quality`` 因此用的是整回合的相关系数，而不是
-        # 逐步配对，晚一拍不影响它。
+        # 脱靶步与跟踪统计：楼梯段不用它判成功，但 info 要报同一口径；
+        # 统计量晚一拍不影响整回合的相关系数。
         if self._step_count > 0:
             self._record_tracking_stats()
         if self._tracking_miss():
@@ -1121,11 +983,8 @@ class Go2StairsEnv(gym.Env):
             self._renderer = mujoco.Renderer(self.model, height=size[1], width=size[0])
             self._render_size = size
             self._render_cam = mujoco.MjvCamera()
-            # ``mjv_defaultOption`` 默认 ``geomgroup = [1, 1, 1, 0, 0, 0]``，
-            # 所以 group 3、4、5 里的任何 geom 默认都不可见。地形放在专用
-            # group 里（见 ``terrain.TERRAIN_GEOM_GROUP``），而它曾经被塞进隐藏
-            # 区间，导致楼梯在每张 GIF 里都消失、物理却还在往上爬。把六个
-            # group 全打开，这样渲染器就永远不会悄悄丢掉整个世界。
+            # 打开全部 6 个 geom group：MuJoCo 默认隐藏 3–5，地形曾因此整段消失
+            # 而物理照常（experience.md §1.2）。
             self._scene_option = mujoco.MjvOption()
             mujoco.mjv_defaultOption(self._scene_option)
             for g in range(6):

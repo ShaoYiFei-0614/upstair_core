@@ -37,12 +37,11 @@ class Policy(Protocol):
 
 @dataclass
 class ObsNorm:
-    """``VecNormalize.obs_rms`` 的一份只读拷贝。
+    """``VecNormalize.obs_rms`` 的只读拷贝。
 
-    直接 ``pickle.loads`` 出来的 ``VecNormalize`` 对象不能随便访问属性：SB3 的
-    ``BaseVecEnv.__getattr__`` 会递归枚举所有属性，多读一个不存在的名字就
-    ``RecursionError``。所以这里立刻把 mean/var/epsilon/clip 拷出来，然后把原对象
-    丢掉（``load_obs_norm`` 里就是这么做的）。
+    直接反 pickle 出的 ``VecNormalize`` 不能随便访问属性（SB3 的
+    ``__getattr__`` 会递归枚举，多读一个不存在的名字就 ``RecursionError``），
+    所以立刻拷出 mean/var/epsilon/clip、丢掉原对象，此后只用这份拷贝。
     """
 
     mean: np.ndarray
@@ -159,15 +158,10 @@ def observation_dim(model_path: str | Path) -> int | None:
 
 
 def policy_arch(model_path: str | Path) -> tuple[int, ...] | None:
-    """从 checkpoint 里读出策略网络的隐藏层宽度，例如 ``(512, 256)``。
+    """从 checkpoint 里读策略网络隐藏层宽度（如 ``(512, 256)``）。
 
-    重建模型时必须用**训练时那一套**结构：``load_policy`` 若按默认架构
-    ``(512, 256)`` 建网再 ``set_parameters``，一个用 ``(64, 64)`` 训出来的权重会
-    直接 ``RuntimeError: Error(s) in loading state_dict for ActorCriticPolicy: size
-    mismatch for mlp_extractor.policy_net.0.weight: copying a param with shape
-    torch.Size([64, 480]) ... the shape in current model is torch.Size([512, 480])``。
-    ``policy_kwargs.net_arch`` 是普通 JSON（``{"pi": [...], "vf": [...]}``），不需要
-    解 pickle。
+    重建模型必须用**训练时那一套**结构，否则 ``set_parameters`` 直接
+    size mismatch。``policy_kwargs.net_arch`` 是普通 JSON，不需要解 pickle。
     """
     data = _zip_data(model_path)
     if not isinstance(data, dict):
@@ -187,28 +181,17 @@ def policy_arch(model_path: str | Path) -> tuple[int, ...] | None:
 
 
 def env_config_for_model(model_path: str | Path) -> EnvConfig:
-    """恢复能加载 ``model_path`` 的 :class:`EnvConfig`。
+    """恢复能加载 ``model_path`` 的 :class:`EnvConfig`（三层退路，能力递减）。
 
-    首选与模型同名的 ``<stem>_env.json``（``train.py`` 每个 checkpoint 都存，
-    与这份权重严格对应）。退路才是运行目录的 ``summary.json``：它记录的是
-    **整个课程**最后一份配置，训练中途加载早期 checkpoint 时并不精确，而且
-    ``write_summary`` 写的是 UTF-16（``json`` 读不了）。都没有时按 ``.zip``
-    里保存的观测维度反推是哪几个观测块（会打一行提示）。必须有这条退路，是因为
-    ``EnvConfig()`` 的默认观测是 10 帧 × 49 维 = 490 维，而本仓 ``config.yaml``
-    用 ``history_len: 1``；直接用默认配置加载本仓权重会抛
-    ``ValueError: Observation spaces do not match``。
+    1. 同目录 ``<stem>_env.json`` —— 训练时逐 checkpoint 写的完整配置，**唯一
+       精确来源**；
+    2. 运行目录 ``summary.json`` —— 整条课程的最后一份配置，中途 checkpoint
+       用它不精确；
+    3. 按观测维度反推观测开关组合（成功时打印提示，调用方必须知道是推断值）。
 
-    反推**不可能**打开 ``obs.base_height``：那个开关在 :class:`ObsConfig` 里
-    被硬性禁止（含地形真值，破坏盲走），所以旧架构那些维度要么被无歧义
-    还原，要么走 :meth:`_obs_config_for_dim` 返回 ``None`` 的报错分支。
-
-    ⚠ **反推回来的配置只有观测块是对的，其余全是 dataclass 默认值。**
-    ``gait_prior``（默认 ``False``）与 ``action_scale``（默认 ``0.30``）之类
-    的字段**不进观测**，任何按维度反推的方案在结构上都不可能恢复它们 ——
-    ``train.py`` 的每个中间检查点现在都写 ``_env.json`` 就是为了让这条退路
-    不被用到。用错的配置回放权重会得到**相反**的结论：同一个检查点，
-    ``gait_prior=False / action_scale=0.30`` 下测得 vx 指令响应斜率
-    ``−0.0001``，而训练时那套（``True / 0.60``）下是 ``+0.667``。
+    **反推在结构上不可能恢复不进观测的字段**（``gait_prior`` / ``action_scale``
+    等）—— 用默认配置回放一个在另一套配置下训出的权重，会得到**相反**的评测
+    结论（experience.md §20.7）。必须精确时用第 1 层。
     """
     model_path = Path(model_path)
     env_kw = _config_from_env_json(model_path)
@@ -254,9 +237,8 @@ def save_env_json(model_path: str | Path, cfg: EnvConfig, *,
                   stage: str = "") -> Path:
     """把 ``cfg`` 写进 ``<模型>_env.json``，并在 report 段记下该权重的地形。
 
-    **为什么需要它**：``summary.json`` 记的是**整条课程**的配置，而每个
-    checkpoint 是在不同的台阶上训出来的。play 想默认用对地形，就必须知道这个
-    权重当时的台阶高——只靠「最后一级」是错的（中间 checkpoint 全都会用错地形）。
+    每个 checkpoint 训练时的台阶高都不一样（只有最后一级是 15 cm），回放想默认
+    用对地形必须逐权重记录 —— 只靠「最后一级」是错的。
     """
     payload = {
         "env_config": asdict(cfg),
@@ -288,20 +270,11 @@ def step_height_from_model(model_path: str | Path) -> float | None:
 
 
 def _obs_config_for_dim(total: int, history_len: int = 1) -> ObsConfig | None:
-    """反推是哪几个观测块拼出了 ``total`` 维。
+    """按总维度反推观测开关组合（枚举五个开关的全部组合）。
 
-    ``base_lin_vel_body``(3) / ``gait_phase``(2) / ``step_height``(1) / ``command``(3)
-    / ``vel_filter``(2) 五个开关组合不多，直接枚举。``base_lin_vel_body`` 与
-    ``command`` 默认开，所以枚举顺序把它们放前面，使最简配置优先命中。
-
-    ``history_len`` 的默认值是 **1**（本仓 ``config.yaml`` 的取值）。它与
-    帧大小是相乘关系，只用总维度无法分离两者：51 维可以是「1 帧 × 51」也可以
-    是别的高帧数组合。所以默认取本仓最常用的历史长度，需要别的长度就显式传。
-
-    **``base_height`` 故意不在枚举里**：它在 :class:`ObsConfig` 的 ``__post_init__``
-    里被硬性禁止（含地形真值，会破坏盲走），所以任何会打开它的组合都不可构造。
-    归档 checkpoint 里那些 460/474 维的权重本来就与本仓观测不兼容，
-    不必为它们保留反推能力。
+    ``base_lin_vel_body`` 与 ``command`` 默认开，枚举顺序让最简配置优先命中。
+    ``base_height`` 故意不在枚举里（构造期即被禁止）。``history_len`` 与帧大小
+    是乘积关系、单靠总维数不可分离，默认取本仓最常用的 1。
     """
     flags = ("base_lin_vel_body", "gait_phase", "step_height", "command", "vel_filter")
     for combo in product((False, True), repeat=len(flags)):

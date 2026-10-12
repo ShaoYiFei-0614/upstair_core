@@ -70,10 +70,8 @@ MIN_STAGE_STEPS = 1
 def kw_call(venv, method: str, **kwargs):
     """用**关键字**调用子环境方法（``venv.env_method`` 的薄封装）。
 
-    ``env_method`` 是 ``(*method_args, **method_kwargs)`` 原样透传
-    （``stable_baselines3/common/vec_env/dummy_vec_env.py:127``），位置实参按
-    **形参顺序**绑定。凡是「多个同类型可选参数」的子环境方法，调用点一律走这里，
-    让「参数名对不上」变成 ``TypeError`` 而不是静默传错值。
+    ``env_method`` 的位置实参按形参顺序绑定 —— 凡「多个同类型可选参数」的
+    子环境方法一律走这里，让参数名对不上变成 ``TypeError`` 而不是静默传错值。
     """
     return venv.env_method(method, **kwargs)
 
@@ -107,14 +105,12 @@ class ProgressCallback(BaseCallback):
 
 
 class CheckpointCallback(BaseCallback):
-    """每 ``every`` 步存一份 ``checkpoints/<阶段>/<阶段>_<步数>_steps.zip``。
+    """每 ``every`` 步存 ``checkpoints/<阶段>/<阶段>_<步数>_steps.zip``，
+    连带 ``_vecnormalize.pkl`` 与 ``_env.json``。
 
-    同时写一份同名的 ``_env.json``。**必须写**：``_env.json`` 是唯一能把
-    「这个权重当时跑在什么配置下」带出来的东西，而 `gait_prior` /
-    `action_scale` 这类字段**不进观测**，任何「按观测维度反推」的方案都
-    不可能恢复它们。中间检查点没有 ``_env.json`` 时，评测脚本只能拿到
-    dataclass 默认值，于是「用另一套配置回放权重」——实测同一个检查点
-    在这两种配置下给出「斜率 −0.0001」与「斜率 +0.667」两个相反结论。
+    ``_env.json`` 必须写：它记录「这个权重当时跑在什么配置下」，而
+    ``gait_prior`` / ``action_scale`` 这类字段不进观测，任何按维度反推的方案
+    都恢复不了它们（experience.md §20.7）。
     """
 
     def __init__(self, directory: Path, stage: str, *, every: int,
@@ -161,10 +157,8 @@ class Trainer:
         self.ppo = ppo
         self.n_envs = n_envs
         self.last_stats = EpisodeStats(window=200)
-        # ⭐ ``config.yaml`` 的奖励基线（**没叠任何课程覆盖**的那一份）。
-        # ``make_env`` 每一级开始前把它抄回子环境，保证奖励覆盖是「从基线叠」
-        # 而不是「在上一次覆盖之上再叠」。这个陷阱在没有深拷贝的年代不可见
-        # （因为那时所有级共享同一个被改烂的 cfg），加上深拷贝之后才暴露出来。
+        # ⭐ config.yaml 的奖励基线（没叠任何课程覆盖的那一份）：
+        # make_env 每级开始前把它抄回子环境，保证覆盖是「从基线叠」。
         self._reward_baseline = copy.deepcopy(cfg.reward)
         # 「阶段名 → 该级实际生效的指令量程与奖励覆盖」，训练结束后写到
         # ``runs/<run>/plan.json``。见 ``make_env`` 里的说明。
@@ -172,13 +166,11 @@ class Trainer:
 
     # ---- 每个阶段一个独立的向量环境（地形烘焙在编译后的 MJCF 里）----------
     def make_env(self, stage: StageSpec, *, warm_start: str | None = None):
-        # ⭐ **每一级必须是自己的 ``EnvConfig`` 副本。**
-        #
-        # ``make_vec_env`` 把传进去的 cfg **原样绑**到每个子环境上，不做拷贝，
-        # 而下面那一串下发全是**就地改写**：``set_commands`` 写
-        # ``cfg.command.*``、``set_reward_overrides`` 用 ``setattr`` 写
-        # ``cfg.reward.*``。直接传 ``self.cfg`` 会让这些设置**跨阶段累积**，
-        # 顺序敏感。深拷贝一份，让每一级都从 ``config.yaml`` 的基线出发。
+        # ⭐ 三条纪律（违反的方式都是静默出错）：
+        # ① 每级深拷贝 cfg —— 下发全是就地改写，共享 cfg 会让设置跨级累积；
+        # ② 奖励覆盖先叠基线再叠本级键 —— 否则上一级覆盖过的键残留到这一级；
+        # ③ 指令量程无条件下发 —— 量程为 0 是「不练这个方向」的有意义设置，
+        #    守卫会让该级继承上一级的范围。且必须走关键字（见 kw_call）。
         stage_cfg = copy.deepcopy(self.cfg)
         venv = make_vec_env(
             stage.spec,
@@ -187,34 +179,19 @@ class Trainer:
             seed=int(self.run["seed"]),
             norm_reward=bool(self.ppo.get("norm_reward", True)),
         )
-        # 指令课程：把这一级的指令**采样范围**下发给每一个子环境。阶段内不再改动
-        # —— 观测的那 3 维在整个课程里恒定，PPO 的网络与 RolloutBuffer 才不用重建。
-        #
-        # ⚠ 这里**不能**用 ``if stage.command_vy_max:`` 之类的守卫：量程为 0 是
-        # **有意义的设置**（这一级不练这个方向），跳过下发只会让这一级继承上一级
-        # 的范围。无条件下发，且**必须走关键字**（见 ``kw_call``）。
+        # 指令课程：无条件下发这一级的采样范围（观测那 3 维恒定，PPO 结构不用重建）。
         kw_call(venv, "set_commands",
                 vy_max=stage.command_vy_max,
                 yaw_max=stage.command_yaw_max,
                 vx_min=stage.command_vx[0],
                 vx_max=stage.command_vx[1])
-        # 奖励课程：这一级的奖励覆盖（``curriculum.reward_overrides``）叠到
-        # ``reward:`` 段的基线值上。常见的用法是「台阶越高，越需要抬腿试探」，
-        # 于是逐级放大 ``foot_lift`` / ``probe_lift`` 这类成形项。
-        #
-        # ``set_reward_overrides`` 是 ``setattr`` 就地改，所以必须先显式把
-        # 基线抄回去 —— 否则上一级叠上去的键会残留，而这一级没覆盖到的键
-        # 就永远是上一级的值（``stage_cfg`` 的深拷贝只保证「不污染 self.cfg」，
-        # 保证不了「每一级都从基线出发」）。
+        # 奖励课程：先叠基线、再叠本级覆盖（见 make_env 注释 ②）。
         venv.env_method("set_reward_overrides",
                         dict(asdict(self._reward_baseline)))
         if stage.reward_overrides:
             venv.env_method("set_reward_overrides", dict(stage.reward_overrides))
-        # 把**这一级实际生效的**设置记下来。``<阶段>_env.json`` 与
-        # ``summary.json`` 里的 ``env_config`` 都是 ``config.yaml`` 的基线，
-        # 不含课程逐级下发的量程与奖励覆盖 —— 二者只靠读那些文件无法还原
-        # （``scripts/teleop.py`` 曾因此把「横向/偏航量程为 0」的基线当成
-        # 训练时的真实设置）。
+        # 记录这一级实际生效的设置：_env.json / summary.json 里只有 config.yaml
+        # 的基线，复现某一级必须读这份实施记录（plan.json）。
         self.plans[stage.name] = {
             "label": stage.label,
             "step_height": float(stage.step_height),
@@ -256,8 +233,8 @@ class Trainer:
         callbacks = [ProgressCallback(log_every=int(self.run["log_every"]))]
         every = int(self.run["save_every"])
         if every > 0:
-            # 中间检查点也要带 ``_env.json``：从子环境读回**这一级实际生效**的
-            # 配置（已叠好指令量程与奖励覆盖），而不是 ``config.yaml`` 的基线。
+            # 中间检查点带 _env.json：从子环境读回这一级实际生效的配置
+            # （已叠好量程与覆盖），而不是 config.yaml 的基线。
             try:
                 live_cfg = venv.get_attr("cfg")[0]
             except Exception:  # noqa: BLE001 - 取不到就不写，不影响训练

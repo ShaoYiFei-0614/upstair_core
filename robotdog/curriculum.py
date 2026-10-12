@@ -275,16 +275,12 @@ def write_summary(
     results: Sequence[StageResult] | None = None,
     meta: dict[str, Any] | None = None,
 ) -> Path:
-    """写 ``summary.json``: 课程定义 + 每级结果 + 元信息 (中文不转义)。
+    """写 ``summary.json``：课程定义 + 每级结果 + 元信息（中文不转义）。
 
-    ``meta`` 里的键会**平铺到顶层**，再补上 ``stages`` / ``results`` /
-    ``total_timesteps`` 三个由本函数计算的键。
-
-    ``stages`` 里每一级除了地形与预算，还**逐级**记下该级的指令量程
-    （``command_vx`` / ``command_vy_max`` / ``command_yaw_max``）。这些是**课程
-    逐级下发的值**，``env.json`` 里只有 ``config.yaml`` 的基线（``vy_max=0``），
-    回放时如果拿基线去评，判出来的成功/失败与训练时不是同一件事 —— 曾经因此把
-    「指令跟随」的级按「前进 N 米」去评，GIF 上打出一堆假的「摔倒/超时」。
+    ``meta`` 的键平铺到顶层，再补上 ``stages`` / ``results`` /
+    ``total_timesteps``。``stages`` **逐级**记下指令量程 —— 它们是课程逐级
+    下发的值，回放口径必须来自这里而不是 ``config.yaml`` 的基线
+    （experience.md §17）。
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
