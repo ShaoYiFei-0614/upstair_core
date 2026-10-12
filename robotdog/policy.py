@@ -7,15 +7,20 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import pickle
+import zipfile
 from dataclasses import asdict, dataclass, fields
+from itertools import product
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 
 from robotdog.env import CommandConfig, EnvConfig, ObsConfig, RewardConfig
-from robotdog.tools.terrain import StairSpec
+from robotdog.gait import GaitParams
+from robotdog.tools.terrain import StairSpec, demo_stairs_spec, flat_spec
 
 
 class Policy(Protocol):
@@ -53,8 +58,6 @@ class ObsNorm:
 
     @classmethod
     def from_path(cls, path: str | Path) -> ObsNorm:
-        import pickle
-
         with open(path, "rb") as fh:
             raw = pickle.load(fh)
         try:
@@ -82,8 +85,6 @@ def _rebuild(cfg_cls: Any, payload: dict[str, Any]) -> Any:
 
 def env_config_from_summary(summary_path: str | Path) -> EnvConfig:
     """从 ``runs/<name>/summary.json`` 恢复训练时使用的 :class:`EnvConfig`。"""
-    from robotdog.gait import GaitParams
-
     data = json.loads(Path(summary_path).read_text(encoding="utf-8"))
     env_kw = dict(data.get("env_config") or {})
     for key in _TUPLE_FIELDS:
@@ -110,10 +111,6 @@ def _zip_data(model_path: str | Path) -> Any:
     SB3 2.9 把 ``data`` 存成 JSON，并用自定义编码器把对象写进
     ``":serialized:"`` 的 base64 pickle；SB3 < 2.0 直接 pickle 整个 ``data``。
     """
-    import base64
-    import pickle
-    import zipfile
-
     try:
         with zipfile.ZipFile(model_path) as zf:
             raw = zf.read("data")
@@ -132,9 +129,6 @@ def _zip_data(model_path: str | Path) -> Any:
 
 def _deserialize(value: Any) -> Any:
     """把 SB3 的 ``":serialized:"`` 字段解回对象；普通值原样返回。"""
-    import base64
-    import pickle
-
     if isinstance(value, dict) and ":serialized:" in value:
         try:
             return pickle.loads(base64.b64decode(value[":serialized:"]))
@@ -309,8 +303,6 @@ def _obs_config_for_dim(total: int, history_len: int = 1) -> ObsConfig | None:
     归档 checkpoint 里那些 460/474 维的权重本来就与本仓观测不兼容，
     不必为它们保留反推能力。
     """
-    from itertools import product
-
     flags = ("base_lin_vel_body", "gait_phase", "step_height", "command", "vel_filter")
     for combo in product((False, True), repeat=len(flags)):
         cand = ObsConfig(history_len=history_len, **dict(zip(flags, combo)))
@@ -327,8 +319,6 @@ def _obs_config_for_dim(total: int, history_len: int = 1) -> ObsConfig | None:
 def stair_from_height(height_cm: float | None, *, tread: float = 0.50,
                       n_up: int = 8) -> StairSpec | None:
     """由台阶高度（cm）造一条楼梯；``None`` 表示沿用配置里的地形。"""
-    from robotdog.tools.terrain import demo_stairs_spec, flat_spec
-
     if height_cm is None:
         return None
     if height_cm <= 0.0:

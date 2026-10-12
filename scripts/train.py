@@ -47,8 +47,10 @@ from robotdog.config import (  # noqa: E402
 )
 from robotdog.curriculum import (  # noqa: E402
     EpisodeStats,
+    StageResult,
     StageSpec,
     format_curriculum,
+    format_seconds,
     write_summary,
 )
 from robotdog.env import EnvConfig  # noqa: E402
@@ -57,7 +59,6 @@ from robotdog.tools import console  # noqa: E402
 from robotdog.training import (  # noqa: E402
     RunDir,
     build_ppo,
-    format_duration,
     make_vec_env,
     save_vecnormalize,
 )
@@ -302,8 +303,6 @@ def parse_args(argv: Sequence[str] | None = None):
 
 def _result(stage: StageSpec, stats: EpisodeStats, wall: float, path: Path,
             cfg: EnvConfig):
-    from robotdog.curriculum import StageResult
-
     return StageResult(
         name=stage.name,
         label=stage.label,
@@ -387,7 +386,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         warm = str(path)
         print(f"[课程] <<< '{stage.name}' 成功率={stats.success_rate:.1%} "
               f"摔倒率={stats.fall_rate:.1%} 均回报={stats.mean_return:.1f} "
-              f"用时={format_duration(wall)}", flush=True)
+              f"用时={format_seconds(wall)}", flush=True)
 
     # 末级权重另存为 model_final，方便 play 直接找（连同它的归一化统计与地形记录）
     if results and Path(results[-1].model_path).is_file():

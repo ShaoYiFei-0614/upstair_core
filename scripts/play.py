@@ -33,7 +33,7 @@ import time
 from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -407,7 +407,7 @@ def hud_for(out: EpisodeOutcome, total: int, stair, *, frame_index: int,
 
 def mode_gif(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
              name: str, play: dict[str, Any], gif_dir: Path | None = None,
-             command: tuple[float, float, float] | None = None) -> int:
+             command: tuple[float, float, float] | None = None) -> None:
     """模式 1：连续渲染 ``episodes`` 个回合，合成一个 GIF。
 
     ``gif_dir`` 决定产物落点。**每个课程阶段一个子目录**（默认
@@ -441,7 +441,6 @@ def mode_gif(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
     size_mb = gif.stat().st_size / 1e6
     print(f"\nGIF: {gif}  ({len(frames)} 帧, {size_mb:.1f} MB, {GIF_FPS} fps)")
     print(f"成功率: {ok}/{episodes} = {100.0 * ok / max(1, episodes):.1f}%")
-    return 0
 
 
 def mode_eval(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
@@ -517,8 +516,8 @@ def _default_height_cm(play: dict[str, Any], target: PlayTarget) -> float | None
 
     优先 ``config.yaml`` 的 ``play.stage_height_cm``（显式覆盖）；否则读权重旁
     ``<模型>_env.json`` 里记的该 checkpoint 训练时的台阶高（**每个 checkpoint 的
-    地形都不一样**，只有最后一级是 15 cm）；再没有就退回 :func:`stair_from_height`
-    的默认（3 cm）。
+    地形都不一样**，只有最后一级是 15 cm）；再没有就返回 ``None``，由
+    ``stair_from_height(None)`` 落到裸 ``StairSpec()`` 的默认（5 cm × 8 级）。
     """
     if play.get("stage_height_cm") is not None:
         return float(play["stage_height_cm"])
@@ -824,7 +823,6 @@ def main(argv: Sequence[str] | None = None) -> int:
           + ", ".join(f"{s.name}({s.height_cm:g}cm)" for s in plan))
     episodes = int(play["episodes_gif"])
     seed = int(play["seed"])
-    failed = 0
     for i, stage in enumerate(plan):
         gif_dir = _gif_dir_for(gifs_root, stage)
         print(f"\n[{i + 1}/{len(plan)}] {stage.label}  "
@@ -843,13 +841,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                                  vx_min=stage.spec.command_vx[0],
                                  vx_max=stage.spec.command_vx[1])
             print(f"  观测: {env.observation_space.shape}  动作: {env.action_space.shape}")
-            failed += mode_gif(env, policy, episodes=episodes, seed=seed,
-                               name=stage.label, play=play, gif_dir=gif_dir,
-                               command=stage.command)
+            mode_gif(env, policy, episodes=episodes, seed=seed,
+                     name=stage.label, play=play, gif_dir=gif_dir,
+                     command=stage.command)
         finally:
             env.close()
     print(f"\n全部 GIF 输出到: {gifs_root}")
-    return 0 if failed == 0 else 1
+    return 0
 
 
 if __name__ == "__main__":

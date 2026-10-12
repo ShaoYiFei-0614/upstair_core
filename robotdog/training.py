@@ -129,28 +129,28 @@ def build_ppo(
         warnings.filterwarnings("ignore", message=".*mini-batch size.*",
                                 category=UserWarning)
         return PPO(
-        "MlpPolicy",
-        venv,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        learning_rate=learning_rate,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        clip_range=clip_range,
-        ent_coef=ent_coef,
-        vf_coef=vf_coef,
-        max_grad_norm=max_grad_norm,
-        target_kl=target_kl,
-        policy_kwargs=dict(
-            net_arch=dict(pi=list(net_arch), vf=list(net_arch)),
-            activation_fn=nn.Tanh,
-            log_std_init=log_std_init,
-        ),
-        tensorboard_log=str(tensorboard_log) if tensorboard_log else None,
-        device=device,
-        seed=seed,
-        verbose=verbose,
+            "MlpPolicy",
+            venv,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            learning_rate=learning_rate,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            clip_range=clip_range,
+            ent_coef=ent_coef,
+            vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
+            target_kl=target_kl,
+            policy_kwargs=dict(
+                net_arch=dict(pi=list(net_arch), vf=list(net_arch)),
+                activation_fn=nn.Tanh,
+                log_std_init=log_std_init,
+            ),
+            tensorboard_log=str(tensorboard_log) if tensorboard_log else None,
+            device=device,
+            seed=seed,
+            verbose=verbose,
         )
 
 
@@ -190,7 +190,9 @@ def load_policy(
     cand = model_path.with_name(model_path.stem + "_vecnormalize.pkl")
     if cand.is_file():
         restore_vecnormalize(venv, cand)
-    norm = ObsNorm.from_path(cand) if cand.is_file() else None
+        norm = ObsNorm.from_path(cand)
+    else:
+        norm = None
     return model, norm
 
 
@@ -301,20 +303,10 @@ class RunDir:
 # --------------------------------------------------------------------------- #
 
 
-def format_duration(seconds: float) -> str:
-    """把秒数写成 ``12.3s`` / ``4.5min`` / ``1.20h``。"""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    if seconds < 3600:
-        return f"{seconds / 60:.1f}min"
-    return f"{seconds / 3600:.2f}h"
-
-
 __all__ = [
     "DEFAULT_NET_ARCH",
     "RunDir",
     "build_ppo",
-    "format_duration",
     "load_policy",
     "make_env_fn",
     "make_vec_env",

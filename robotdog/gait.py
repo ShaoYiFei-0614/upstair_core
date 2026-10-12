@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from dataclasses import asdict, dataclass, field
@@ -186,9 +187,7 @@ class GaitParams:
 
     def with_dynamic_scale(self, scale: float) -> GaitParams:
         """返回一个把动态缩放写成 ``scale`` 的副本（本方法不改自己）。"""
-        import copy as _copy
-
-        clone = _copy.copy(self)
+        clone = copy.copy(self)
         clone._scale_dyn = float(scale)
         return clone
 

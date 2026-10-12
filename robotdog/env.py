@@ -307,7 +307,6 @@ class Go2StairsEnv(gym.Env):
         self._max_steps = int(self.cfg.episode_length_s / self.cfg.control_dt)
 
         self._hist: deque[np.ndarray] = deque(maxlen=self.cfg.obs.history_len)
-        self._prev_action = np.zeros(self.num_act, dtype=np.float64)
         self._last_action = np.zeros(self.num_act, dtype=np.float64)
         self._step_count = 0
         # 本回合**四足支撑面**曾达到的最大高度（2026-10-12 起；原为机身正下方地形），
@@ -921,8 +920,8 @@ class Go2StairsEnv(gym.Env):
         而 RL 的终止信号本来就是上帝视角，所以没有问题 —— 但**绝不能**把它写进
         ``_obs_frame``。
         """
-        heights = [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
-        return float(min(heights)) if heights else self.terrain_height_under_base
+        heights = self._terrain_height(self.foot_pos[:, 0])
+        return float(np.min(heights)) if heights.size else self.terrain_height_under_base
 
     def _support_height_mean(self) -> float:
         """四足下方地形高度的均值。
@@ -931,8 +930,8 @@ class Go2StairsEnv(gym.Env):
         跳变摊到四次 ``h/4`` 增量上。它*并不*只是更宽松 —— 跨越过程中均值高于
         最小值，所以会更早触发；它消除的是单帧的不连续。
         """
-        heights = [self.stair.height_at(float(x)) for x in self.foot_pos[:, 0]]
-        return float(np.mean(heights)) if heights else self.terrain_height_under_base
+        heights = self._terrain_height(self.foot_pos[:, 0])
+        return float(np.mean(heights)) if heights.size else self.terrain_height_under_base
 
     def _fall_reference_height(self) -> float:
         """摔倒判据用来衡量躯干的地形高度。
@@ -995,7 +994,6 @@ class Go2StairsEnv(gym.Env):
 
         self.nominal_pose = float(self.meta.home_qpos[2])
         self._peak_terrain_height = self._support_height()   # 足端支撑面，不是躯干 x（见 §2.7）
-        self._prev_action = np.zeros(self.num_act)
         self._last_action = np.zeros(self.num_act)
         self._command[:] = self._sample_command()
         self._step_count = 0
@@ -1143,7 +1141,6 @@ class Go2StairsEnv(gym.Env):
         )
         self._advance_foot_air_time(foot_contact)
 
-        self._prev_action = self._last_action.copy()
         self._last_action = action.copy()
         # 足端 xy 位移必须恰好在一个控制步上测量，所以这个快照每一步都要
         # 推进。

@@ -280,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         stair = flat_spec_for()
         terrain_label = "平地"
     else:
-        stair = stair_from_height(args.height) or _stair_from_model(cfg, target, args)
+        stair = stair_from_height(args.height) or _stair_from_model(target)
         if stair is None:
             raise SystemExit("无法确定地形：请用 --height 指定台阶高 [cm]，或加 --flat")
         terrain_label = f"台阶 {stair.step_height * 100:.1f}cm × {stair.n_up} 级"
@@ -323,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _stair_from_model(cfg, target, args):
+def _stair_from_model(target):
     """用权重自带的台阶高造地形（与 ``play.py`` 的行为一致）。"""
     from robotdog.policy import step_height_from_model
 

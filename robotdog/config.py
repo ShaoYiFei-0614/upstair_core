@@ -94,6 +94,7 @@ SECTION_KEYS: dict[str, frozenset[str]] = {
     "run": frozenset({"name", "seed", "save_every", "log_every"}),
     "play": frozenset({
         "episodes_gif", "episodes_eval", "seed", "gif_max_frames", "stages", "batch",
+        "stage_height_cm",
     }),
     "curriculum": frozenset({
         "tread", "n_up", "heights_cm", "timesteps", "learning_rate",

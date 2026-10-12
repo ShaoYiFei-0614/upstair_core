@@ -328,8 +328,12 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
         (env.base_pos[2] - env.terrain_height_under_base - target_height) ** 2
     )
     terms["joint_vel"] = rc.joint_vel * float(np.sum(np.square(env.joint_vel)))
+    # 相邻步动作差 ``‖a_t − a_{t-1}‖``。奖励结算发生在 ``env.step`` 更新动作
+    # 历史之前，所以 ``_last_action`` 此刻存的就是上一步的动作 ``a_{t-1}``。
+    # （2026-10-12 修复：原先读 ``_prev_action``，它的更新时序滞后一步，让这一项
+    # 实际算成了「与上上步动作的差」。）
     terms["action_rate"] = rc.action_rate * float(
-        np.sum(np.square(action - env._prev_action))
+        np.sum(np.square(action - env._last_action))
     )
     lo, hi = env.act_low, env.act_high
     q = env.joint_pos
