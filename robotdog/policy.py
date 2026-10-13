@@ -270,13 +270,16 @@ def step_height_from_model(model_path: str | Path) -> float | None:
 
 
 def _obs_config_for_dim(total: int, history_len: int = 1) -> ObsConfig | None:
-    """按总维度反推观测开关组合（枚举五个开关的全部组合）。
+    """按总维度反推观测开关组合。
 
-    ``base_lin_vel_body`` 与 ``command`` 默认开，枚举顺序让最简配置优先命中。
-    ``base_height`` 故意不在枚举里（构造期即被禁止）。``history_len`` 与帧大小
-    是乘积关系、单靠总维数不可分离，默认取本仓最常用的 1。
+    ``base_lin_vel_body`` 与 ``command`` 是**必选项**（构造期强制为 true），
+    反推只枚举三个可选开关。``base_height`` 同样不在枚举里（构造期即被禁止）。
+    枚举顺序让「本仓最常用」的组合优先命中 —— ``itertools.product`` 是最后
+    一个位置翻转最快，所以把 ``gait_phase`` 放最前（恒 False 持续最久）、
+    ``vel_filter`` 居中：51 维会先命中 vel+step 组合而非 gait+step。
+    ``history_len`` 与帧大小是乘积关系、单靠总维数不可分离，默认取本仓最常用的 1。
     """
-    flags = ("base_lin_vel_body", "gait_phase", "step_height", "command", "vel_filter")
+    flags = ("gait_phase", "vel_filter", "step_height")
     for combo in product((False, True), repeat=len(flags)):
         cand = ObsConfig(history_len=history_len, **dict(zip(flags, combo)))
         if cand.size == total:

@@ -111,7 +111,11 @@ env:
   # 每一项都有真机出处（编码器 / IMU / 上一步动作 / 本体感觉估计 / 上层指令），
   # 加上一个标量任务参数 step_height。信息来源清单见 agent.md §8.6。
   obs:
+    # ⭐ base_lin_vel_body 与 command 是**必选项**（构造期强制，改 false 直接抛
+    # ValueError）：指令跟踪的两个组成部分 —— 「实测」（腿式里程计 + IMU 融合的
+    # 本体感觉估计）与「指令」（上层下发），缺一不可，见 doc/env.md。
     base_lin_vel_body: true
+    command: true
     # 必须 false，且**不能**改成 true：这一项是「机身相对正下方地形的高度」，
     # 含地形真值，会破坏盲走。改成 true 会直接抛 ValueError（ObsConfig.__post_init__）。
     base_height: false
@@ -123,7 +127,7 @@ env:
     vel_filter: true
     # 历史帧数。实测 1 帧**不亏**：课程内每一级都不差、3cm/6cm 还更好
     # （92% vs 62%、22% vs 0%），课程外 3/5cm 都是 100%。50 Hz 下相邻帧几乎
-    # 相同，10 帧绝大部分是冗余（10 帧 = 500 维）。见 train.md §3.6。
+    # 相同，10 帧绝大部分是冗余（10 帧 = 500 维）。
     history_len: 1
 
 

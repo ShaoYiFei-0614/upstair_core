@@ -62,7 +62,7 @@ class ObsConfig:
 
     ``base_frame_size`` 始终存在（42 个本体感知量）。下面几个块按声明顺序
     追加；``step_height`` 是盲走策略无法低成本推断的那一项，所以它是一个普通
-    数字，而不是要机器人自己去估计的量。``README.md`` §3.2 列出了由此得到的
+    数字，而不是要机器人自己去估计的量。``doc/env.md`` 列出了由此得到的
     维度。
     """
 
@@ -81,8 +81,23 @@ class ObsConfig:
         if self.base_height:
             raise ValueError(
                 "obs.base_height 必须为 false：这一项是『机身相对正下方地形的高度』，"
-                "含地形真值，盲走策略不允许拿到（见 agent.md §8.6 的信息来源清单）。"
+                "含地形真值，盲走策略不允许拿到（见 doc/env.md 的信息来源清单）。"
                 "要观察离地高度请用本体感知的替代品，或保持 step_height 这一项。"
+            )
+        # 下面两项是**必选项**：指令跟踪的两个组成部分 —— 「实测」（本体感觉
+        # 估计，不含地形真值）与「指令」（上层下发）。缺任何一个，策略都无法
+        # 计算跟随误差，构造期直接拒绝。
+        if not self.base_lin_vel_body:
+            raise ValueError(
+                "obs.base_lin_vel_body 必须为 true：机身系线速度是指令跟踪的"
+                "「实测」侧（腿式里程计 + IMU 融合的本体感觉估计，不含地形真值）；"
+                "没有它策略不知道自己在往哪走（见 doc/env.md 的信息来源清单）。"
+            )
+        if not self.command:
+            raise ValueError(
+                "obs.command 必须为 true：三轴速度指令是跟随目标的「指令」侧，"
+                "奖励与成功判据都以它为参照；课程只能改采样范围，不能把维数关掉"
+                "（见 doc/env.md 的信息来源清单）。"
             )
 
     @property
@@ -702,7 +717,7 @@ class Go2StairsEnv(gym.Env):
         """四足下方最低的地形高度 —— 真正撑住机器人的支撑面。
 
         **特权信息**（读 ``stair.height_at()`` 真值）：只服务终止判定与
-        stair_progress，绝不能写进 ``_obs_frame``（盲走契约，见 agent.md §8.6）。
+        stair_progress，绝不能写进 ``_obs_frame``（盲走契约，见 doc/env.md）。
         """
         heights = self._terrain_height(self.foot_pos[:, 0])
         return float(np.min(heights)) if heights.size else self.terrain_height_under_base
