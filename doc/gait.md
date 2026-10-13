@@ -39,6 +39,11 @@ target = home + gait_gain · gait.radians(t) + action_scale · action
 不存在稳定解）、上侧是 `normalize()` 开始整体再缩放的边界。低于下沿的指令段
 先验仍以下沿速度走，那一段靠策略残差刹车。
 
+⚠ **标定曲线是先验特定的**：`v(s)` 在 5.48 Hz 的 trot 上测得；换步频/换先验
+必须重做 §20 的标定。当前出货配置（2026-10-13 起）`gait_speed_track: false`，
+使用 2 Hz 自然步态（`artifacts/trot_natural.json`，零残差 ≈0.22 m/s、平地
+3 seed × 40 s 全存活）—— 速度参数化机制保留但闲置。
+
 运行期动态缩放放在 `_scale_dyn` 字段：`radians()` 临时应用、用完还原，
 **不进任何配置文件**（`to_dict()` 会剔除）—— 它是每步按当前指令现算的，写进
 配置只会让下次加载带一个过期数字。

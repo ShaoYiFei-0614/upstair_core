@@ -75,10 +75,11 @@ CAMERA_GIF = "track"
 #: 渲染分辨率（mujoco 离屏渲染），GIF 编码前按 :data:`GIF_SCALE` 整数缩小。
 FRAME_WIDTH = 960
 FRAME_HEIGHT = 540
-#: GIF 帧率（也是 HUD 里「帧 i/n」的基准）。
+#: GIF 帧率（HUD 里「帧 i/n」的基准；实际回放帧间隔由取帧步幅决定，见 run_episode）。
 GIF_FPS = 25
 #: GIF 编码前的整数缩小倍数；2 表示 960×540 → 480×270。
 GIF_SCALE = 2
+
 
 #: 字体候选（HUD 用），按顺序取第一个存在的。
 _FONT_CANDIDATES = (
@@ -244,7 +245,7 @@ def draw_hud(frame: np.ndarray, lines: Sequence[str]) -> np.ndarray:
     return np.asarray(img)
 
 
-def write_gif(path: Path, frames: Sequence[np.ndarray]) -> Path:
+def write_gif(path: Path, frames: Sequence[np.ndarray], *, frame_ms: int = 40) -> Path:
     """把 RGB 帧编码成 GIF（全片共用一套调色板）。
 
     先取若干帧拼缩略 mosaic 求全局调色板，再逐帧套用 —— 逐帧各自量化会让同一只
@@ -284,7 +285,7 @@ def write_gif(path: Path, frames: Sequence[np.ndarray]) -> Path:
         path,
         save_all=True,
         append_images=images[1:],
-        duration=max(20, int(round(1000.0 / max(1, GIF_FPS)))),
+        duration=max(20, int(frame_ms)),
         loop=0,
         optimize=True,
         disposal=2,
@@ -317,6 +318,9 @@ class EpisodeOutcome:
     #: 回合末的滤波实测值（与奖励里用的同一个量，见 ``robotdog/reward.py``）。
     act_vy: float = 0.0
     act_yaw: float = 0.0
+    #: 帧间隔 [ms] = 取帧步幅 × 控制周期 —— GIF 按真实仿真时间回放
+    #: （内存上限把取帧稀疏化时，帧间隔相应加大，播放不再被动加快）。
+    frame_ms: int = 40
     frames: list[np.ndarray] = field(default_factory=list)
 
     @property
@@ -349,8 +353,10 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
     x0, z0 = float(env.base_pos[0]), float(env.base_pos[2])
     max_steps = int(env.cfg.episode_length_s / env.cfg.control_dt)
     take = max(FRAME_STRIDE, -(-max_steps // max_frames)) if max_frames > 0 else FRAME_STRIDE
+    # 帧间隔 = 取帧步幅 × 控制周期 → GIF 按真实仿真时间回放。
+    frame_ms = max(20, int(round(take * env.cfg.control_dt * 1000)))
     out = EpisodeOutcome(episode=episode, steps=0, cmd_vx=float(vx),
-                         cmd_vy=float(vy), cmd_yaw=float(yaw))
+                         cmd_vy=float(vy), cmd_yaw=float(yaw), frame_ms=frame_ms)
     info: dict[str, Any] = {}
     terminated = truncated = False
 
@@ -435,10 +441,12 @@ def mode_gif(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
               f"实测 vy{out.act_vy:+.2f}/wz{out.act_yaw:+.2f}", flush=True)
 
     gif = (gif_dir or paths.OUTPUT_GIFS_DIR) / f"{name}.gif"
-    write_gif(gif, frames)
+    frame_ms = outcomes[0].frame_ms if outcomes else 40
+    write_gif(gif, frames, frame_ms=frame_ms)
     ok = sum(o.success for o in outcomes)
     size_mb = gif.stat().st_size / 1e6
-    print(f"\nGIF: {gif}  ({len(frames)} 帧, {size_mb:.1f} MB, {GIF_FPS} fps)")
+    print(f"\nGIF: {gif}  ({len(frames)} 帧, {size_mb:.1f} MB, "
+          f"{1000.0 / frame_ms:.1f} fps = 实时)")
     print(f"成功率: {ok}/{episodes} = {100.0 * ok / max(1, episodes):.1f}%")
 
 
