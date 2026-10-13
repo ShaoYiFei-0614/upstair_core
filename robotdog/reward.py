@@ -125,9 +125,12 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     rc = env.cfg.reward
     cmd = env.cfg.command
     rpy = env.base_rpy
-    # 「前进」的参照系按地形分（见 ``_forward_speed``）；「指令跟踪读滤波量还是
-    # 瞬时量」由观测开关决定 —— 奖励与观测必须指同一个数。
-    v_fwd = _forward_speed(env)
+    # 指令在世界系给定，统一投影到机体系再比较（``env.command_body()``）：执行器
+    # 只产生机体系速度，而世界系指令在机身转向后含义不变 —— 「掉头走开」会立即
+    # 表现为机体系误差，§21.14 的地形参照分支由此统一（experience.md §23.9）。
+    # 「指令跟踪读滤波量还是瞬时量」由观测开关决定 —— 奖励与观测必须指同一个数。
+    v_fwd = float(env.base_lin_vel_body[0])
+    cmd_body = env.command_body()
     target_height = env.nominal_pose
     vel_filter = bool(env.cfg.obs.vel_filter)
 
@@ -136,7 +139,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 1) 前进速度跟踪：绝对误差窗口上的线性死区 + 超速侧额外惩罚（有倍率上界），
     #    两处都有界。目标取**本步真实采样的指令** ``env._command[0]``，不是
     #    ``cmd.vx`` —— 那只是采样范围为空时的回退定值，课程下发的是范围。
-    err = float(v_fwd) - float(env._command[0])
+    err = v_fwd - float(cmd_body[0])
     track = max(-1.0, track_shape(abs(err) / float(rc.forward_track_window),
                                   float(rc.track_tail)))
     if err > 0.0:
@@ -156,7 +159,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     tail = float(rc.track_tail)
     if cmd.vy_max:
         vy = (env.filtered_lateral_vel if vel_filter else env.base_lin_vel_body[1])
-        xy = abs(vy - cmd.vy) / (0.5 * float(cmd.vy_max))
+        xy = abs(vy - float(cmd_body[1])) / (0.5 * float(cmd.vy_max))
         follow += rc.lateral_vel * max(-1.0, track_shape(xy, tail))
     # 偏航项**恒在**（不受 ``yaw_max`` 门控），量程取 ``max(yaw_max, yaw_range_floor)``。
     # 门控的代价实测过：``yaw_max == 0`` 的级别里没有任何一项读 wz，策略学会
@@ -166,7 +169,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 保证「不转」在零指令级别也有价钱，同时避免 ``yaw_max == 0`` 时除零；
     # 加惩罚必须**有界**（下界 −1，即最差 −``yaw_rate``），理由同前进项。
     wz = env.filtered_yaw_rate if vel_filter else env.yaw_rate
-    yaw_err = abs(wz - cmd.wz)
+    yaw_err = abs(wz - float(cmd_body[2]))
     # ``wz = 0`` 的级别补一个零指令基线惩罚：否则「命令我不许转」没有任何价钱
     # （放大系数见 ``RewardConfig.yaw_zero_gain``）。
     if cmd.wz == 0.0:
@@ -318,7 +321,8 @@ def update_probe_state(env) -> None:
     「抬高进展」（否则势函数在整条回合里只增不减，第二次卡住就没有梯度）。
     """
     rc = env.cfg.reward
-    cmd_vx = float(env._command[0])          # 采样指令，不是 cfg.command.vx（见 env.md §3.13）
+    cmd_body = env.command_body()
+    cmd_vx = float(cmd_body[0])              # 机体系投影（见 command_body 的 docstring）
     # 机身系：这是「往前走没走」的判据，世界系分量在机器人偏航时会换号。
     vx = float(env.base_lin_vel_body[0])
     terrain = float(env.terrain_height_under_base)
@@ -332,20 +336,3 @@ def update_probe_state(env) -> None:
             env._blocked = True
             env._blocked_peak = terrain
             env._probe_best[:] = 0.0
-
-
-# --------------------------------------------------------------------------- #
-# 俯仰补偿（只服务前进项）
-# --------------------------------------------------------------------------- #
-
-def _forward_speed(env) -> float:
-    """前进项该跟踪的速度 —— 按地形分两个参照系。
-
-    楼梯级（``n_up > 0``）返回**课程方向**（世界系 +x）的速度：楼梯是沿 +x 铺开的
-    一条课程，「前方」只能是课程方向 —— 只跟踪机身系时「前方」是鼻子指哪算哪，
-    出生点背后是无障碍平地，掉头走开就是最优解（``experience.md`` §21.14 有完整
-    的实测对账）。平地段返回机身系速度，那里转向本身是指令的一部分。
-    """
-    if env.stair.n_up > 0:
-        return float(env.base_lin_vel_world[0])
-    return float(env.base_lin_vel_body[0])

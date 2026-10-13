@@ -100,12 +100,14 @@ class ObsConfig:
 
 @dataclass
 class CommandConfig:
-    """三轴速度指令 ``[vx, vy, wz]``。
+    """三轴速度指令 ``[vx, vy, wz]`` —— **vx/vy 在世界系给定**，wz 为绕竖直轴
+    的角速度（两系同值）。
 
     每个轴都是「范围 + 当前值」两层：范围由指令课程按阶段下发（``robotdog/config.py``
     的 ``config_to_stages``），当前值在 ``reset()`` 时从范围内采样，也可以由外部
     控制器用 :meth:`Go2StairsEnv.set_command_now` 随时改写（``scripts/teleop.py``）。
-    ``_now`` 就是当前值，奖励与观测都读它。
+    ``_now`` 就是当前值（**世界系**），奖励与观测读的都是它的**机体系投影**
+    （:meth:`Go2StairsEnv.command_body`）。
 
     范围的上界与下界取 ``±vy_max`` / ``±yaw_max``；前向是对称轴之外的量（不可能
     往回走），所以用 ``vx_min`` / ``vx_max`` 一对。``vx_max == 0`` 表示「前向不采样」，
@@ -203,16 +205,24 @@ class EnvConfig:
     # --- 成功 -------------------------------------------------------------- #
     spawn_back: float = 0.55                # 第一个立面前方的米数
     # 平地阶段的成功判据是**指令跟随**：脱靶步占比与「实测量真的跟着指令变」的
-    # 相关系数双门槛（常数输出能把平均误差压到最小，骗不过相关系数）。容差按
-    # 「真在跟的策略实测误差的 1.4~1.6 倍」标定，依据见 experience.md §18。
-    flat_track_tol_vy: float = 0.30         # m/s
-    flat_track_tol_wz: float = 0.70         # rad/s
-    flat_track_tol_vx: float = 0.35         # m/s（比横移松：步态的周期速度波动主要在前后向）
+    # 相关系数双门槛（常数输出能把平均误差压到最小，骗不过相关系数）。
+    # ⭐ 2026-10-13 容差随指令量程缩减（vy ≤ 0.15、wz ≤ 0.6）收紧：vy 0.30→0.12、
+    # wz 0.70→0.40。取值原则（避免骑边界）：容差 ≈ 2×「真在跟的策略」的预期误差
+    # （滤波过渡 + 调制滞后 ≈ 0.05~0.2），让跟得动的策略有余量、不跟的策略
+    # （误差 = 满量程）明确出局 —— 不放在任何典型误差恰好落地的值上。
+    flat_track_tol_vy: float = 0.12         # m/s（vy_max ≤ 0.15，留 ~2.5 倍过渡余量）
+    flat_track_tol_wz: float = 0.40         # rad/s（yaw_max ≤ 0.6；不跟者满量程 0.6 出局）
+    flat_track_tol_vx: float = 0.35         # m/s（vx 带 [0.2,0.6] 未变，维持原值）
     flat_track_miss_ratio: float = 0.30     # 上限含指令阶跃过渡段的天然脱靶份额
     flat_track_min_corr: float = 0.30       # 只对指令本身在变的轴判定；作用是排除零响应
     # 回合内每隔这么多**控制步**重抽一次指令（0 或负数 = 整回合定值）。定值指令
     # 下「输出常数」是最优解；回放/遥操作用 set_command_now(hold=True) 关掉。
     command_hold_steps: int = 100
+    # 指令缓变扰动（OU 过程）：训练时模拟真实操作手的轻微无规律输入 —— 每步
+    # ``w ← w·exp(−dt/τ) + std·√dt·N(0,1)``，稳态幅度 ≈ std·√(τ/2)。叠加在采样
+    # 指令之上；hold=True（回放/遥操作）时完全不生效；0 = 关闭。
+    command_wander_std: float = 0.0
+    command_wander_tau: float = 1.5
 
     # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
@@ -295,6 +305,8 @@ class Go2StairsEnv(gym.Env):
         # 所以「外部控制器改写指令」与「奖励读当前指令」看到的是同一份数据，
         # 不存在两份状态不同步的窗口。
         self._command = self.cfg.command._now
+        self._cmd_hold = np.zeros(3)      # 重抽的「驻留」指令（缓变扰动围绕它走）
+        self._cmd_wander = np.zeros(3)    # 指令缓变扰动（OU 过程状态）
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
@@ -340,7 +352,7 @@ class Go2StairsEnv(gym.Env):
     # ------------------------------------------------------------------- 指令
 
     def _sample_command(self) -> list[float]:
-        """按当前范围抽一条指令 ``[vx, vy, wz]``。上界为 0 的轴恒为 0。"""
+        """按当前范围抽一条**世界系**指令 ``[vx, vy, wz]``。上界为 0 的轴恒为 0。"""
         cmd = self.cfg.command
         vx = (float(self._rng.uniform(cmd.vx_min, cmd.vx_max))
               if cmd.vx_max else float(cmd.vx))
@@ -395,6 +407,8 @@ class Go2StairsEnv(gym.Env):
 
         ``hold=True`` 表示「这条指令要一直生效，别被回合内的周期重抽覆盖」
         —— 回放、遥操作与 GIF 都用它；默认 ``False`` 则只写到下一次重抽为止。
+        ``vx`` / ``vy`` 为**世界系**分量（机体系投影由 :meth:`command_body`
+        每步现算）。
         """
         if hold:
             # 把年龄顶到不可能到达的值：``step()`` 里的重抽判据就永远不成立。
@@ -404,6 +418,8 @@ class Go2StairsEnv(gym.Env):
         self.cfg.command._set_now(vx=vx, vy=vy, wz=yaw_rate)
         if vx is not None:
             self.cfg.command.vx = float(vx)
+        # 同步驻留值：缓变扰动/重抽以写入值为基准（hold=True 时扰动不生效）。
+        self._cmd_hold[:] = [float(v) for v in self._command]
         # 刷新「已经算好、还没被取走」的那一帧观测：控制器是在两次 ``step()``
         # 之间下指令的，不刷新的话策略拿到的那一帧还带着上一步的指令（50 Hz
         # 下 20 ms 的滞后）。指令是外生输入，改它不破坏马尔可夫性。
@@ -412,6 +428,23 @@ class Go2StairsEnv(gym.Env):
             if self._hist[-1].shape == frame.shape:
                 self._hist[-1] = frame
         return list(self._command)
+
+    def command_body(self) -> np.ndarray:
+        """世界系指令的**机体系投影** ``[vx_b, vy_b, wz]``。
+
+        指令由上层在世界系给定（vx 沿课程方向 +x，vy 为世界横向）；策略的执行器
+        只产生机体系速度，所以奖励的比较、观测的呈现、脱靶判据用的都是这个投影。
+        转换只绕竖直轴（yaw）：`[vx_b, vy_b] = R(yaw)ᵀ·[vx, vy]`，wz 两系同值。
+
+        为什么统一到机体系：世界系指令 + 机体系投影后，「掉头背对指令方向走开」
+        会立即表现为机体系误差（指令说「你机体系后退」），无需再按地形切换参照系
+        —— §21.14 的地形分支由此统一（experience.md §23.9）。
+        """
+        yaw = float(self.base_rpy[2])
+        c, s = np.cos(yaw), np.sin(yaw)
+        return np.array([c * self._command[0] + s * self._command[1],
+                         -s * self._command[0] + c * self._command[1],
+                         float(self._command[2])])
 
     # ------------------------------------------------------------------- 成功
 
@@ -428,13 +461,13 @@ class Go2StairsEnv(gym.Env):
     def _tracking_miss(self) -> bool:
         """本控制步的三轴速度是否脱靶（实测与指令之差超过容差）。
 
-        横向/偏航只读**滤波后**的量（瞬时值被步态摆动主导，等于在判步态相位）；
-        前向用机身系瞬时速度（本来平滑）。
+        指令用机体系投影（``command_body``）；横向/偏航实测只读**滤波后**的量
+        （瞬时值被步态摆动主导，等于在判步态相位）；前向用机身系瞬时速度。
         """
-        cmd = self.cfg.command
-        err_vx = abs(float(self.base_lin_vel_body[0]) - float(self._command[0]))
-        err_vy = abs(self.filtered_lateral_vel - float(self._command[1]))
-        err_wz = abs(self.filtered_yaw_rate - float(self._command[2]))
+        cb = self.command_body()
+        err_vx = abs(float(self.base_lin_vel_body[0]) - float(cb[0]))
+        err_vy = abs(self.filtered_lateral_vel - float(cb[1]))
+        err_wz = abs(self.filtered_yaw_rate - float(cb[2]))
         return bool(err_vy > self.cfg.flat_track_tol_vy
                     or err_wz > self.cfg.flat_track_tol_wz
                     or err_vx > self.cfg.flat_track_tol_vx)
@@ -445,7 +478,7 @@ class Go2StairsEnv(gym.Env):
         act = np.array([float(self.base_lin_vel_body[0]),
                         float(self.filtered_lateral_vel),
                         float(self.filtered_yaw_rate)])
-        cmd = np.asarray(self._command, dtype=np.float64)
+        cmd = self.command_body()
         self._track_n += 1
         self._track_cmd_sum += cmd
         self._track_cmd_sq += cmd * cmd
@@ -600,8 +633,9 @@ class Go2StairsEnv(gym.Env):
             # 楼梯信息里唯一直接告诉策略的一项。盲走仍然需要知道自己在*哪一段*
             # 楼梯上；但它不会知道下一级立面在哪里。
             parts.append(np.array([float(self.stair.step_height)]))
-        # 结构固定块：三轴速度指令（「指令」侧；来自操作者/上游规划器，不含地形真值）。
-        parts.append(np.asarray(self._command, dtype=np.float64).copy())
+        # 结构固定块：三轴速度指令（「指令」侧；**机体系投影**，来自操作者/上游
+        # 规划器的世界系指令经 :meth:`command_body` 转换，不含地形真值）。
+        parts.append(self.command_body())
         if obs_cfg.vel_filter:
             # 滤波后的横向速度 / 偏航角速度。奖励的 command_follow 读同一批量 ——
             # 只改奖励不改观测会把滤波器状态藏起来、破坏马尔可夫性，必须成对出现。
@@ -774,7 +808,9 @@ class Go2StairsEnv(gym.Env):
         self.nominal_pose = float(self.meta.home_qpos[2])
         self._peak_terrain_height = self._support_height()   # 足端支撑面，不是躯干 x（见 §2.7）
         self._last_action = np.zeros(self.num_act)
-        self._command[:] = self._sample_command()
+        self._cmd_hold[:] = self._sample_command()
+        self._command[:] = list(self._cmd_hold)
+        self._cmd_wander[:] = 0.0
         self._step_count = 0
         self._tracking_miss_count = 0
         self._track_n = 0
@@ -861,7 +897,16 @@ class Go2StairsEnv(gym.Env):
         self._cmd_age += 1
         if self._cmd_age >= self.cfg.command_hold_steps:
             self._cmd_age = 0
-            self._command[:] = self._sample_command()
+            self._cmd_hold[:] = self._sample_command()
+        # 指令缓变扰动（OU 过程）：模拟真实操作手的轻微无规律输入。只在未钉住
+        # （训练流）时生效；回放/遥操作 hold=True 完全不受影响。
+        if self._cmd_age < self.cfg.command_hold_steps and self.cfg.command_wander_std > 0:
+            dt = self.cfg.control_dt
+            self._cmd_wander *= float(np.exp(-dt / self.cfg.command_wander_tau))
+            self._cmd_wander += (self.cfg.command_wander_std * np.sqrt(dt)
+                                 * self._rng.standard_normal(3))
+            np.clip(self._cmd_wander, -0.08, 0.08, out=self._cmd_wander)
+            self._command[:] = (self._cmd_hold + self._cmd_wander).tolist()
 
         # 残差 RL：先验提供一个能用的周期步态，策略提供修正量。观测里报告的
         # 相位就是本步实际使用的那一个，所以转移保持马尔可夫性。
