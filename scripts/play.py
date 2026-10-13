@@ -318,6 +318,8 @@ class EpisodeOutcome:
     #: 回合末的滤波实测值（与奖励里用的同一个量，见 ``robotdog/reward.py``）。
     act_vy: float = 0.0
     act_yaw: float = 0.0
+    #: 本回合登上的最高台阶级数（0 = 未踏上任何一级；平地为 0）。
+    steps_mounted: int = 0
     #: 帧间隔 [ms] = 取帧步幅 × 控制周期 —— GIF 按真实仿真时间回放
     #: （内存上限把取帧稀疏化时，帧间隔相应加大，播放不再被动加快）。
     frame_ms: int = 40
@@ -374,6 +376,7 @@ def run_episode(env: Go2StairsEnv, policy: Runner, *, episode: int, seed: int,
     out.speed = round(out.distance / dt, 3) if dt > 0 else 0.0
     out.act_vy = round(float(env.filtered_lateral_vel), 3)
     out.act_yaw = round(float(env.filtered_yaw_rate), 3)
+    out.steps_mounted = int(info.get("steps_mounted", 0))
     out.success = bool(info.get("is_success", False))
     out.fell = bool(terminated) and not out.success
     out.timeout = bool(truncated) and not out.success
@@ -396,13 +399,18 @@ def hud_for(out: EpisodeOutcome, total: int, stair, *, frame_index: int,
     else:
         terrain = (f"台阶 {stair.step_height * 100:.1f}cm × {stair.n_up} 级"
                    f"  踏面 {stair.tread * 100:.0f}cm  顶端 {stair.crest_height:.2f}m")
-    return [
+    lines = [
         f"回合 {out.episode + 1}/{total}  {out.status}",
         terrain,
+    ]
+    if stair is not None and float(stair.step_height) > 0.0:
+        lines.append(f"登踏 {out.steps_mounted}/{int(stair.n_up)} 级")
+    lines += [
         f">指令 vx {out.cmd_vx:+.2f}  vy {out.cmd_vy:+.2f}  wz {out.cmd_yaw:+.2f} m/s, rad/s"
         f"（实测 vy {out.act_vy:+.2f}  wz {out.act_yaw:+.2f}）",
         f"前进 {out.distance:+.2f}m  速度 {out.speed:.2f}m/s  帧 {frame_index}/{frame_total}",
     ]
+    return lines
 
 
 # --------------------------------------------------------------------------- #

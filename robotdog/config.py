@@ -350,7 +350,11 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
             name, label = _unique_name("flat", seen), "平地（指令跟随）"
         else:
             spec = demo_stairs_spec(step_height=h_cm / 100.0, tread=tread, n_up=n_up)
-            name = _unique_name(f"stair{h_cm:g}", seen)
+            # ⭐ 阶段名禁止点字符：SB3 的 model.save 对带点路径做 with_suffix
+            # 处理，"stair7.5_final" 会被写坏（zip 无扩展名 / _env.json 断成
+            # "stair7_env.json"），warm-start 链在下一级直接 FileNotFoundError
+            # （experience.md §23.11）。统一把 "." 换成 "_"。
+            name = _unique_name(f"stair{h_cm:g}".replace(".", "_"), seen)
             label = f"{h_cm:g}cm 台阶"
         overrides = dict(row)
         stages.append(

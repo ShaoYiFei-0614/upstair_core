@@ -990,6 +990,8 @@ class Go2StairsEnv(gym.Env):
                 self._tracking_miss_count / max(1, self._step_count)
             ),
             "tracking_corr": float(self._tracking_quality()[1]),
+            "steps_mounted": int(round(
+                self._peak_terrain_height / max(self.stair.step_height, 1e-9))),
             "gait_prior": bool(self.cfg.gait_prior),
         }
         return self._observation(), float(reward), terminated, truncated, info

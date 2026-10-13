@@ -45,7 +45,14 @@ class RewardConfig:
     body_collision: float = -1.2        # 躯干接触地形（逐步、有界，不终止回合）
 
     # --- 横向 / 旋转指令跟踪 ------------------------------------------------ #
-    lateral_vel: float = 6.0            # 对 vy 指令的线性死区跟踪（vy_max 非零才参与）
+    lateral_vel: float = 6.0            # 对 vy 指令的线性死区跟踪（恒在，不门控）
+    # 横向窗口下限 [m/s]：window = 0.5·max(vy_max, lateral_range_floor)。
+    # ⭐ 2026-10-13 横向项与偏航项对称化（去门控）：原 `if cmd.vy_max:` 门控使
+    # vy_max=0 的级别（flat_1）**没有任何横向惩罚**，策略在这样的级别里自由
+    # 长出 +0.17 恒漂，下一级再花容量戒（experience.md §23.10）—— 偏航通道
+    # 靠 yaw_range_floor 免疫此病，横向补上对称设计。取 0.15 = 当前量程上限，
+    # 使全部级别的横向窗口统一为 0.075。
+    lateral_range_floor: float = 0.15
     yaw_rate: float = 4.0               # 对 wz 指令的线性死区跟踪（恒在，不门控）
     yaw_range_floor: float = 0.30       # yaw_max=0 时的量程下限 [rad/s]，兼防除零
     # 零偏航指令的基线惩罚放大系数：cmd.wz == 0 时误差按 ``yaw_zero_gain ×
@@ -76,6 +83,13 @@ class RewardConfig:
     joint_limit: float = -0.5
     alive: float = 0.15
     termination: float = -15.0          # 摔倒一次性罚（config.yaml 用远大于此的值）
+    # ⭐ 摔倒罚的**进度分级**（2026-10-13）：摔倒时的终止罚按「本回合已爬升的
+    # 高度占比」线性减免 —— 在平地或台阶脚下摔 = 全额，爬到顶端摔 = 半额
+    # （termination × (1 − relief × frac)）。理由：晚摔说明已获得爬楼进展
+    # （stair_progress 已逐级支付），全额罚会把「高处的尝试」罚得比「脚下
+    # 空耗」还重，与连续登踏的目标相反。§19.2 的防早摔约束只依赖 frac=0
+    # 处的全额值，不受影响。平地/0 高度时 frac=0，行为与旧版逐位一致。
+    termination_progress_relief: float = 0.5
     success: float = 50.0
 
     # --- 爬升进展 ------------------------------------------------------------ #
@@ -150,16 +164,17 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
         track -= over
     terms["forward_vel"] = rc.forward_vel * float(track)
 
-    # 1b) 横向 / 偏航指令跟踪：形状同前进项，窗口取 0.5 × 量程（零输出不再白拿分）。
-    # 横向按量程门控（量程为 0 = 该级不练这个方向）；偏航**恒在**（量程下限
-    # ``yaw_range_floor``）—— 门控分轴判断，见 experience.md §13.3。两项**求和**
-    # 而不是取 max：取 max 时误差小的那项会盖掉另一项的梯度。
+    # 1b) 横向 / 偏航指令跟踪：形状同前进项，窗口 = 0.5 × max(量程, 下限)。
+    # 两通道都**恒在**（横向与偏航对称去门控 —— 门控级别里漂移自由生长的
+    # 教训见 experience.md §23.10）。两项**求和**而不是取 max：取 max 时
+    # 误差小的那项会盖掉另一项的梯度。
     # 读**滤波后**的量（与观测的 vel_filter 块同一个数，保持马尔可夫性）。
     follow = 0.0
     tail = float(rc.track_tail)
-    if cmd.vy_max:
+    window_vy = 0.5 * max(float(cmd.vy_max), float(rc.lateral_range_floor))
+    if cmd.vy_max or rc.lateral_vel:
         vy = (env.filtered_lateral_vel if vel_filter else env.base_lin_vel_body[1])
-        xy = abs(vy - float(cmd_body[1])) / (0.5 * float(cmd.vy_max))
+        xy = abs(vy - float(cmd_body[1])) / window_vy
         follow += rc.lateral_vel * max(-1.0, track_shape(xy, tail))
     # 偏航项**恒在**（不受 ``yaw_max`` 门控），量程取 ``max(yaw_max, yaw_range_floor)``。
     # 门控的代价实测过：``yaw_max == 0`` 的级别里没有任何一项读 wz，策略学会
@@ -276,9 +291,16 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # --- 终止 -----------------------------------------------------------
     # 到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出楼梯远端摔下去。
     # ``env._reached_top`` 在回合内是粘性的，所以更早某一步的摔倒仍然算失败。
+    # 摔倒罚按爬升进度分级（见 ``RewardConfig.termination_progress_relief``）：
+    # 高处的摔倒比脚下摔倒罚得轻 —— 进展已经由 stair_progress 逐级支付。
     terminal = 0.0
     if terminated:
-        terminal = rc.success if env._reached_top else rc.termination
+        if env._reached_top:
+            terminal = rc.success
+        else:
+            crest = float(env.stair.crest_height)
+            frac = min(1.0, env._peak_terrain_height / crest) if crest > 1e-9 else 0.0
+            terminal = rc.termination * (1.0 - rc.termination_progress_relief * frac)
 
     return float(sum(terms.values())), terms, float(terminal)
 
