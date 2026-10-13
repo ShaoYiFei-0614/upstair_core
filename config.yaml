@@ -111,15 +111,15 @@ env:
   # 每一项都有真机出处（编码器 / IMU / 上一步动作 / 本体感觉估计 / 上层指令），
   # 加上一个标量任务参数 step_height。信息来源清单见 agent.md §8.6。
   obs:
-    # ⭐ base_lin_vel_body 与 command 是**必选项**（构造期强制，改 false 直接抛
-    # ValueError）：指令跟踪的两个组成部分 —— 「实测」（腿式里程计 + IMU 融合的
-    # 本体感觉估计）与「指令」（上层下发），缺一不可，见 doc/env.md。
-    base_lin_vel_body: true
-    command: true
-    # 必须 false，且**不能**改成 true：这一项是「机身相对正下方地形的高度」，
-    # 含地形真值，会破坏盲走。改成 true 会直接抛 ValueError（ObsConfig.__post_init__）。
+    # ⭐ 机身系线速度（3 维）与三轴指令（3 维）是**结构固定块**（无开关，直接
+    # 写死在 _obs_frame 里）：指令跟踪的两个组成部分 —— 「实测」（腿式里程计 +
+    # IMU 融合的本体感觉估计）与「指令」（上层下发），缺一不可，见 doc/env.md。
+    # 可选开关只有三个：gait_phase / step_height / vel_filter。
+    # 必须 false，且**不能**改成 true：base_height 含地形真值，会破坏盲走。
     base_height: false
-    gait_phase: false
+    # 步态时钟 sin/cos。2026-10-13 打开：2 Hz 慢步态下单步支撑时间长，残差需要
+    # 相位信息才能与先验配合发力。
+    gait_phase: true
     step_height: true
     # 指令跟随读**滤波后**的横向速度 / 偏航角速度。必须打开：瞬时 yaw_rate 在小跑
     # 步态下 std 可达 0.37 rad/s，奖励和成功判据都会变成「在判步态相位」。这两个量
@@ -210,7 +210,12 @@ reward:
   # −31000，而第 75 步摔倒只损失约 −600（实测，见 experience.md）。−15 只值 2 步，
   # 挡不住这个激励 —— 实测策略把摔倒率从 0% 训到 100%、平均步数从 1000 掉到 75。
   alive: 0.15
-  success: 50.0
+  # ⭐ success 50 → 500（2026-10-13，scaling）：§23.7 诊断出「爬完（+1440+50）
+  # vs 摔在半路（−5000+144）」的账面失衡是两局部最优振荡的成因之一；把登顶
+  # 奖励提到与 stair_progress 总量同量级，让「爬完」显著为正。仍远小于
+  # termination（1:10），不违反 §19.2 的「termination 必须主导」约束。
+  # 下轮训练验证。
+  success: 500.0
   termination: -5000.0
 
 

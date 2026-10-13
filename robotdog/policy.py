@@ -272,7 +272,7 @@ def step_height_from_model(model_path: str | Path) -> float | None:
 def _obs_config_for_dim(total: int, history_len: int = 1) -> ObsConfig | None:
     """按总维度反推观测开关组合。
 
-    ``base_lin_vel_body`` 与 ``command`` 是**必选项**（构造期强制为 true），
+    机身系线速度与三轴指令是**结构固定块**（无开关，恒在），
     反推只枚举三个可选开关。``base_height`` 同样不在枚举里（构造期即被禁止）。
     枚举顺序让「本仓最常用」的组合优先命中 —— ``itertools.product`` 是最后
     一个位置翻转最快，所以把 ``gait_phase`` 放最前（恒 False 持续最久）、

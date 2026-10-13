@@ -48,6 +48,11 @@ class RewardConfig:
     lateral_vel: float = 6.0            # 对 vy 指令的线性死区跟踪（vy_max 非零才参与）
     yaw_rate: float = 4.0               # 对 wz 指令的线性死区跟踪（恒在，不门控）
     yaw_range_floor: float = 0.30       # yaw_max=0 时的量程下限 [rad/s]，兼防除零
+    # 零偏航指令的基线惩罚放大系数：cmd.wz == 0 时误差按 ``yaw_zero_gain ×
+    # (|err| + |wz|)`` 放大，否则「命令我不许转」没有任何价钱。实测（2 Hz 步态、
+    # 滤波 wz 摆幅 ≈0.1 rad/s）×1.5 使该通道在零指令级恒饱和于 −yaw_rate/步 ——
+    # 是「跟住不许转」的强信号，但也是逐项账面里最大的恒定负项（experience.md §23.8）。
+    yaw_zero_gain: float = 1.5
 
     # --- 摆动足抬升 ---------------------------------------------------------- #
     foot_lift_target: float = 0.08      # 目标值的下限，而不是完整的目标值
@@ -162,9 +167,10 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 加惩罚必须**有界**（下界 −1，即最差 −``yaw_rate``），理由同前进项。
     wz = env.filtered_yaw_rate if vel_filter else env.yaw_rate
     yaw_err = abs(wz - cmd.wz)
-    # ``wz = 0`` 的级别补一个零指令基线惩罚：否则「命令我不许转」没有任何价钱。
+    # ``wz = 0`` 的级别补一个零指令基线惩罚：否则「命令我不许转」没有任何价钱
+    # （放大系数见 ``RewardConfig.yaw_zero_gain``）。
     if cmd.wz == 0.0:
-        yaw_err = 1.5 * (yaw_err + abs(wz))
+        yaw_err = rc.yaw_zero_gain * (yaw_err + abs(wz))
     yaw_range = 0.5 * max(float(cmd.yaw_max), float(rc.yaw_range_floor))
     follow += rc.yaw_rate * max(-1.0, track_shape(yaw_err / yaw_range, tail))
     terms["command_follow"] = follow

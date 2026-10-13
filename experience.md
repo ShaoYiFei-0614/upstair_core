@@ -2056,3 +2056,28 @@ walk 腿相位天然留了侧向作动空间；② 最差轴门槛过严（三�
 方法论：**训练期统计（成功率）是门槛的合取，单看它分不清是哪一条门失败的**；
 把每个 checkpoint 拉出来做分段指令扫描，才能把「没学会 / 学会后遗忘 /
 被恒漂顶爆」这三种病因分开。`.tmp/track_trend.py` 可复用。
+
+### 23.8 观测结构化 + 奖励逐项审计与 scaling（2026-10-13）
+
+**观测**：`gait_phase` 打开（2 Hz 慢步态下单步支撑时间长，残差需要相位信息与
+先验配合）；`base_lin_vel_body` / `command` 从「开关 + 构造期校验」改为
+**结构固定块**（字段删除，`_obs_frame` 直接写死，`frame_size` 恒 +6）——
+指令跟踪的两测在结构上不可移除。观测 51 → **53 维**（48 结构 + gait 2 +
+step 1 + vel 2）。`_obs_config_for_dim` 只枚举三个可选开关（注意
+`itertools.product` 最后位翻转最快，`gait_phase` 必须放最前才能让 51/53 维
+命中合理组合）。
+
+**奖励逐项实测**（平地/楼梯零残差 + 已训策略回合，全表见 doc/reward.md）：
+
+* 逐步项全部被 `max(−1,·)` / `overspeed_cap` 约束在 ±10×权重带内 ——
+  **整体尺度不过大**，绝对量由 VecNormalize 吸收。
+* **command_follow 的 yaw 零指令基线是最大的恒定负项**（−3.5/步）：误差
+  ×1.5 放大 × 0.15 窗口，滤波 wz 摆幅 0.1 rad/s 即饱和。它有梯度
+  （「跟住不许转」值 +8/步），但也是账面里最大的常数偏移 —— 已把硬编码的
+  1.5 提为 `RewardConfig.yaw_zero_gain`（行为不变），后续可调。
+* **四个死项**（base_height/joint_vel/action_rate/joint_limit ≈ 0）是
+  瞬态保险丝，2 Hz 稳态下不工作，保留。
+* **scaling 已应用**：`success 50 → 500`（§23.7 的「爬完 vs 摔在半路」账面
+  失衡；登顶与 stair_progress 总量同量级，仍为 termination 的 1/10）。
+  **不 scaling**：stair_progress 1200（爬楼梯度刚建立）、termination −5000
+  （§19.2 下界）。两者待下轮训练验证。

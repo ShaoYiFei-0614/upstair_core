@@ -60,18 +60,17 @@ from robotdog.tools.terrain import StairSpec, build_terrain_xml
 class ObsConfig:
     """观测布局。
 
-    ``base_frame_size`` 始终存在（42 个本体感知量）。下面几个块按声明顺序
-    追加；``step_height`` 是盲走策略无法低成本推断的那一项，所以它是一个普通
-    数字，而不是要机器人自己去估计的量。``doc/env.md`` 列出了由此得到的
-    维度。
+    每帧 = 42 维本体感知 + **6 维结构固定块**（机身系线速度 3 + 三轴指令 3：
+    指令跟踪的「实测」与「指令」两侧，无开关直接写死）+ 按声明顺序追加的
+    可选块；沿时间堆叠 ``history_len`` 帧。``step_height`` 是盲走策略无法
+    低成本推断的那一项，所以它是一个普通数字，而不是要机器人自己去估计的量。
+    ``doc/env.md`` 有逐块讲解与维度账。
     """
 
     history_len: int = 10
-    base_lin_vel_body: bool = True      # 3：机身系线速度
-    base_height: bool = False           # 1：机身相对其正下方地形的高度
+    base_height: bool = False           # 1：机身相对其正下方地形的高度（构造期禁止）
     gait_phase: bool = False            # 2：步态时钟的 sin/cos
     step_height: bool = True            # 1：本回合的楼梯高度
-    command: bool = True                # 3：前向 / 横向 / 偏航速度指令
     vel_filter: bool = False            # 2：机身系横向速度 / 偏航角速度的**低通量**
     base_frame_size: int = 42
 
@@ -84,29 +83,13 @@ class ObsConfig:
                 "含地形真值，盲走策略不允许拿到（见 doc/env.md 的信息来源清单）。"
                 "要观察离地高度请用本体感知的替代品，或保持 step_height 这一项。"
             )
-        # 下面两项是**必选项**：指令跟踪的两个组成部分 —— 「实测」（本体感觉
-        # 估计，不含地形真值）与「指令」（上层下发）。缺任何一个，策略都无法
-        # 计算跟随误差，构造期直接拒绝。
-        if not self.base_lin_vel_body:
-            raise ValueError(
-                "obs.base_lin_vel_body 必须为 true：机身系线速度是指令跟踪的"
-                "「实测」侧（腿式里程计 + IMU 融合的本体感觉估计，不含地形真值）；"
-                "没有它策略不知道自己在往哪走（见 doc/env.md 的信息来源清单）。"
-            )
-        if not self.command:
-            raise ValueError(
-                "obs.command 必须为 true：三轴速度指令是跟随目标的「指令」侧，"
-                "奖励与成功判据都以它为参照；课程只能改采样范围，不能把维数关掉"
-                "（见 doc/env.md 的信息来源清单）。"
-            )
 
     @property
     def frame_size(self) -> int:
-        extra = 0
-        extra += 3 if self.base_lin_vel_body else 0
+        # 结构固定块：机身系线速度 3 + 三轴指令 3（指令跟踪的两测，见类 docstring）。
+        extra = 6
         extra += 2 if self.gait_phase else 0
         extra += 1 if self.step_height else 0
-        extra += 3 if self.command else 0
         extra += 2 if self.vel_filter else 0
         return self.base_frame_size + extra
 
@@ -607,8 +590,8 @@ class Go2StairsEnv(gym.Env):
             self.base_ang_vel_body,
             self._last_action,
         ]
-        if obs_cfg.base_lin_vel_body:
-            parts.append(self.base_lin_vel_body)
+        # 结构固定块：机身系线速度（指令跟踪的「实测」侧，无开关）。
+        parts.append(self.base_lin_vel_body)
         # 这里故意没有 base_height 分支：它含地形真值，ObsConfig 构造期已禁止。
         if obs_cfg.gait_phase:
             theta = 2.0 * np.pi * self.cfg.gait.freq * self._gait_phase
@@ -617,9 +600,8 @@ class Go2StairsEnv(gym.Env):
             # 楼梯信息里唯一直接告诉策略的一项。盲走仍然需要知道自己在*哪一段*
             # 楼梯上；但它不会知道下一级立面在哪里。
             parts.append(np.array([float(self.stair.step_height)]))
-        if obs_cfg.command:
-            # 三轴速度指令。允许进观测：它来自操作者或上游规划器，不含地形真值。
-            parts.append(np.asarray(self._command, dtype=np.float64).copy())
+        # 结构固定块：三轴速度指令（「指令」侧；来自操作者/上游规划器，不含地形真值）。
+        parts.append(np.asarray(self._command, dtype=np.float64).copy())
         if obs_cfg.vel_filter:
             # 滤波后的横向速度 / 偏航角速度。奖励的 command_follow 读同一批量 ——
             # 只改奖励不改观测会把滤波器状态藏起来、破坏马尔可夫性，必须成对出现。
