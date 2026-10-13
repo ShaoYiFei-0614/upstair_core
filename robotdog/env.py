@@ -223,6 +223,18 @@ class EnvConfig:
     # 指令之上；hold=True（回放/遥操作）时完全不生效；0 = 关闭。
     command_wander_std: float = 0.0
     command_wander_tau: float = 1.5
+    # ⭐ 楼梯段**闭环外部引导**（2026-10-13，用户指令）：楼梯级（n_up > 0）的
+    # vy/wz 指令不再来自课程采样，而是由外部控制器每步按状态闭环生成 ——
+    # vy 按机身偏离台阶中线（center_y）的距离反号拉回，wz 按朝向误差对准
+    # 课程方向（+x）。这是「人在遥感操控」的机制化（teleop.py 的
+    # StairController 搬进环境）：跟随引导指令 = 保持中线与航向，狗走偏时
+    # 指令会主动纠正它。vx 仍由课程采样（前进速度独立）。
+    # 平地级不受影响（指令跟随任务照旧用采样范围）。
+    stair_guidance: bool = True
+    guidance_vy_gain: float = 1.2      # vy [m/s] 每米横向偏差
+    guidance_vy_limit: float = 0.15    # vy 引导限幅
+    guidance_yaw_gain: float = 1.5     # wz [rad/s] 每弧度朝向误差
+    guidance_yaw_limit: float = 0.60   # wz 引导限幅
 
     # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
@@ -428,6 +440,22 @@ class Go2StairsEnv(gym.Env):
             if self._hist[-1].shape == frame.shape:
                 self._hist[-1] = frame
         return list(self._command)
+
+    def _guidance_command(self) -> tuple[float, float]:
+        """楼梯段的**闭环外部引导** ``(vy, wz)`` —— 「人在遥感操控」的机制化。
+
+        vy 按机身偏离台阶中线（``center_y``）的距离**反号**拉回；wz 按朝向误差
+        对准课程方向（+x，即 wrap(−yaw)）。增益与限幅见
+        ``EnvConfig.guidance_*``。只服务楼梯级（平地级的指令跟随任务照旧用
+        课程采样范围）。
+        """
+        e_y = float(self.base_pos[1]) - float(self.stair.center_y)
+        e_yaw = float(np.arctan2(np.sin(-self.base_rpy[2]), np.cos(-self.base_rpy[2])))
+        vy = float(np.clip(-self.cfg.guidance_vy_gain * e_y,
+                           -self.cfg.guidance_vy_limit, self.cfg.guidance_vy_limit))
+        wz = float(np.clip(self.cfg.guidance_yaw_gain * e_yaw,
+                           -self.cfg.guidance_yaw_limit, self.cfg.guidance_yaw_limit))
+        return vy, wz
 
     def command_body(self) -> np.ndarray:
         """世界系指令的**机体系投影** ``[vx_b, vy_b, wz]``。
@@ -907,6 +935,13 @@ class Go2StairsEnv(gym.Env):
                                  * self._rng.standard_normal(3))
             np.clip(self._cmd_wander, -0.08, 0.08, out=self._cmd_wander)
             self._command[:] = (self._cmd_hold + self._cmd_wander).tolist()
+        # 楼梯段闭环外部引导：vy/wz 由引导控制器按状态生成（拉回中线 + 对准
+        # 航向），vx 保留课程采样；缓变扰动仍叠加在引导值上（真实操作手也有
+        # 手抖）。平地级不受影响。
+        if self.stair.n_up > 0 and self.cfg.stair_guidance:
+            vy_g, wz_g = self._guidance_command()
+            self._command[1] = float(np.clip(vy_g + self._cmd_wander[1], -0.2, 0.2))
+            self._command[2] = float(np.clip(wz_g + self._cmd_wander[2], -0.8, 0.8))
 
         # 残差 RL：先验提供一个能用的周期步态，策略提供修正量。观测里报告的
         # 相位就是本步实际使用的那一个，所以转移保持马尔可夫性。

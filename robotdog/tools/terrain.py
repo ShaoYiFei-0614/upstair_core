@@ -174,6 +174,11 @@ class StairSpec:
         :mod:`robotdog.tools.touch` 里的前向测距能投射一条看不见机器人自己腿的
         射线 —— 机器人的 geom 位于 group 2 和 3。geom group 对物理没有影响，但它
         *确实*决定方块是否被渲染，所以改动前先看那个常量的 docstring。
+
+        ⭐ ``solref``/``solimp``（2026-10-13）：默认软接触（时间常数 20ms）在
+        15kg 全身重量经单足压在踏面/立面上时允许 **厘米级持续下陷**（实测
+        12~33mm，足端几何上陷进 box 内"无法抬起"—— experience.md §23.15）。
+        收紧为 5ms + 高阻抗，穿透降到毫米级。
         """
         out: list[str] = []
         fr = " ".join(f"{v:g}" for v in self.friction)
@@ -183,7 +188,8 @@ class StairSpec:
                 f'pos="{cx:.6f} {cy:.6f} {cz:.6f}" '
                 f'size="{hx:.6f} {hy:.6f} {hz:.6f}" '
                 f'condim="3" friction="{fr}" rgba="{self.rgba}" '
-                f'group="{TERRAIN_GEOM_GROUP}"/>'
+                f'group="{TERRAIN_GEOM_GROUP}" '
+                f'solref="0.005 1" solimp="0.95 0.99 0.001"/>'
             )
         return "\n".join(out)
 

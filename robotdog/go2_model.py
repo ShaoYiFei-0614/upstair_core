@@ -202,7 +202,8 @@ def default_floor_geom(z: float = 0.0, size: float = 60.0) -> str:
     return (
         f'<geom name="floor" type="plane" pos="0 0 {z:g}" size="{size:g} {size:g} 0.05" '
         f'condim="3" friction="0.9 0.005 0.0001" material="groundplane" '
-        f'group="{TERRAIN_GEOM_GROUP}"/>'
+        f'group="{TERRAIN_GEOM_GROUP}" '
+        f'solref="0.005 1" solimp="0.95 0.99 0.001"/>'
     )
 
 
@@ -347,6 +348,16 @@ def compile_scene(
         dump = GENERATED_DIR / "failed_scene.xml"
         dump.write_text(xml, encoding="utf-8")
         raise RuntimeError(f"MJCF compile failed; dumped to {dump}") from exc
+
+    # ⭐ 机器人碰撞 geom 的接触刚化（2026-10-13，experience.md §23.15）：vendored
+    # go2.xml 的足端 solimp = [0.015, 1.0, 0.022] 允许**厘米级深穿透** —— 实测
+    # 15kg 全身压在单足上时足端陷进台阶 box 12~33mm（"足和楼梯穿模、无法抬起"
+    # 的物理根因；软接触合规性在持续载荷下的平衡下陷）。此处编译后直接改写
+    # model 层参数：group 3 = 全部碰撞图元（足/腿/躯干），高阻抗 + 短时间常数。
+    # 楼梯与地面 geom 在 terrain.py / default_floor_geom 里带同样的参数。
+    collision = np.where(model.geom_group == COLLISION_GEOM_GROUP)[0]
+    model.geom_solref[collision] = [0.005, 1.0]
+    model.geom_solimp[collision] = [0.99, 0.999, 0.001, 0.5, 2.0]
 
     meta = extract_meta(model)
     return model, meta, xml
