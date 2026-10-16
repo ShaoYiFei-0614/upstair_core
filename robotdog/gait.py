@@ -60,6 +60,14 @@ class GaitParams:
     off_th: float = 0.0  # 大腿常量偏置
     off_ca: float = 0.0  # 小腿常量偏置
     calf_shape: str = "sin"  # 小腿波形：sin | dip | half
+    # ⭐ 摆动占空比（2026-10-15，爬行步态支持）：一周期内**腾空相**所占比例。
+    # 实测（`.tmp/measure_swing_window.py`）：本仓先验的腾空相位于基波
+    # ``sin(p) < 0`` 的半个周期（零残差平地逐足离地主导相位 ≈270°），所以
+    # 实现方式是**相位弯折**——把该半周期压到 ``swing_frac`` 比例上，其余为
+    # 支撑相。``0.5`` = 恒等（与加参数前逐位一致，等价回归可验）。
+    # 爬行步态 = 四分之一错相（``leg_phase``）+ 小 ``swing_frac``（如 0.25）
+    # ⇒ 任一时刻至少 3 足支撑（静态稳定），这是跨级上台阶需要的稳定性来源。
+    swing_frac: float = 0.5
     action_scale: float = 0.70  # 每归一化单位对应的弧度
     leg_phase: tuple[float, float, float, float] = field(
         default_factory=lambda: tuple(TROT_PHASE)
@@ -82,9 +90,29 @@ class GaitParams:
     def leg_phases(self, t: float) -> np.ndarray:
         return 2.0 * np.pi * self.freq * t + np.asarray(self.leg_phase, dtype=np.float64)
 
+    def _swing_warp(self, p: np.ndarray) -> np.ndarray:
+        """相位弯折：把腾空相（``sin(p) < 0`` 的半周期）压到 ``swing_frac``。
+
+        ``swing_frac = 0.5`` 时**恒等返回**（不经过 mod/缩放，保证与加参数前
+        逐位一致）。其余取值下相位先取模到 ``[0, 2π)`` 再分段线性映射：
+        支撑段 ``[0, 2π(1−f))`` → ``[0, π)``、摆动段 → ``[π, 2π)``。
+        弯折只改**时间分配**，不改波形形状与腿间相位关系。
+        """
+        sf = float(self.swing_frac)
+        if sf == 0.5:
+            return p
+        two_pi = 2.0 * np.pi
+        q = np.mod(p, two_pi)
+        stance_end = two_pi * (1.0 - sf)
+        return np.where(
+            q < stance_end,
+            q * (np.pi / stance_end),
+            np.pi + (q - stance_end) * (np.pi / (two_pi - stance_end)),
+        )
+
     def actions(self, t: float) -> np.ndarray:
         """归一化动作单位，形状 ``(12,)``，按执行器顺序排列。"""
-        p = self.leg_phases(t)
+        p = self._swing_warp(self.leg_phases(t))
         thigh = self.off_th + self.amp_th * np.sin(p + self.ph_th)
         calf = self.off_ca + self.amp_ca * self._calf_wave(p + self.ph_ca)
         a = np.zeros((4, 3), dtype=np.float64)  # 每条腿：hip, thigh, calf
@@ -150,6 +178,7 @@ class GaitParams:
                 setattr(self, amp, a * s)
         self.ph_th = float(math.atan2(math.sin(self.ph_th), math.cos(self.ph_th)))
         self.ph_ca = float(math.atan2(math.sin(self.ph_ca), math.cos(self.ph_ca)))
+        self.swing_frac = float(np.clip(self.swing_frac, 0.05, 1.0))
         if self.calf_shape not in CALF_SHAPES:
             raise ValueError(f"calf_shape must be one of {CALF_SHAPES}")
         self.leg_phase = tuple(float(v) for v in self.leg_phase)

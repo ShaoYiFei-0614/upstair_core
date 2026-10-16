@@ -91,8 +91,8 @@ SECTION_KEYS: dict[str, frozenset[str]] = {
     }),
     "run": frozenset({"name", "seed", "save_every", "log_every"}),
     "play": frozenset({
-        "episodes_gif", "episodes_eval", "seed", "gif_max_frames", "stages", "batch",
-        "stage_height_cm",
+        "episodes_video", "episodes_eval", "seed", "video_max_frames", "stages",
+        "batch", "stage_height_cm",
     }),
     "curriculum": frozenset({
         "tread", "n_up", "heights_cm", "timesteps", "learning_rate",
@@ -235,6 +235,7 @@ def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
     cmd_raw = env.pop("command", None)   # 嵌套子段，单独处理
     env.pop("n_envs", None)              # 属于运行参数，不属于 EnvConfig
     gait_file = env.pop("gait_file", None)
+    gait_file_stair = env.pop("gait_file_stair", None)   # 楼梯级专用先验（可选）
     cfg = EnvConfig()
 
     _apply(cfg, env, where="env")
@@ -260,6 +261,13 @@ def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
             cfg.gait.amp_th *= cfg.gait_amp_scale
             cfg.gait.amp_ca *= cfg.gait_amp_scale
             cfg.gait = cfg.gait.normalize()
+        if gait_file_stair is not None:
+            # 楼梯级专用先验（爬行步态）：平地段保持 gait，楼梯段自动切它。
+            cfg.gait_stair = _load_gait(gait_file_stair)
+            if cfg.gait_amp_scale != 1.0:
+                cfg.gait_stair.amp_th *= cfg.gait_amp_scale
+                cfg.gait_stair.amp_ca *= cfg.gait_amp_scale
+                cfg.gait_stair = cfg.gait_stair.normalize()
     return cfg
 
 
@@ -378,9 +386,9 @@ def config_to_stages(raw: Mapping[str, Any]) -> list[StageSpec]:
 #: 回放时横向/偏航指令取量程的哪个比例（几乎拉满但留一点余量）。
 PLAY_COMMAND_FRAC: float = 0.8
 
-#: 每个回合最多写进 GIF 多少帧（渲染帧很大，逐阶段累积曾把内存吃光；超限后
+#: 每个回合最多写进视频多少帧（渲染帧很大，逐阶段累积曾把内存吃光；超限后
 #: 按当前帧数反算步幅稀疏取帧）。
-PLAY_GIF_MAX_FRAMES: int = 300
+PLAY_VIDEO_MAX_FRAMES: int = 300
 
 
 def command_for_stage(stage: StageSpec, *, frac: float = PLAY_COMMAND_FRAC,
@@ -476,18 +484,18 @@ def config_to_play(raw: Mapping[str, Any]) -> dict[str, Any]:
     拦下，直接删掉即可）。
     """
     play = _section(raw, "play")
-    play.setdefault("episodes_gif", 10)
+    play.setdefault("episodes_video", 10)
     play.setdefault("episodes_eval", 100)
     play.setdefault("seed", 0)
-    #: ``play.gif_max_frames`` —— 单回合最多写进 GIF 的帧数（见 ``PLAY_GIF_MAX_FRAMES``）。
-    play.setdefault("gif_max_frames", PLAY_GIF_MAX_FRAMES)
-    #: ``play.stages`` —— ``gif`` 模式要渲染哪些课程阶段（地形 × 指令）。
+    #: ``play.video_max_frames`` —— 单回合最多写进视频的帧数（见 ``PLAY_VIDEO_MAX_FRAMES``）。
+    play.setdefault("video_max_frames", PLAY_VIDEO_MAX_FRAMES)
+    #: ``play.stages`` —— ``video`` 模式要渲染哪些课程阶段（地形 × 指令）。
     #: ``"curriculum"`` = 配置里 ``curriculum:`` 段的全部级；``"auto"``（缺省）
     #: 在运行目录里有 ``checkpoints/<阶段>_final.zip`` 时按检查点定级、否则
     #: 退回当前课程的阶段表。也接受阶段名列表或高度列表（cm）。
     play.setdefault("stages", "auto")
-    #: ``play.batch`` —— 这一批 GIF 的标签。用来把「不同批次训练出来的 GIF」
-    #: 分开放：产物落在 ``runs/<run>/gifs/<批次>/<阶段>/<阶段>.gif``。
+    #: ``play.batch`` —— 这一批视频的标签。用来把「不同批次训练出来的视频」
+    #: 分开放：产物落在 ``runs/<run>/videos/<批次>/<阶段>/<阶段>.mp4``。
     play.setdefault("batch", "")
     return play
 

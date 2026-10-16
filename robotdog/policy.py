@@ -100,6 +100,10 @@ def env_config_from_summary(summary_path: str | Path) -> EnvConfig:
         env_kw["command"] = _rebuild(CommandConfig, env_kw["command"])
     if isinstance(env_kw.get("gait"), dict):
         env_kw["gait"] = GaitParams.from_dict(env_kw["gait"])
+    if isinstance(env_kw.get("gait_stair"), dict):
+        # 同样必须重建：JSON 往返后它是普通 dict，回放楼梯级时
+        # ``_active_gait().freq`` 会当场 AttributeError（2026-10-15 实测踩到）。
+        env_kw["gait_stair"] = GaitParams.from_dict(env_kw["gait_stair"])
     known = {f.name for f in fields(EnvConfig)}
     return EnvConfig(**{k: v for k, v in env_kw.items() if k in known})
 

@@ -28,8 +28,8 @@
 
 拼接规则（`_obs_frame()`）：**恒在 48 维**（42 维本体 + 两个必选块），再按
 `ObsConfig` 的开关依声明顺序追加可选块，最后沿时间堆叠 `history_len` 帧。
-当前 `config.yaml`（`history_len: 1`、`gait_phase` 关、其余开）= 每帧
-**51 维**（48 + step_height 1 + vel_filter 2）。
+当前 `config.yaml`（`history_len: 1`、全部开关开）= 每帧
+**55 维**（48 + gait_phase 2 + step_height 1 + vel_filter 2 + gait_cmd 2）。
 
 **恒在 48 维（全部真机口径；后两块为必选项，构造期强制，改 false 直接抛
 ValueError）：**
@@ -49,8 +49,9 @@ ValueError）：**
 | 块 | 维 | 物理量 | 真机出处 | 为什么（或不）给 |
 | --- | --- | --- | --- | --- |
 | `vel_filter` | 2 | 横向速度 / 偏航角速度的**低通值**（τ=0.2 s） | 对同一信号滤波，真机可算 | 瞬时量被步态摆动主导（wz 摆幅可达 ±0.37 rad/s）；**奖励读同一批量，必须成对出现**（马尔可夫性） |
-| `gait_phase` | 2 | 步态时钟 sin/cos | 内部时钟 | 残差策略需要知道先验处于周期哪一点（当前 config 关闭） |
+| `gait_phase` | 2 | 步态时钟 sin/cos | 内部时钟 | 残差策略需要知道先验处于周期哪一点（当前 config 打开） |
 | `step_height` | 1 | 本回合台阶高（m） | **任务参数**，随任务下发 | 唯一非传感器项：告诉策略「在哪条楼梯上」，但**不含下一道立面在哪** |
+| `gait_cmd` | 2 | 步态指令（freq [Hz] + swing 缩放） | 上层指令（Walk-These-Ways 式条件化） | 策略**伺服**的步态参数：楼梯档/平地档是同一策略的两个条件点，部署时 `set_gait_cmd_now()` 实时切换；P2 的教训是参数放 action、WtW 放 obs |
 
 **盲走契约（硬边界）**：观测里不得出现任何**地形几何真值**。`base_height`
 （机身相对正下方地形的高度）曾被实现过 —— 它等于把地形读数塞进观测；现在
@@ -65,32 +66,61 @@ ValueError）：**
 
 ### 动作：从策略输出到电机
 
-动作空间是 12 维 `Box(-1, 1)`，顺序 = 执行器顺序：每条腿
-`hip / thigh / calf` × 腿序 `FL, FR, RL, RR`。
+动作空间是 `Box(-1, 1)`，维度与顺序**随 `action_mode` 变**：
 
-**残差管线（唯一的动作映射，`_target_from_action`）**：
+**`residual`（12 维，旧口径）** —— 每条腿 `hip / thigh / calf` × 腿序
+`FL, FR, RL, RR` 的关节残差，叠加在固定先验上：
 
-    target = clip(home + gait_gain · gait.radians(t) + action_scale · action,
-                  act_low, act_high)
+    target = clip(home + gait_gain · gait.radians(t) + action_scale · action, lo, hi)
 
-三个组成部分，权限**刻意分开**：
+**`gait_params`（8 维，P2）** —— `[前对(amp_th, amp_ca, off_th, off_ca), 后对(同四项)]`：
 
-* `home` — 标称站姿（关节角 [0, 0.9, −1.8]，机身 0.27 m），动作的零点；
-* `gait.radians(t)` — 开环先验（`doc/gait.md`），幅值自带独立缩放
-  `GaitParams.action_scale`，**与策略无关**；
-* `action_scale · action` — 策略残差（当前 0.60 rad）：策略能偏离先验多远。
+    target = clip(home + traj(参数, θ), lo, hi)
+    traj: thigh_l = off_th[pair_l] + amp_th[pair_l]·sin(θ + φ_l + ph_th)
+          calf_l  = off_ca[pair_l] + amp_ca[pair_l]·wave(θ + φ_l + ph_ca)
 
-两个缩放混用会让策略的探索噪声乘上先验幅值 —— 先验一动、噪声跟着放大，
-实测几秒内失稳。
+其中 θ = 2π·步态时钟，φ_l 用固定的 **trot 对角反相**（`(0, π, π, 0)`），
+波形与相位偏置沿用先验结构；幅值参数映射到 `[0, param_amp_max]`（楼梯上再乘
+`stair_stride_boost`），偏置映射到 `±param_off_max`。步频由地形决定
+（`gait_freq_flat` / `gait_freq_stair`）。
+
+**为什么这样切**（§23.17 P2）：结构（sin + trot 相位）保证随机探索也落在
+**协调步态**上 —— 这解决了「无先验 → 奖励平台期 → 学不出行走」的老问题；
+而**前/后对分开参数化**让「前脚驻留（前对幅值→0）+ 后腿抬升（后对幅值拉大）」
+这类受阻态行为**可表达** —— 固定先验的对角耦合做不到（§23.20 的 P1 实验
+证明：受阻时把先验整个关掉会毁掉爬楼，因为节奏同时是登踏的动力）。
+
+**残差模式的两个幅值刻意分开**：`gait.action_scale` 表示先验动作有多大，
+`cfg.action_scale` 表示策略可以偏离它多少。共用一个尺度会让策略的探索噪声
+随先验一起缩放，瞬间失稳。gait_params 模式只有先验结构、没有残差项。
+
+### 按地形选先验（`gait_stair`）
+
+`residual` 模式下，楼梯级与平地级可以跑**不同的先验**（`gait_file_stair` →
+`EnvConfig.gait_stair`；`_active_gait()` 按 `stair.n_up > 0` 切换）：
+
+* 平地 → `gait_file`（`artifacts/trot_natural167.json`，1.67 Hz 自然小跑，
+  平地自然高抬腿就是在这上面学出来的）；
+* 楼梯 → `gait_file_stair`（`artifacts/crawl_125.json`，1.25 Hz **爬行**：
+  四分之一错相 + `swing_frac 0.25` ⇒ 一次一足、三足支撑）。
+
+**为什么楼梯要爬行**：实测前后足 x 间距 0.367 m > 踏面 0.30 m ⇒ 四足**无法
+同踩一级**、必须跨级站立；跨级时小跑的 2 足支撑余量不足，静态支撑是稳定性来源
+（`experience.md` §23.32）。
+
+频率的取值优先级（`_gait_freq_eff`）：条件化采样的指令 → **楼梯专用先验自带的
+频率** → `gait_freq_stair_fixed`（>0 时钉死）→ 按台阶高在「先验 json 频率 → 1.0」
+之间线性插值。奖励侧（`foot_lift` 速度门控、`air_time` target）读的是**同一个**
+函数 —— 用错基准会让等价性悄悄破掉。
 
 **执行**：目标角交给关节 PD（`tau = kp(target−q) − kd·qd`，kp/kd 按腿为
 `[30, 30, 45] / [0.6, 0.6, 0.9]`），每个控制步内做 `decimation=10` 次
 500 Hz 物理步，力矩按 `ctrl_ranges` 截断。选**位置控制**而非力矩控制：
 四足位置伺服是 Unitree 出厂形态，sim-to-real 差距最小。
 
-**与奖励的耦合**：`action_rate` 罚相邻步动作差（平滑），`torque` 罚力矩平方
-（节能），两者共同把残差压向「必要的变化量」；探索幅度由 PPO 的
-`log_std_init` 决定（`doc/training.md`）。
+**与奖励的耦合**：`action_rate` 罚相邻步动作差（平滑，按 `num_action` 维计），
+`torque` 罚力矩平方（节能），两者共同把动作压向「必要的变化量」；探索幅度由
+PPO 的 `log_std_init` 决定（`doc/training.md`）。
 
 ### 指令的三层模型（`CommandConfig`）
 

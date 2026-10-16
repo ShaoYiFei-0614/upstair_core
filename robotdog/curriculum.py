@@ -104,6 +104,7 @@ class EpisodeStats:
     _fall: deque[float] = field(default_factory=deque, repr=False)
     _returns: deque[float] = field(default_factory=deque, repr=False)
     _lengths: deque[float] = field(default_factory=deque, repr=False)
+    _mounted: deque[float] = field(default_factory=deque, repr=False)
     n_total: int = 0
 
     def __post_init__(self) -> None:
@@ -111,13 +112,19 @@ class EpisodeStats:
         self._fall = deque(self._fall, maxlen=self.window)
         self._returns = deque(self._returns, maxlen=self.window)
         self._lengths = deque(self._lengths, maxlen=self.window)
+        self._mounted = deque(self._mounted, maxlen=self.window)
 
-    def add(self, *, success: bool, fallen: bool, ret: float, length: float) -> None:
-        """记一个已结束的回合 (``ret``/``length`` 应为 ``nan`` 表示未知)。"""
+    def add(self, *, success: bool, fallen: bool, ret: float, length: float,
+            mounted: float = float("nan")) -> None:
+        """记一个已结束的回合 (``ret``/``length`` 应为 ``nan`` 表示未知)。
+
+        ``mounted`` = 本回合登上的最高楼梯级数（``info["steps_mounted"]``；
+        平地级恒 0，未知传 nan）。"""
         self._success.append(1.0 if success else 0.0)
         self._fall.append(1.0 if fallen else 0.0)
         self._returns.append(float(ret))
         self._lengths.append(float(length))
+        self._mounted.append(float(mounted))
         self.n_total += 1
 
     def add_info(self, info: dict[str, Any]) -> bool:
@@ -134,6 +141,7 @@ class EpisodeStats:
             fallen=bool(info.get("fallen", False)),
             ret=float(ep.get("r", float("nan"))),
             length=float(ep.get("l", float("nan"))),
+            mounted=float(info.get("steps_mounted", float("nan"))),
         )
         return True
 
@@ -164,6 +172,18 @@ class EpisodeStats:
     def mean_length(self) -> float:
         return _nanmean(self._lengths)
 
+    @property
+    def mean_mounted(self) -> float:
+        """窗口内平均登上的最高楼梯级数（平地级恒 0）。"""
+        return _nanmean(self._mounted)
+
+    @property
+    def max_mounted(self) -> float:
+        """窗口内最深登级 —— 「策略爬到过第几级」的直接读数。"""
+        arr = np.asarray(list(self._mounted), dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        return float(np.max(arr)) if arr.size else 0.0
+
     def as_dict(self) -> dict[str, float]:
         return {
             "episodes_total": self.n_total,
@@ -172,6 +192,8 @@ class EpisodeStats:
             "fall_rate": round(self.fall_rate, 4),
             "mean_return": round(self.mean_return, 2),
             "mean_length": round(self.mean_length, 1),
+            "mean_mounted": round(self.mean_mounted, 2),
+            "max_mounted": round(self.max_mounted, 1),
         }
 
     def format_line(self) -> str:
@@ -179,7 +201,8 @@ class EpisodeStats:
         return (
             f"回合={self.n_total:>5d} 成功率={self.success_rate:6.1%} "
             f"摔倒率={self.fall_rate:6.1%} 均回报={self.mean_return:9.2f} "
-            f"均步数={self.mean_length:6.1f}"
+            f"均步数={self.mean_length:6.1f} "
+            f"登级均/最深={self.mean_mounted:.2f}/{self.max_mounted:.0f}"
         )
 
 

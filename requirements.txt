@@ -11,7 +11,8 @@
 #   * torch 的 "+cpu" 后缀来自 PyTorch 官方 CPU 源，所以必须带 --extra-index-url；
 #     不想要镜像就把 --index-url 去掉（走 PyPI 官方源）。
 #   * 训练用前 6 个；pyyaml 读 config.yaml（所有超参都在那里，缺它起不来）；
-#     pillow 只在 play.py --mode gif 渲染 GIF 时用到。
+#     pillow 在 play.py 的 HUD 绘字与缩帧时用到；imageio-ffmpeg 自带 ffmpeg，
+#     负责把渲染帧编码成 MP4（H.264）。
 #   * onnx / onnxruntime / matplotlib 已随相关脚本（eval.py 导出、HUD 叠字）删除，
 #     不再是本仓依赖。
 
@@ -23,5 +24,7 @@ numpy==2.2.4
 tensorboard==2.21.0
 pyyaml==6.0.3
 
-# 可选（GIF 渲染）
+# 可选（视频渲染：HUD + MP4 编码）
 pillow==10.4.0
+imageio==2.38.1
+imageio-ffmpeg==0.6.0

@@ -1,7 +1,7 @@
 """指令跟踪演示：给策略喂一串**分段恒定**的横向/旋转指令，边跑边看它跟不跟。
 
 与 ``scripts/teleop.py`` 的区别：teleop 是「控制器闭环看着地形打方向」（遥感操控），
-本脚本是「开环给指令」，专门用来**量跟踪能力**并出 GIF 给用户看：
+本脚本是「开环给指令」，专门用来**量跟踪能力**并出视频给用户看：
 
 * 每 ``--hold-steps`` 个控制步换一条指令，段内恒定、段间跳变；
 * 每段统计**实测均值的符号/量级**，最后出一张「指令 vs 实测」表，配
@@ -10,10 +10,10 @@
 用法::
 
     # 原地横移 + 原地偏航（要用手上带原地阶段的权重）
-    .venv\\Scripts\\python.exe scripts\\cmd_demo.py --run cmdtrack --phase inplace --gif
+    .venv\\Scripts\\python.exe scripts\\cmd_demo.py --run cmdtrack --phase inplace --video
 
     # 边走边横移
-    .venv\\Scripts\\python.exe scripts\\cmd_demo.py --run cmdtrack --phase walk --gif
+    .venv\\Scripts\\python.exe scripts\\cmd_demo.py --run cmdtrack --phase walk --video
 
 ⚠ 权重必须**是带指令课程训出来的**（``curriculum.command_vy_max`` 非零的阶段），
 否则观测维数或指令范围对不上。
@@ -31,13 +31,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from play import (  # noqa: E402
-    CAMERA_GIF,
+    CAMERA_VIDEO,
     FRAME_HEIGHT,
     FRAME_STRIDE,
     FRAME_WIDTH,
     open_runner,
     resolve_target,
-    write_gif,
+    write_mp4,
 )
 from robotdog.config import DEFAULT_CONFIG_PATH, device, load_config  # noqa: E402
 from robotdog.tools import console, paths  # noqa: E402
@@ -102,7 +102,7 @@ def slope_and_r(xs: list[float], ys: list[float]) -> tuple[float, float]:
 
 def run_demo(env, runner, phases, *, seed: int, hold_steps: int, capture: bool,
              camera: str, width: int, height: int) -> tuple[list[PhaseStat], list[np.ndarray], dict]:
-    """跑完整个分段指令表，返回逐段统计、GIF 帧与逐段原始序列。"""
+    """跑完整个分段指令表，返回逐段统计、视频帧与逐段原始序列。"""
     obs, _info = env.reset(seed=seed)
     frames: list[np.ndarray] = []
     stats: list[PhaseStat] = []
@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hold-steps", type=int, default=75,
                         help="每段持续的控制步数（默认 75 = 1.5 s）")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--gif", action="store_true")
+    parser.add_argument("--video", action="store_true")
     args = parser.parse_args(argv)
     raw = load_config(args.config)  # 早失败：配置有问题就不要等到环境建好才发现
 
@@ -172,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
           f"量程 vy±{vy_limit:g} wz±{wz_limit:g}")
     stats, frames, trace = run_demo(
         env, runner, phases, seed=args.seed, hold_steps=args.hold_steps,
-        capture=args.gif, camera=CAMERA_GIF,
+        capture=args.video, camera=CAMERA_VIDEO,
         width=FRAME_WIDTH, height=FRAME_HEIGHT,
     )
 
@@ -189,10 +189,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"偏航：斜率 {sl_wz:+.3f}（1.0 = 完全跟上）  相关系数 {r_wz:+.3f}  "
           f"平均|误差| {np.mean(np.abs(np.array(trace['wz']) - np.array(trace['cmd_wz']))):.3f} rad/s")
 
-    if args.gif and frames:
-        out = paths.OUTPUT_GIFS_DIR / f"{target.label}_cmd_{args.phase}.gif"
-        write_gif(out, frames)
-        print(f"  GIF: {out}")
+    if args.video and frames:
+        out = paths.OUTPUT_VIDEOS_DIR / f"{target.label}_cmd_{args.phase}.mp4"
+        write_mp4(out, frames)
+        print(f"  MP4: {out}")
     return 0
 
 

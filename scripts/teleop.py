@@ -15,7 +15,7 @@
 用法::
 
     .venv\\Scripts\\python.exe scripts\\teleop.py --run course1
-    .venv\\Scripts\\python.exe scripts\\teleop.py --run course1 --height 9 --gif
+    .venv\\Scripts\\python.exe scripts\\teleop.py --run course1 --height 9 --video
     .venv\\Scripts\\python.exe scripts\\teleop.py --run flatcmd --hold 0.0 0.30 0.0
 
 ``--hold vx vy wz`` 是最直接的演示：把指令钉死在一条上跑满一回合，用来量策略
@@ -48,14 +48,14 @@ from robotdog.policy import stair_from_height  # noqa: E402
 from robotdog.tools import console, paths  # noqa: E402
 
 from play import (  # noqa: E402
-    CAMERA_GIF,
+    CAMERA_VIDEO,
     FRAME_HEIGHT,
     FRAME_STRIDE,
     FRAME_WIDTH,
     open_runner,
     read_json_or,
     resolve_target,
-    write_gif,
+    write_mp4,
 )
 from robotdog.env import Go2StairsEnv  # noqa: E402
 
@@ -263,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="台阶高 [cm]，默认用权重自带记录")
     parser.add_argument("--flat", action="store_true",
                         help="换成平地地形（测指令跟踪时用，默认跟着 --hold 走）")
-    parser.add_argument("--gif", action="store_true", help="渲染成 GIF")
+    parser.add_argument("--video", action="store_true", help="渲染成 MP4 视频")
     parser.add_argument("--hold", type=float, nargs=3, default=None,
                         metavar=("VX", "VY", "WZ"),
                         help="钉死一条指令跑满回合（同时默认切到平地地形）")
@@ -300,8 +300,8 @@ def main(argv: list[str] | None = None) -> int:
     frames: list[np.ndarray] = []
     for ep in range(args.episodes):
         stats, ep_frames = run_teleop(
-            env, runner, controller, seed=args.seed + ep, capture=args.gif,
-            camera=CAMERA_GIF, width=FRAME_WIDTH,
+            env, runner, controller, seed=args.seed + ep, capture=args.video,
+            camera=CAMERA_VIDEO, width=FRAME_WIDTH,
             height=FRAME_HEIGHT,
         )
         frames.extend(ep_frames)
@@ -313,10 +313,10 @@ def main(argv: list[str] | None = None) -> int:
               f"偏航误差(均) {stats['mean_abs_wz_err']:.3f}rad/s  "
               f"{'成功' if stats['success'] else ('摔倒' if stats['fell'] else '超时')}")
 
-    if args.gif and frames:
-        out = paths.OUTPUT_GIFS_DIR / f"{target.label}_teleop.gif"
-        write_gif(out, frames)
-        print(f"  GIF: {out}")
+    if args.video and frames:
+        out = paths.OUTPUT_VIDEOS_DIR / f"{target.label}_teleop.mp4"
+        write_mp4(out, frames)
+        print(f"  MP4: {out}")
     return 0
 
 

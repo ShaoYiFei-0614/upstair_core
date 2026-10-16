@@ -14,7 +14,7 @@
 | `WORKSPACE` | 仓根 | 由本文件位置上溯三级推得；**层级变了这里会静默指错**，冒烟测试必须覆盖 |
 | `GO2_XML` / `GO2_ASSETS_DIR` | vendored Go2 模型 | 只读，永不修改 |
 | `RUNS_DIR` | `runs/` | 训练产物（gitignored，可整体重建） |
-| `OUTPUT_DIR` / `OUTPUT_GIFS_DIR` | `output/` | 人要看的东西；`gifs/` 是交付件（**不在 gitignore 里**，冒烟后要清理） |
+| `OUTPUT_DIR` / `OUTPUT_VIDEOS_DIR` | `output/` | 人要看的东西；`videos/` 是交付件（**不在 gitignore 里**，冒烟后要清理） |
 | `GENERATED_DIR` | `.generated/` | 动态生成的 MJCF 转储（编译失败时的现场） |
 
 ## 约定

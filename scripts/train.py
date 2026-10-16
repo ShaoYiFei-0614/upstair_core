@@ -275,6 +275,9 @@ def parse_args(argv: Sequence[str] | None = None):
                     help="输出目录名；默认用 config.yaml 的 run.name")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG_PATH),
                     help="配置文件路径")
+    ap.add_argument("--warm-start", default=None,
+                    help="第一级从哪个 checkpoint 继承权重（跨 run 续训用；"
+                         "例如从 runs/<旧 run>/checkpoints/stair9_final.zip 出发只训更高台阶）")
     return ap.parse_args(argv)
 
 
@@ -321,13 +324,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[运行] {rundir.root}  (seed={run['seed']}, n_envs={n_envs})")
     print(f"[观测] 每帧 {cfg.obs.frame_size} 维 × history {cfg.obs.history_len} "
           f"= {cfg.obs.size} 维")
-    print(f"[动作] 残差模式, action_scale={cfg.action_scale} rad, "
-          f"步态先验={'开' if cfg.gait_prior else '关'}")
+    if cfg.action_mode == "gait_params":
+        print(f"[动作] gait_params 模式（12 维步态参数：前/后对各 amp_th/amp_ca/"
+              f"off_th/off_ca/hip_amp/hip_off → sin 结构 + trot 相位）"
+              f"  平地步频={cfg.gait_freq_flat:g} Hz  楼梯={cfg.gait_freq_stair:g} Hz"
+              f"  楼梯步幅×{cfg.stair_stride_boost:g}"
+              f"  幅值上限={cfg.param_amp_max:g}/偏置上限={cfg.param_off_max:g}")
+    else:
+        print(f"[动作] residual 模式, action_scale={cfg.action_scale} rad, "
+              f"步态先验={'开' if cfg.gait_prior else '关'}")
     cmd = cfg.command
     print(f"[指令] 基线 vx={cmd.vx:g} m/s；实际三轴范围由指令课程按级下发"
           f"（观测里的那 3 维恒在）")
     if cfg.gait_prior:
-        print(f"[步态] {cfg.gait.summary()}")
+        print(f"[步态结构] {cfg.gait.summary()}")
     print(f"[奖励] forward_vel={cfg.reward.forward_vel} "
           f"foot_lift={cfg.reward.foot_lift} success={cfg.reward.success} "
           f"termination={cfg.reward.termination}")
@@ -342,7 +352,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     trainer = Trainer(cfg, rundir, run=run, ppo=ppo, n_envs=n_envs)
     results = []
-    warm: str | None = None
+    warm: str | None = getattr(args, "warm_start", None)
+    if warm:
+        print(f"[课程] 第一级从外部 checkpoint 继承权重: {warm}", flush=True)
     t_start = time.time()
     for i, stage in enumerate(stages, start=1):
         print(f"[课程] >>> 第 {i}/{len(stages)} 级 '{stage.name}' ({stage.label}) "
@@ -400,7 +412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  汇总: {summary}")
     print("\n下一步:")
     print(f"  .venv\\Scripts\\python.exe scripts\\play.py --run {name} --mode eval")
-    print(f"  .venv\\Scripts\\python.exe scripts\\play.py --run {name} --mode gif")
+    print(f"  .venv\\Scripts\\python.exe scripts\\play.py --run {name} --mode video")
     return 0
 
 

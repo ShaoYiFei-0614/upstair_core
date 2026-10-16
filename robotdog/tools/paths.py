@@ -16,10 +16,10 @@ GO2_ASSETS_DIR: Path = GO2_DIR / "assets"
 
 RUNS_DIR: Path = WORKSPACE / "runs"
 
-#: 人要**看**的东西放这里。只有 ``gifs/`` 是交付件（``output/gifs/<名字>.gif``），
+#: 人要**看**的东西放这里。只有 ``videos/`` 是交付件（``output/videos/<名字>.mp4``），
 #: 其余是工作目录，谁写谁按需创建。
 OUTPUT_DIR: Path = WORKSPACE / "output"
-OUTPUT_GIFS_DIR: Path = OUTPUT_DIR / "gifs"
+OUTPUT_VIDEOS_DIR: Path = OUTPUT_DIR / "videos"
 
 #: 动态生成的 MJCF 场景（不污染 vendored 的模型目录）。
 GENERATED_DIR: Path = WORKSPACE / ".generated"
@@ -32,7 +32,7 @@ __all__ = [
     "GO2_XML",
     "MODELS_DIR",
     "OUTPUT_DIR",
-    "OUTPUT_GIFS_DIR",
+    "OUTPUT_VIDEOS_DIR",
     "RUNS_DIR",
     "WORKSPACE",
 ]

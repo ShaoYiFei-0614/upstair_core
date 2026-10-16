@@ -10,7 +10,12 @@
   **先验只提供稳定的行走节律，不得成为楼梯的解** —— 爬楼必须由 RL 从奖励梯度里
   学出来（`experience.md` §21）。
 
-课程固定九级（四级平地指令预热 → 3/6/9/12/15 cm），每级在上一级权重上继续训。
+课程固定九级（四级平地指令预热 → 3 / 4.5 / 6 / 7.5 / 9 cm），每级在上一级权重上继续训。
+台阶**踏面 0.30 m**（对齐真机：前后足间距 0.367 m > 0.30 ⇒ 四足无法同踩一级、
+必须跨级站立），**楼梯级用爬行先验**（1.25 Hz、四分之一错相、摆动占空比 0.25
+——一次一足、三足支撑），平地级仍用自然小跑的 `trot_natural167`。
+实测高度链（同配方逐级）：**3cm 96% / 4.5cm 90% / 6cm 74% / 7.5cm 92% / 9cm 98%**
+（`train.md` 的 crawl 系列、`experience.md` §23.32）。
 
 ## 文档体系
 
@@ -18,7 +23,7 @@
 | --- | --- | --- |
 | `README.md`（本文） | 代码结构 | — |
 | `doc/<模块>.md` | 每个代码文件的**抽象实现方法** | 与代码文件一一对应 |
-| `train.md` | 训练台账（每次训练的改动/结果/GIF） | — |
+| `train.md` | 训练台账（每次训练的改动/结果/视频） | — |
 | `experience.md` | 调试记录（现象 → 根因 → 修法） | — |
 | `agent.md` | **改代码之前先读**：同步义务、验证流程、硬约束 | — |
 
@@ -50,12 +55,12 @@ upstair_core/
     __init__.py / tools/__init__.py   再导出壳（无逻辑，不入 doc/）
   scripts/
     train.py       训练入口（逐级循环）                          → doc/train.md
-    play.py        评估 / GIF                                    → doc/play.md
+    play.py        评估 / 视频                                    → doc/play.md
     teleop.py      外部控制器遥控                                → doc/teleop.md
     cmd_demo.py    指令跟踪量化                                  → doc/cmd_demo.md
     download_go2.py 拉取 Go2 模型                                → doc/download_go2.md
   runs/<名字>/     训练产物（gitignored）
-  output/gifs/     GIF 交付件
+  output/videos/   视频交付件
 ```
 
 依赖方向**单向无环**：`scripts → robotdog → robotdog/tools`。
@@ -76,7 +81,7 @@ config.yaml ──config.py──► EnvConfig + StageSpec[]
                                 ▼
         runs/<name>/  checkpoint 三件套（zip + vecnormalize.pkl + _env.json）
                                 ▼
-        scripts/play.py（eval / GIF，口径从训练记录回灌）
+        scripts/play.py（eval / 视频，口径从训练记录回灌）
 ```
 
 ## 快速上手
@@ -90,9 +95,9 @@ python -m venv .venv
 :: 训练（全部超参在 config.yaml）
 .venv\Scripts\python.exe scripts\train.py --run-name <名字>
 
-:: 评估 / GIF（权重自动配对 *_vecnormalize.pkl 与 <模型>_env.json 的地形）
+:: 评估 / 视频（权重自动配对 *_vecnormalize.pkl 与 <模型>_env.json 的地形）
 .venv\Scripts\python.exe scripts\play.py --run <名字> --mode eval
-.venv\Scripts\python.exe scripts\play.py --run <名字> --mode gif --batch <批次>
+.venv\Scripts\python.exe scripts\play.py --run <名字> --mode video --batch <批次>
 
 :: 遥控演示 / 指令跟踪量化
 .venv\Scripts\python.exe scripts\teleop.py --run <名字> --flat --hold 0.45 0.3 0.0

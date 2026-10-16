@@ -52,3 +52,8 @@ size mismatch（`experience.md` §7.1）。`_zip_data` / `_deserialize` 是对 S
 
 评测口径必须与训练一致；嵌套 dataclass 过 JSON 往返后要重建 —— 见
 `experience.md` §13.5、§20.7。
+
+`env_config_from_summary` 逐个重建嵌套 dataclass（`obs` / `reward` / `command` /
+`gait` / **`gait_stair`**）：JSON 往返后它们都是普通 dict，漏一个就会在回放时
+以 `AttributeError` 爆掉，或更糟 —— 静默用上默认值、得出相反的评测结论
+（§23.32 的 `gait_stair` 漏重建）。**新增嵌套字段时必须同时加这里的一行。**

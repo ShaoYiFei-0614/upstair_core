@@ -47,18 +47,13 @@ class RewardConfig:
     # --- 横向 / 旋转指令跟踪 ------------------------------------------------ #
     lateral_vel: float = 6.0            # 对 vy 指令的线性死区跟踪（恒在，不门控）
     # 横向窗口下限 [m/s]：window = 0.5·max(vy_max, lateral_range_floor)。
-    # ⭐ 2026-10-13 横向项与偏航项对称化（去门控）：原 `if cmd.vy_max:` 门控使
-    # vy_max=0 的级别（flat_1）**没有任何横向惩罚**，策略在这样的级别里自由
-    # 长出 +0.17 恒漂，下一级再花容量戒（experience.md §23.10）—— 偏航通道
-    # 靠 yaw_range_floor 免疫此病，横向补上对称设计。取 0.15 = 当前量程上限，
-    # 使全部级别的横向窗口统一为 0.075。
+    # 与偏航通道对称去门控（vy_max=0 的级别也要有「不许横漂」的价钱）；
+    # 门控级别里漂移自由生长的教训见 experience.md §23.10。
     lateral_range_floor: float = 0.15
     yaw_rate: float = 4.0               # 对 wz 指令的线性死区跟踪（恒在，不门控）
     yaw_range_floor: float = 0.30       # yaw_max=0 时的量程下限 [rad/s]，兼防除零
-    # 零偏航指令的基线惩罚放大系数：cmd.wz == 0 时误差按 ``yaw_zero_gain ×
-    # (|err| + |wz|)`` 放大，否则「命令我不许转」没有任何价钱。实测（2 Hz 步态、
-    # 滤波 wz 摆幅 ≈0.1 rad/s）×1.5 使该通道在零指令级恒饱和于 −yaw_rate/步 ——
-    # 是「跟住不许转」的强信号，但也是逐项账面里最大的恒定负项（experience.md §23.8）。
+    # 零偏航指令的基线惩罚放大系数：cmd.wz == 0 时误差按增益放大，否则
+    # 「命令我不许转」没有任何价钱（experience.md §23.8）。
     yaw_zero_gain: float = 1.5
 
     # --- 摆动足抬升 ---------------------------------------------------------- #
@@ -70,6 +65,22 @@ class RewardConfig:
     probe_lift: float = 1.0             # 抬高进展的权重
     probe_lift_target: float = 0.06     # m，起算线（跟策略当前能力比，不跟台阶高走）
     probe_blocked_frac: float = 0.30    # 实测前进速度 < 该比例 × 指令速度 ⇒ 被阻挡
+    # 低足门控开关（默认关，2026-10-14 消融，experience.md §23.27）：关 =
+    # 全部脚结算（sub9_v5 行为）；开启必须过 stair3 250k 对照关。
+    probe_lift_low_foot_only: bool = False
+    # 受阻态驻留势函数（见 doc/reward.md）：Φ = 台面脚数 × 台阶高，按 ΔΦ
+    # 结算。⚠ 默认 0（2026-10-14 消融，experience.md §23.27）：与 stair3
+    # 探索期的「受阻→抬脚再爬」转移对打，双臂 A/B 楼梯全灭的条件之一；
+    # 重引入必须过 stair3 250k 对照关。
+    foot_hold: float = 0.0
+    hold_elev_frac: float = 0.3         # 判定「在台面上」的高度阈值（× 台阶高）
+    # 俯仰姿态惩罚：只罚抬头侧。⚠ 默认 0（2026-10-14 实测否决，experience.md
+    # §23.27）：死区覆盖不住健康姿态分布（平地 −7°±5.7°），flat_4 76%→18%；
+    # 该形式在平地无解，平地抬头改用课程顺序解。字段留作楼梯级实验位。
+    pitch_posture: float = 0.0
+    pitch_tol_flat: float = 0.14        # rad，平地死区
+    pitch_tol_per_m: float = 1.2        # rad/m，随台阶高放宽
+    pitch_cap: float = 0.4              # rad，尾项上限（惩罚有界）
 
     # --- 步态发现 ------------------------------------------------------------ #
     air_time: float = 0.6
@@ -83,12 +94,9 @@ class RewardConfig:
     joint_limit: float = -0.5
     alive: float = 0.15
     termination: float = -15.0          # 摔倒一次性罚（config.yaml 用远大于此的值）
-    # ⭐ 摔倒罚的**进度分级**（2026-10-13）：摔倒时的终止罚按「本回合已爬升的
-    # 高度占比」线性减免 —— 在平地或台阶脚下摔 = 全额，爬到顶端摔 = 半额
-    # （termination × (1 − relief × frac)）。理由：晚摔说明已获得爬楼进展
-    # （stair_progress 已逐级支付），全额罚会把「高处的尝试」罚得比「脚下
-    # 空耗」还重，与连续登踏的目标相反。§19.2 的防早摔约束只依赖 frac=0
-    # 处的全额值，不受影响。平地/0 高度时 frac=0，行为与旧版逐位一致。
+    # 摔倒罚的**进度分级**（experience.md §19.2/§23.7）：终止罚按「本回合已
+    # 爬升高度占比」线性减免 —— 高处的尝试已被 stair_progress 逐级支付，
+    # 全额罚会把「高处的尝试」罚得比「脚下空耗」还重。平地/0 高度时 frac=0。
     termination_progress_relief: float = 0.5
     success: float = 50.0
 
@@ -195,6 +203,11 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
 
     # 2) 姿态稳定奖励 -- 惩罚 roll 与 pitch -----------------------------
     terms["orientation"] = rc.orientation * float(rpy[0] ** 2 + rpy[1] ** 2)
+    # 2b) 俯仰姿态：只罚**抬头**侧，死区随台阶高放宽（爬楼需要抬头，平地不需要）。
+    pitch_tol = (rc.pitch_tol_flat
+                 + rc.pitch_tol_per_m * float(env.stair.step_height))
+    nose_up = max(0.0, -float(rpy[1]) - pitch_tol)
+    terms["pitch_posture"] = rc.pitch_posture * min(nose_up, rc.pitch_cap)
 
     # 3) 关节力矩惩罚 -- 关节力矩平方和 ---------------------------------
     tau = env.data.actuator_force
@@ -208,7 +221,15 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     foot_speed = np.linalg.norm(
         (feet - env._prev_foot_pos) / foot_dt, axis=1
     )
-    gate = np.clip(foot_speed / max(float(rc.foot_lift_gate_speed), 1e-6),
+    # 门控阈值：平地随频率归一（低频慢摆同样开门，wtw7 高抬证据）、楼梯固定
+    # 0.25（归一在楼梯让立面贴地蹭速达标 → 假梯度、stair3 崩；地形二分见
+    # experience.md §23.29）。
+    if env.stair.n_up > 0:
+        gate_speed_eff = float(rc.foot_lift_gate_speed)
+    else:
+        gate_speed_eff = (float(rc.foot_lift_gate_speed)
+                          * float(env._gait_freq_eff()) / 1.67)
+    gate = np.clip(foot_speed / max(gate_speed_eff, 1e-6),
                    0.0, 1.0)
     # geom_xpos 是球心，所以要减去半径，才能得到足端表面与地形之间的
     # 真实间隙。
@@ -240,7 +261,15 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
             foot_contact = env._contact_scan()[2]
         landed = foot_contact & ~env._prev_foot_contact
         air = env._foot_air_time
-        credit = np.clip(air - rc.air_time_target, 0.0, None)
+        # target 随频率缩放——**只在平地**（与门控二分对称，experience.md
+        # §23.29）：楼梯级保持 0.30（sub9_v5 口径；wtw9/10 楼梯崩的未排除
+        # 变量，按「楼梯保持 sub9_v5 口径」原则一并二分）。平地缩放让慢摆的
+        # 高抬跨步重新拿得到滞空收益。
+        if env.stair.n_up > 0:
+            target = float(rc.air_time_target)
+        else:
+            target = rc.air_time_target * float(env._gait_freq_eff()) / 2.0
+        credit = np.clip(air - target, 0.0, None)
         overrun = np.clip(air - rc.air_time_max, 0.0, None)
         terms["air_time"] = rc.air_time * float(
             np.sum((credit - overrun) * landed)
@@ -279,6 +308,15 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 为什么起算线不跟台阶高走见 experience.md §15。
     if rc.probe_lift != 0.0 and env._blocked:
         peaks = env._peak_swing_clearance
+        # 只让**低面脚**（还没上到台面的那些，即需要爬升的腿）的峰值参与结算 ——
+        # 台面上的脚不该再抬高（它们该驻留，见 foot_hold），旧写法把前脚刨立面的
+        # 峰值也算进「抬高进展」，等于奖励了错的腿（§23.26）。
+        terr = env._terrain_height(env.foot_pos[:, 0])
+        elev = terr > (env._support_height()
+                       + rc.hold_elev_frac * float(env.stair.step_height))
+        # 低足门控默认关（消融证据 §23.27）；开启必须过 stair3 250k 对照关。
+        if rc.probe_lift_low_foot_only and elev.any():
+            peaks = np.where(elev, 0.0, peaks)
         floor = np.maximum(env._probe_best, float(rc.probe_lift_target))
         gain = float(np.sum(np.clip(peaks - floor, 0.0, None)))
         if gain > 0.0:
@@ -287,6 +325,23 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
         terms["probe_lift"] = rc.probe_lift * gain
     else:
         terms["probe_lift"] = 0.0
+
+    # 9) 受阻态驻留（势函数，见 RewardConfig.foot_hold）：受阻时，「踩在台面上且
+    #    正触地」的脚数 × 台阶高 构成势 Φ，按 ΔΦ 结算。把台上的脚抬走要付代价，
+    #    踩住/多踩一脚给分。非受阻期只同步 Φ（不结算），避免进出受阻时的假跳变。
+    if rc.foot_hold != 0.0:
+        if foot_contact is None:
+            foot_contact = env._contact_scan()[2]
+        terr_h = env._terrain_height(env.foot_pos[:, 0])
+        elev_h = terr_h > (env._support_height()
+                           + rc.hold_elev_frac * float(env.stair.step_height))
+        phi = (float(np.sum(foot_contact & elev_h))
+               * float(env.stair.step_height))
+        terms["foot_hold"] = (rc.foot_hold * (phi - env._hold_phi)
+                              if env._blocked else 0.0)
+        env._hold_phi = phi
+    else:
+        terms["foot_hold"] = 0.0
 
     # --- 终止 -----------------------------------------------------------
     # 到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出楼梯远端摔下去。

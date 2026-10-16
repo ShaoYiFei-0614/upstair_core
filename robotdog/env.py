@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import gymnasium as gym
 import mujoco
@@ -72,6 +72,10 @@ class ObsConfig:
     gait_phase: bool = False            # 2：步态时钟的 sin/cos
     step_height: bool = True            # 1：本回合的楼梯高度
     vel_filter: bool = False            # 2：机身系横向速度 / 偏航角速度的**低通量**
+    # 2：步态指令条件（freq [Hz] + swing_scale）—— Walk These Ways 式：步态参数是
+    # **观测条件**而不是动作自由度（P2 的教训：参数放 action 两次全败，
+    # experience.md §23.27/§23.28）。旧权重 json 缺此键，重建时按 False 还原 53 维。
+    gait_cmd: bool = False
     base_frame_size: int = 42
 
     def __post_init__(self) -> None:
@@ -91,6 +95,7 @@ class ObsConfig:
         extra += 2 if self.gait_phase else 0
         extra += 1 if self.step_height else 0
         extra += 2 if self.vel_filter else 0
+        extra += 2 if self.gait_cmd else 0
         return self.base_frame_size + extra
 
     @property
@@ -167,7 +172,19 @@ class EnvConfig:
     timestep: float = 0.002
     decimation: int = 10                    # -> 50 Hz 控制
     episode_length_s: float = 20.0
-    action_scale: float = 0.30              # rad，策略权限
+    action_scale: float = 0.30              # rad，策略权限（residual 模式的残差上限）
+    # 动作模式："residual" = 12 维关节残差 + 固定先验（当前唯一在用，sub9_v5
+    # 同款）；"gait_params" = P2 参数化生成器（楼梯两次全败已归档，
+    # experience.md §23.24/25；字段保留供实验）。
+    action_mode: str = "residual"
+    gait_freq_flat: float = 1.67            # gait_params：平地步频 [Hz]
+    gait_freq_stair: float = 1.25           # gait_params：楼梯步频 [Hz]
+    stair_stride_boost: float = 1.4         # gait_params：楼梯步幅放大倍率
+    param_amp_max: float = 0.8              # gait_params：幅值参数上限（归一化单位）
+    param_off_max: float = 0.4              # gait_params：偏置参数上限
+    gait_param_nominal: tuple[float, float, float, float] = (0.25, 0.50, 0.12, 0.0)
+    param_hip_amp_max: float = 0.5
+    param_hip_off_max: float = 0.4
 
     # --- 指令（外部控制器接口）：盲走允许的信息（操作者/上游规划器给出，不含
     # 地形真值）。横向与偏航每回合从 [-max, +max] 采样，量程随课程放宽。
@@ -182,6 +199,29 @@ class EnvConfig:
     gait_gain: float = 1.0
     gait_amp_scale: float = 1.0         # 全局幅值缩放（只缩 amp 保留步频，缩后过 normalize()）
     gait_speed_track: bool = True       # 速度参数化：先验幅值按当前指令缩放（doc/gait.md）
+    # ⭐ 分档先验频率（2026-10-14）：residual 非条件化下，楼梯级先验频率 =
+    # stair_band 中点（1.25，自然降频诉求）、平地 = 先验 json 频率（1.67），
+    # 见 ``_gait_freq_eff``。obs.gait_cmd=true 时 freq/swing 还作为**观测条件**
+    # 进 obs（Walk-These-Ways 式）——⚠ 实测条件化把 RL 推向贴地（§23.29），
+    # 当前关闭。
+    gait_freq_flat_band: tuple[float, float] = (1.50, 1.85)    # 平地 freq 采样范围 [Hz]
+    gait_freq_stair_band: tuple[float, float] = (1.10, 1.40)   # 楼梯 freq 采样范围 [Hz]
+    #: 楼梯级**固定频率** [Hz]（>0 生效；0 = 按台阶高插值）。
+    # 用户要求：楼梯段 1.25 Hz（experience.md §23.32）。
+    gait_freq_stair_fixed: float = 0.0
+    #: 楼梯级**专用先验**（2026-10-15，爬行步态）。None = 平楼梯共用 ``gait``。
+    # 设了它时楼梯级的先验轨迹与频率都取自它（频率字段优先于上面的固定值）——
+    # 平地段保持 trot 自然步态、楼梯段用爬行（4 足错相 + 小占空比 = 静态稳定）。
+    gait_stair: GaitParams | None = None
+    gait_swing_flat_band: tuple[float, float] = (0.90, 1.10)   # 平地 swing 缩放范围
+    gait_swing_stair_band: tuple[float, float] = (1.00, 1.35)  # 楼梯 swing 缩放范围
+    # 先验状态门控（P1）：受阻/站立时先验平滑衰减。⚠ 受阻门控实测有害默认关
+    # （§23.20：先验在受阻态的节奏正是连续登踏的动力来源）；站立门控保留
+    # （课程内不触发，服务于回放/遥操作的「站着别踏步」）。
+    prior_gate_on_block: bool = False
+    prior_gate_on_stand: bool = True
+    prior_gate_tau: float = 0.3         # 门控平滑时间常数 [s]
+    prior_gate_floor: float = 0.0       # 受阻/站立时的门控目标值
     kp: tuple[float, float, float] = (30.0, 30.0, 45.0)
     kd: tuple[float, float, float] = (0.6, 0.6, 0.9)
 
@@ -204,12 +244,9 @@ class EnvConfig:
 
     # --- 成功 -------------------------------------------------------------- #
     spawn_back: float = 0.55                # 第一个立面前方的米数
-    # 平地阶段的成功判据是**指令跟随**：脱靶步占比与「实测量真的跟着指令变」的
-    # 相关系数双门槛（常数输出能把平均误差压到最小，骗不过相关系数）。
-    # ⭐ 2026-10-13 容差随指令量程缩减（vy ≤ 0.15、wz ≤ 0.6）收紧：vy 0.30→0.12、
-    # wz 0.70→0.40。取值原则（避免骑边界）：容差 ≈ 2×「真在跟的策略」的预期误差
-    # （滤波过渡 + 调制滞后 ≈ 0.05~0.2），让跟得动的策略有余量、不跟的策略
-    # （误差 = 满量程）明确出局 —— 不放在任何典型误差恰好落地的值上。
+    # 平地阶段的成功判据是**指令跟随**：脱靶步占比与相关系数双门槛（常数输出
+    # 骗不过相关系数）。容差 ≈ 2×「真在跟的策略」的预期误差（不放在典型误差
+    # 恰好落地的值上，避免骑边界）。
     flat_track_tol_vy: float = 0.12         # m/s（vy_max ≤ 0.15，留 ~2.5 倍过渡余量）
     flat_track_tol_wz: float = 0.40         # rad/s（yaw_max ≤ 0.6；不跟者满量程 0.6 出局）
     flat_track_tol_vx: float = 0.35         # m/s（vx 带 [0.2,0.6] 未变，维持原值）
@@ -268,11 +305,17 @@ class Go2StairsEnv(gym.Env):
         self._build_model()
 
         self.num_act = 12
+        if self.cfg.action_mode not in ("residual", "gait_params"):
+            raise ValueError(f"未知的 action_mode {self.cfg.action_mode!r}，"
+                             f"可选 'residual' 或 'gait_params'")
+        # 动作维度随模式变：residual=12（逐关节残差）；gait_params=12
+        # （前/后对各 6 个参数：amp_th, amp_ca, off_th, off_ca, hip_amp, hip_off）
+        self.num_action = 12 if self.cfg.action_mode == "residual" else 12
         self.act_low = self.meta.joint_ranges[:, 0].astype(np.float32)
         self.act_high = self.meta.joint_ranges[:, 1].astype(np.float32)
         self.home_angles = self.meta.home_joint_angles.astype(np.float32)
 
-        self.action_space = spaces.Box(-1.0, 1.0, (self.num_act,), dtype=np.float32)
+        self.action_space = spaces.Box(-1.0, 1.0, (self.num_action,), dtype=np.float32)
         self.observation_space = spaces.Box(
             -np.inf, np.inf, (self.cfg.obs.size,), dtype=np.float32
         )
@@ -282,7 +325,10 @@ class Go2StairsEnv(gym.Env):
         self._max_steps = int(self.cfg.episode_length_s / self.cfg.control_dt)
 
         self._hist: deque[np.ndarray] = deque(maxlen=self.cfg.obs.history_len)
-        self._last_action = np.zeros(self.num_act, dtype=np.float64)
+        self._last_action = np.zeros(self.num_action, dtype=np.float64)
+        # 上一步**下发的关节偏移**（12 维）：residual 模式即 action；gait_params 模式
+        # 是由 8 个参数生成的轨迹。观测里报的是它（「我上一步命令了什么」）。
+        self._last_traj = np.zeros(self.num_act, dtype=np.float64)
         self._step_count = 0
         # 本回合四足支撑面曾达到的最大高度（由 reward.py 的 stair_progress 结算）。
         self._peak_terrain_height = 0.0
@@ -294,6 +340,8 @@ class Go2StairsEnv(gym.Env):
         self._probe_count = 0
         self._probe_best = np.zeros(len(self.meta.foot_geom_ids))
         self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
+        # 受阻态驻留势的 Φ（见 reward.py 的 foot_hold）
+        self._hold_phi = 0.0
 
         # 低通滤波后的横向速度 / 偏航角速度：一阶 IIR，``alpha = dt / tau``，
         # 初值取 reset 时的瞬时值（避免开头几十毫秒从 0 慢慢爬）。
@@ -322,9 +370,19 @@ class Go2StairsEnv(gym.Env):
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
-        # 步态先验时钟（自回合开始起的秒数）。
+        # 步态先验时钟（自回合开始起的秒数）+ gait_params 模式的步态时钟（周期数）。
         self._gait_t = 0.0
         self._gait_phase = 0.0
+        self._gait_clock = 0.0
+        self._gait_phase_cycles = 0.0
+        self._prior_gate = 1.0            # 先验状态门控（受阻/站立时向 floor 衰减）
+        self._vx_ema = 0.0                # 前向速度 EMA（门控的受阻判据）
+        self._gate_slow_streak = 0        # 「平滑后速度接近零」的连续步数（去抖）
+        self._gate_has_moved = False      # 本回合是否已动过（冷启动自锁的护栏）
+        # 步态指令条件（freq/swing，见 EnvConfig.gait_freq_*_band）：reset 采样、
+        # 回合内固定；obs.gait_cmd 开启时报给策略，策略伺服它（Walk These Ways 式）。
+        self._gait_freq_cmd = float(self.cfg.gait.freq)
+        self._gait_swing_cmd = 1.0
         self._rng = np.random.default_rng(seed)
         self._renderer: mujoco.Renderer | None = None
         self._render_cam = None
@@ -418,13 +476,16 @@ class Go2StairsEnv(gym.Env):
         覆盖它。``vy`` / ``wz`` 只改当前值，它们每回合本来就该重抽。
 
         ``hold=True`` 表示「这条指令要一直生效，别被回合内的周期重抽覆盖」
-        —— 回放、遥操作与 GIF 都用它；默认 ``False`` 则只写到下一次重抽为止。
+        —— 回放、遥操作与视频录制都用它；默认 ``False`` 则只写到下一次重抽为止。
         ``vx`` / ``vy`` 为**世界系**分量（机体系投影由 :meth:`command_body`
         每步现算）。
         """
         if hold:
-            # 把年龄顶到不可能到达的值：``step()`` 里的重抽判据就永远不成立。
-            self._cmd_age = 10 ** 9
+            # ⭐ 负值 = 永不满足重抽判据(``_cmd_age >= hold_steps``)。旧写法
+            # ``10**9`` 恒满足 ``>=100`` → hold 的钉指令完全失效、回放时指令
+            # 每步随机重抽(2026-10-15 实锤:同权重审查 3/3 vs play 0/10,
+            # experience.md §23.30)。
+            self._cmd_age = -(10 ** 9)
         else:
             self._cmd_age = 0
         self.cfg.command._set_now(vx=vx, vy=vy, wz=yaw_rate)
@@ -432,6 +493,37 @@ class Go2StairsEnv(gym.Env):
             self.cfg.command.vx = float(vx)
         # 同步驻留值：缓变扰动/重抽以写入值为基准（hold=True 时扰动不生效）。
         self._cmd_hold[:] = [float(v) for v in self._command]
+
+    def _sample_gait_cmd(self) -> None:
+        """按地形采一条步态指令 ``(freq, swing)``,回合内固定。
+
+        平地档中心 1.67 Hz、楼梯档中心 1.25 Hz（trot_natural167 标定）；
+        swing 是先验幅值的条件缩放（楼梯档偏大 = 更从容的大步幅）。范围见
+        ``EnvConfig.gait_freq_*_band`` / ``gait_swing_*_band``。
+        """
+        stair = self.stair.n_up > 0
+        fb = (self.cfg.gait_freq_stair_band if stair
+              else self.cfg.gait_freq_flat_band)
+        sb = (self.cfg.gait_swing_stair_band if stair
+              else self.cfg.gait_swing_flat_band)
+        self._gait_freq_cmd = float(self._rng.uniform(*fb))
+        self._gait_swing_cmd = float(self._rng.uniform(*sb))
+
+    def set_gait_cmd_now(self, freq: float | None = None,
+                         swing: float | None = None) -> tuple[float, float]:
+        """**立即**写入步态指令（部署/play 的实时步态切换入口）。
+
+        ``None`` 表示该项保持当前值；返回写后的 ``(freq, swing)``。swing 缩放
+        先验幅值、不动常量偏置（与 ``GaitParams.with_dynamic_scale`` 同语义）。
+        训练中 freq/swing 每回合由 :meth:`_sample_gait_cmd` 重采，这里的写入
+        会被下一次 reset 覆盖 —— 要锁定请配合 ``set_command_now(hold=True)``
+        的用法自行在回放循环里每步调用。
+        """
+        if freq is not None:
+            self._gait_freq_cmd = float(freq)
+        if swing is not None:
+            self._gait_swing_cmd = float(swing)
+        return self._gait_freq_cmd, self._gait_swing_cmd
         # 刷新「已经算好、还没被取走」的那一帧观测：控制器是在两次 ``step()``
         # 之间下指令的，不刷新的话策略拿到的那一帧还带着上一步的指令（50 Hz
         # 下 20 ms 的滞后）。指令是外生输入，改它不破坏马尔可夫性。
@@ -649,13 +741,15 @@ class Go2StairsEnv(gym.Env):
             self.joint_vel,
             self.base_rpy,
             self.base_ang_vel_body,
-            self._last_action,
+            self._last_traj,
         ]
         # 结构固定块：机身系线速度（指令跟踪的「实测」侧，无开关）。
         parts.append(self.base_lin_vel_body)
         # 这里故意没有 base_height 分支：它含地形真值，ObsConfig 构造期已禁止。
         if obs_cfg.gait_phase:
-            theta = 2.0 * np.pi * self.cfg.gait.freq * self._gait_phase
+            # 报「产生器实际在用的那个相角」（residual=先验相位；gait_params=生成器
+            # 时钟）—— 观测与动作流水线必须同一个相位，否则破坏马尔可夫性。
+            theta = self._gait_theta()
             parts.append(np.array([np.sin(theta), np.cos(theta)]))
         if obs_cfg.step_height:
             # 楼梯信息里唯一直接告诉策略的一项。盲走仍然需要知道自己在*哪一段*
@@ -668,6 +762,11 @@ class Go2StairsEnv(gym.Env):
             # 滤波后的横向速度 / 偏航角速度。奖励的 command_follow 读同一批量 ——
             # 只改奖励不改观测会把滤波器状态藏起来、破坏马尔可夫性，必须成对出现。
             parts.append(np.array([self.filtered_lateral_vel, self.filtered_yaw_rate]))
+        if obs_cfg.gait_cmd:
+            # 步态指令条件（freq [Hz] + swing 缩放）：策略要伺服的两个步态参数，
+            # 与 _gait_action 生成先验用的是同一组值（马尔可夫性）。
+            parts.append(np.array([float(self._gait_freq_cmd),
+                                   float(self._gait_swing_cmd)]))
         return np.concatenate(parts).astype(np.float64)
 
     def _observation(self) -> np.ndarray:
@@ -835,9 +934,11 @@ class Go2StairsEnv(gym.Env):
 
         self.nominal_pose = float(self.meta.home_qpos[2])
         self._peak_terrain_height = self._support_height()   # 足端支撑面，不是躯干 x（见 §2.7）
-        self._last_action = np.zeros(self.num_act)
+        self._last_action = np.zeros(self.num_action)
+        self._last_traj = np.zeros(self.num_act)
         self._cmd_hold[:] = self._sample_command()
         self._command[:] = list(self._cmd_hold)
+        self._sample_gait_cmd()
         self._cmd_wander[:] = 0.0
         self._step_count = 0
         self._tracking_miss_count = 0
@@ -855,6 +956,7 @@ class Go2StairsEnv(gym.Env):
         self._probe_count = 0
         self._probe_best = np.zeros(len(self.meta.foot_geom_ids))
         self._peak_swing_clearance = np.zeros(len(self.meta.foot_geom_ids))
+        self._hold_phi = 0.0
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = self._contact_scan()[2]
@@ -862,6 +964,12 @@ class Go2StairsEnv(gym.Env):
         # 实际使用的那一个。
         self._gait_t = 0.0
         self._gait_phase = 0.0
+        self._gait_clock = 0.0
+        self._gait_phase_cycles = 0.0
+        self._prior_gate = 1.0
+        self._vx_ema = 0.0
+        self._gate_slow_streak = 0
+        self._gate_has_moved = False
         self._hist.clear()
         # 滤波器用「回合第一步的瞬时值」做初值：从 0 开始爬会白白浪费开头一段，
         # 而 reset 时机器人是站在原地的，瞬时值本身就是合理的初值。
@@ -883,35 +991,161 @@ class Go2StairsEnv(gym.Env):
             return 1.0
         return float(GaitParams.scale_for_speed(float(self._command[0])))
 
+    def _active_gait(self) -> GaitParams:
+        """当前地形的先验：楼梯级且配了 ``gait_stair`` 时用它，否则用 ``gait``。"""
+        if self.stair.n_up > 0 and self.cfg.gait_stair is not None:
+            return self.cfg.gait_stair
+        return self.cfg.gait
+
     def _gait_action(self) -> np.ndarray:
         """步态先验在当前相位下的关节角偏移（rad）。
 
         先验被禁用时恒为零，于是动作流水线对 ``gait_prior=False``
-        和对 ``GaitParams.static()`` 是同一条代码路径。
+        和对 ``GaitParams.static()`` 是同一条代码路径。``_prior_gate`` 是
+        状态门控（受阻/站立时向 floor 衰减，见 ``EnvConfig.prior_gate_*``）。
         """
         if not self.cfg.gait_prior or self.cfg.gait_gain == 0.0:
             return np.zeros(self.num_act, dtype=np.float64)
-        gait = self.cfg.gait
+        gait = self._active_gait()
+        if self.cfg.obs.gait_cmd:
+            # 条件化（Walk These Ways 式）：先验按**采样的 gait 指令**生成 ——
+            # freq 换成指令值、幅值乘 swing（只缩幅值不动偏置，_scale_dyn 语义）。
+            # freq 回合内恒定，秒制相位 2π·f·t 连续；副本每步现造（开销可忽略）。
+            # 非条件化走旧路径，与 sub9_v5 逐位等价。
+            scale = self._gait_scale() * float(self._gait_swing_cmd)
+            gait = replace(gait, freq=float(self._gait_freq_cmd),
+                           _scale_dyn=float(scale))
+            return (self.cfg.gait_gain * self._prior_gate
+                    * gait.radians(self._gait_theta()))
         scale = self._gait_scale()
         if scale != 1.0:
             gait = gait.with_dynamic_scale(scale)
-        return self.cfg.gait_gain * gait.radians(self._gait_phase)
+        f_eff = self._gait_freq_eff()
+        if f_eff != gait.freq:
+            # 非条件化分档：楼梯级先验频率降到楼梯档中点（与 _gait_theta
+            # 同源，保持马尔可夫性）；平地/频率一致时零开销。
+            gait = replace(gait, freq=f_eff)
+        return (self.cfg.gait_gain * self._prior_gate
+                * gait.radians(self._gait_phase))
+
+    def _gait_freq(self) -> float:
+        """gait_params 模式的步频 [Hz]：楼梯更低（更从容的登踏），平地 1.67。"""
+        return (float(self.cfg.gait_freq_stair) if self.stair.n_up > 0
+                else float(self.cfg.gait_freq_flat))
+
+    def _gait_freq_eff(self) -> float:
+        """奖励与先验生成**共用**的当前实际步态频率 [Hz]（门控/air_time 等
+        成形项以它做频率归一 —— 用错基准会让等价性悄悄破掉，§23.29）。
+
+        与 :meth:`_gait_freq` 的分工：那个是 gait_params 时钟的地形常量。
+        取值：gait_params → 地形常量；residual 条件化 → 采样指令；
+        residual 非条件化 → **分档**（楼梯级 = stair_band 中点、平地 = 先验
+        json 频率）。"""
+        if self.cfg.action_mode == "gait_params":
+            return self._gait_freq()
+        if self.cfg.obs.gait_cmd:
+            return float(self._gait_freq_cmd)
+        if self.stair.n_up > 0 and self.cfg.gait_stair is not None:
+            return float(self.cfg.gait_stair.freq)   # 楼梯专用先验自带频率
+        if self.stair.n_up > 0:
+            # 楼梯级频率：``gait_freq_stair_fixed > 0`` 时钉死该值（用户要求的
+            # 「楼梯段固定 1.25 Hz」）；否则按台阶高线性插值 先验json 频率→1.0。
+            if float(self.cfg.gait_freq_stair_fixed) > 0.0:
+                return float(self.cfg.gait_freq_stair_fixed)
+            h = float(self.stair.step_height)
+            f_flat = float(self.cfg.gait.freq)
+            return f_flat + (1.0 - f_flat) * min(1.0, h / 0.15)
+        return float(self.cfg.gait.freq)
+
+    def _gait_theta(self) -> float:
+        """当前步态相角 [rad]。
+
+        产生器用的与观测报的**必须是同一个**（马尔可夫性）：residual 模式取固定
+        先验的 ``2π·f·t``；gait_params 模式取生成器时钟的 ``2π·周期数``。
+        """
+        if self.cfg.action_mode == "gait_params":
+            return 2.0 * np.pi * self._gait_phase_cycles
+        if self.cfg.obs.gait_cmd:
+            # 条件化：residual 的相位跟随**采样的步态频率**（回合内恒定 → 秒制
+            # 相位连续；与 _gait_action 用同一个值，保持马尔可夫性）。
+            return 2.0 * np.pi * self._gait_freq_cmd * self._gait_phase
+        # 非条件化：频率与 _gait_action 的先验生成同源（分档后楼梯级为
+        # 楼梯档中点）。
+        return 2.0 * np.pi * self._gait_freq_eff() * self._gait_phase
+
+    def _gait_traj_from_params(self, action: np.ndarray) -> np.ndarray:
+        """P2：8 维步态参数 → 12 维关节角偏移（已乘先验 ``action_scale``）。
+
+        ``action = [前对(amp_th, amp_ca, off_th, off_ca, hip_amp, hip_off), 后对(同六项)]``：
+        每项以 ``gait_param_nominal``（标称步态）为**零点**做双侧线性映射 ——
+        ``a < 0`` 压向 0（幅值 0 = 该腿对驻留）、``a > 0`` 放到 ``param_*_max``
+        （楼梯上幅值上限再乘 ``stair_stride_boost``）。髋的标称是 0（artifact
+        形态，髋不摆），幅值单侧、偏置双侧 —— **偏航/横移的作动权限在髋上**，
+        没有这四项 P2 在结构上就删掉了转向能力（§23.25）。相位用固定的 trot
+        对角反相（``gait.leg_phase``），波形/相位偏置沿用先验结构。
+
+        为什么按**前/后对**而不是对角对：对角对把前腿与后腿锁在一起，无法表达
+        受阻态需要的「前脚驻留 + 后腿抬升」（前对幅值→0、后对幅值拉大）——
+        这是 P2 相对固定先验的核心增益（§23.17）。
+
+        为什么零点是**标称步态**而不是全零：全零 = ``off_th=0`` = 原地踏步
+        （§23.6 标定结论；§23.24 实测从零学不动）。以会走的步态为零点，
+        策略只需学「怎么改」——与 residual 模式同构，但改的是**结构化的参数**。
+        """
+        g = self.cfg.gait
+        nom = self.cfg.gait_param_nominal          # (amp_th, amp_ca, off_th, off_ca)
+        amp_max = float(self.cfg.param_amp_max)
+        if self.stair.n_up > 0:
+            amp_max *= float(self.cfg.stair_stride_boost)
+        off_max = float(self.cfg.param_off_max)
+        a = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+
+        def amp_map(ai: float, nominal: float) -> float:
+            return nominal * (1.0 + ai) if ai < 0 else nominal + ai * (amp_max - nominal)
+
+        def off_map(ai: float, nominal: float) -> float:
+            return nominal + ai * (off_max - nominal if ai > 0 else off_max + nominal)
+
+        amp_th = np.array([amp_map(a[0], nom[0]), amp_map(a[6], nom[0])])   # 前对/后对
+        amp_ca = np.array([amp_map(a[1], nom[1]), amp_map(a[7], nom[1])])
+        off_th = np.array([off_map(a[2], nom[2]), off_map(a[8], nom[2])])
+        off_ca = np.array([off_map(a[3], nom[3]), off_map(a[9], nom[3])])
+        # 髋：标称 0（artifact 形态，髋不摆）。幅值用**有符号**形式（负号 = 反相
+        # 摆动，语义等价、量程不浪费）；偏置双侧 ±hip_off_max。
+        hip_amp = np.array([self.cfg.param_hip_amp_max * a[4],
+                            self.cfg.param_hip_amp_max * a[10]])
+        hip_off = np.array([self.cfg.param_hip_off_max * a[5],
+                            self.cfg.param_hip_off_max * a[11]])
+        theta = self._gait_theta()
+        traj = np.zeros((4, 3), dtype=np.float64)       # 每条腿 hip/thigh/calf
+        for leg in range(4):
+            pair = 0 if leg < 2 else 1                  # FL/FR = 前对；RL/RR = 后对
+            p = theta + float(g.leg_phase[leg])
+            traj[leg, 0] = hip_off[pair] + hip_amp[pair] * np.sin(p)   # 髋摆（横移/转向权限）
+            traj[leg, 1] = off_th[pair] + amp_th[pair] * np.sin(p + g.ph_th)
+            traj[leg, 2] = off_ca[pair] + amp_ca[pair] * g._calf_wave(p + g.ph_ca)
+        return float(g.action_scale) * traj.ravel()
 
     def _target_from_action(self, action: np.ndarray) -> np.ndarray:
         """把策略动作映射为 PD 关节目标（整条动作流水线）。
 
-        只有一种映射：**残差 RL**。它有意把两个幅值分开：
+        **residual 模式**（12 维）：固定先验 + 策略残差，两个幅值刻意分开 ——
 
             target = home + gait_gain * gait.radians(t) + action_scale * action
 
-        ``gait.action_scale`` 表示先验动作有多大（它是被搜索的步态的一部分）；
-        ``cfg.action_scale`` 表示策略可以偏离它多少。共用一个尺度会让策略的
-        探索噪声随先验一起缩放，瞬间就把机器人搞失稳。
+        ``gait.action_scale`` 表示先验动作有多大；``cfg.action_scale`` 表示策略
+        可以偏离它多少。共用一个尺度会让探索噪声随先验一起缩放，瞬间失稳。
 
-        （历史上有过 "absolute" 模式：``target = lo + (a+1)/2 * (hi-lo)``。
-        它从未被训练或被搜索使用过，只是 ``EnvConfig`` 里一个无人设置的
-        分支，已随本次清理删除。）
+        **gait_params 模式**（8 维，P2）：动作**就是**步态参数，经 sin 结构 +
+        trot 相位生成轨迹 —— ``target = home + traj(params, θ)``。结构提供协调性
+        （随机探索也落在协调步态上），参数的前/后分离提供受阻态的表达力。
+
+        （历史上有过 "absolute" 模式，从未被使用，已随清理删除。）
         """
+        if self.cfg.action_mode == "gait_params":
+            traj = self._gait_traj_from_params(action)
+            self._last_traj = traj.copy()               # 供观测的「上一步下发偏移」
+            return np.clip(self.home_angles + traj, self.act_low, self.act_high)
         target = (self.home_angles
                   + self._gait_action()
                   + self.cfg.action_scale * action)
@@ -943,11 +1177,45 @@ class Go2StairsEnv(gym.Env):
             self._command[1] = float(np.clip(vy_g + self._cmd_wander[1], -0.2, 0.2))
             self._command[2] = float(np.clip(wz_g + self._cmd_wander[2], -0.8, 0.8))
 
+        # 先验状态门控（P1）：受阻 = 「有前进指令但**平滑后**的前向速度持续
+        # 接近零」——不能直接用 ``_blocked``（按瞬时速度判定，步态摆动下每秒
+        # 闪烁多次）。三个防误触发参数都是实测标定的（experience.md §23.18）：
+        # EMA τ=0.8s 压掉整个步态周期（2 Hz 下的摆动残余 ±0.03）、阈值
+        # 0.15×cmd 与正常行走速度（≈0.5×cmd）留足余量、40 步（0.8s）去抖让
+        # 出生静止与行进中的短暂减速都不触发；否则门控会把平地正常行走也
+        # 关掉先验，而先验一关速度归零 → 自锁死。
+        if self.cfg.prior_gate_on_block:
+            a_v = min(1.0, self.cfg.control_dt / 0.8)
+            self._vx_ema += a_v * (float(self.base_lin_vel_body[0]) - self._vx_ema)
+            need = 0.15 * max(abs(float(self._command[0])), 0.05)
+            self._gate_slow_streak = (self._gate_slow_streak + 1
+                                      if self._vx_ema < need else 0)
+            # 「先动过」标志（冷启动自锁的教训，experience.md §23.18）：门控只
+            # 衰减在「先行走、后被卡住」的情形（用户原意：爬楼途中被卡住时先验
+            # 别乱动）；从没动过的策略必须先靠先验起步，否则一衰减就永久冻住。
+            if self._vx_ema > 0.5 * max(abs(float(self._command[0])), 0.05):
+                self._gate_has_moved = True
+        stand = (self.cfg.prior_gate_on_stand
+                 and abs(float(self._command[0])) < 1e-3)
+        # 受阻是**楼梯现象**且要过**出生宽限**与**先动过**两道门（平地滞留不是
+        # 受阻；出生加速期的 EMA 尚未爬到行走速度）。
+        blocked_gate = (self.cfg.prior_gate_on_block
+                        and self.stair.n_up > 0
+                        and self._step_count > 75
+                        and self._gate_has_moved
+                        and self._gate_slow_streak >= 40)
+        goal = self.cfg.prior_gate_floor if (stand or blocked_gate) else 1.0
+        alpha = min(1.0, self.cfg.control_dt
+                    / max(1e-6, self.cfg.prior_gate_tau))
+        self._prior_gate += alpha * (goal - self._prior_gate)
+
         # 残差 RL：先验提供一个能用的周期步态，策略提供修正量。观测里报告的
         # 相位就是本步实际使用的那一个，所以转移保持马尔可夫性。
         self._gait_phase = self._gait_t
+        self._gait_phase_cycles = self._gait_clock
         target = self._target_from_action(action)
         self._gait_t += self.cfg.control_dt
+        self._gait_clock += self.cfg.control_dt * self._gait_freq()
 
         for _ in range(self.cfg.decimation):
             q = self.data.qpos[self.meta.qpos_joint_adr]
@@ -994,6 +1262,10 @@ class Go2StairsEnv(gym.Env):
         self._advance_foot_air_time(foot_contact)
 
         self._last_action = action.copy()
+        # gait_params 模式下 _last_traj 已在 _target_from_action 里设为生成的轨迹；
+        # residual 模式下它就是本步 action（下发的关节偏移）。
+        if self.cfg.action_mode == "residual":
+            self._last_traj = action.copy()
         # 足端 xy 位移必须恰好在一个控制步上测量，所以这个快照每一步都要
         # 推进。
         self._prev_foot_pos = self.foot_pos.copy()
@@ -1034,7 +1306,7 @@ class Go2StairsEnv(gym.Env):
     # ---------------------------------------------------------------- 渲染
 
     #: :meth:`render` 能识别的相机预设。
-    CAMERAS = ("side", "track", "chase", "front", "top")
+    CAMERAS = ("side", "track", "chase", "front", "top", "side_high")
 
     #: 各相机的 ``(azimuth, elevation, distance)``。注视点在 :meth:`render` 里
     #: 按相机名取：``side`` 固定在楼梯入口，其余跟随机身。
@@ -1044,6 +1316,9 @@ class Go2StairsEnv(gym.Env):
         "chase": (135.0, -22.0, 3.0),
         "front": (180.0, -10.0, 3.0),
         "top": (90.0, -85.0, 4.5),
+        # 审查用:侧上方 30° 俯视——立面与踏面同现(side 的 -12° 俯角低于
+        # 台阶立面可见临界 atan(立面/踏面)≈13.5°,立面被踏面遮挡,§23.30)
+        "side_high": (90.0, -30.0, 5.0),
     }
 
     def render(self, camera: str = "side", *, width: int = 640, height: int = 480):
@@ -1077,7 +1352,11 @@ class Go2StairsEnv(gym.Env):
         # ``side`` 固定看整段楼梯入口，其余注视点跟随机身。
         self._render_cam.lookat[:] = {
             "side":  (self.stair.start_x + 1.0, 0.0, 0.3),
-            "track": (float(base[0]) + 0.35, float(base[1]), float(base[2]) + 0.02),
+            "side_high": (self.stair.start_x + 1.2, 0.0, 0.5),
+            # 视频用：沿前进方向平移跟随 + z 跟随机身高度(y 钉楼梯中线)——
+            # z 钉死会在爬高后把台阶压扁成「一块平地」(立面全被踏面遮挡,
+            # 2026-10-15 用户发现);机身 z 比足端平稳,不引入步态抖动。
+            "track": (float(base[0]) + 0.35, 0.0, float(base[2])),
             "chase": (float(base[0]) + 0.6, float(base[1]), float(base[2]) + 0.10),
             "front": (float(base[0]) + 1.2, float(base[1]), float(base[2]) + 0.10),
             "top":   (float(base[0]) + 0.8, float(base[1]), float(base[2])),
