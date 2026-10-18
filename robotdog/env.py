@@ -272,6 +272,26 @@ class EnvConfig:
     guidance_vy_limit: float = 0.15    # vy 引导限幅
     guidance_yaw_gain: float = 1.5     # wz [rad/s] 每弧度朝向误差
     guidance_yaw_limit: float = 0.60   # wz 引导限幅
+    # hold=True（回放/遥操作/录像）时是否仍按引导覆盖 vy/wz。默认 True =
+    # **训练条件原样复现**（训练时引导恒开，回放若关掉会造成分布偏移）。
+    # 代价：hold 钉住的 vy/wz 在楼梯级上被静默改写 —— teleop 的 StairController
+    # 与 `--hold` 演示测的是「引导指令」而不是操作手给的指令（audit B8）。
+    # 要测真实指令跟踪/关闭引导干扰，置 false（teleop 的 --strict-hold 会设它）。
+    stair_guidance_under_hold: bool = True
+
+    # --- 观测口径 ----------------------------------------------------------- #
+    # ``yaw_rate``（偏航指令跟踪的实测侧）读哪个量。2026-10-18 审计（见
+    # doc/audit_report.md 的 B7）：旧口径在真实爬楼时 mean|误差| 0.198 rad/s ——
+    # 约等于偏航指令量程 0.3 的 66%，且误差与 roll rate 的相关系数为 -0.90。
+    #   "legacy" -> R(yaw)^T·qvel[3:6] 的 z 分量。注意这是**双重旋转**：
+    #               qvel[3:6] 本来就在机体系（MuJoCo free joint 的角速度就是机体
+    #               系角速度），再乘一次 R^T 等于把 ω 投到「偏航旋转后的机身系」，
+    #               roll/pitch rate 会漏进偏航读数。保留只为复现旧训练结果。
+    #   "body_z" -> qvel[5]（机体系 z 分量，真机陀螺口径、最便宜）。
+    #   "world"  -> ψ̇ = (ω_y·sinφ + ω_z·cosφ)/cosθ（世界系偏航角速度，与 wz
+    #               指令同口径；审计实测 mean|误差| 0.198 -> 0.060 rad/s）。
+    # 只影响观测的 vel_filter 块与奖励的偏航跟踪项，不影响物理。
+    yaw_rate_mode: str = "legacy"
 
     # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
@@ -323,9 +343,15 @@ class Go2StairsEnv(gym.Env):
         if self.cfg.action_mode not in ("residual", "gait_params"):
             raise ValueError(f"未知的 action_mode {self.cfg.action_mode!r}，"
                              f"可选 'residual' 或 'gait_params'")
-        # 动作维度随模式变：residual=12（逐关节残差）；gait_params=12
-        # （前/后对各 6 个参数：amp_th, amp_ca, off_th, off_ca, hip_amp, hip_off）
-        self.num_action = 12 if self.cfg.action_mode == "residual" else 12
+        if self.cfg.yaw_rate_mode not in ("legacy", "body_z", "world"):
+            raise ValueError(
+                f"未知的 yaw_rate_mode {self.cfg.yaw_rate_mode!r}，"
+                f"可选 'legacy'（旧口径，有 bug，仅用于复现）、"
+                f"'body_z'（机体系 z 分量）或 'world'（世界系偏航角速度）"
+            )
+        # 两种模式的动作维数都是 12：residual = 逐关节残差；gait_params =
+        # 前/后对各 6 个参数（amp_th, amp_ca, off_th, off_ca, hip_amp, hip_off）。
+        self.num_action = 12
         self.act_low = self.meta.joint_ranges[:, 0].astype(np.float32)
         self.act_high = self.meta.joint_ranges[:, 1].astype(np.float32)
         self.home_angles = self.meta.home_joint_angles.astype(np.float32)
@@ -342,7 +368,7 @@ class Go2StairsEnv(gym.Env):
         self._hist: deque[np.ndarray] = deque(maxlen=self.cfg.obs.history_len)
         self._last_action = np.zeros(self.num_action, dtype=np.float64)
         # 上一步**下发的关节偏移**（12 维）：residual 模式即 action；gait_params 模式
-        # 是由 8 个参数生成的轨迹。观测里报的是它（「我上一步命令了什么」）。
+        # 是由 12 个参数生成的轨迹。观测里报的是它（「我上一步命令了什么」）。
         self._last_traj = np.zeros(self.num_act, dtype=np.float64)
         self._step_count = 0
         # 本回合四足支撑面曾达到的最大高度（由 reward.py 的 stair_progress 结算）。
@@ -382,6 +408,10 @@ class Go2StairsEnv(gym.Env):
         self._command = self.cfg.command._now
         self._cmd_hold = np.zeros(3)      # 重抽的「驻留」指令（缓变扰动围绕它走）
         self._cmd_wander = np.zeros(3)    # 指令缓变扰动（OU 过程状态）
+        # ``set_command_now(hold=True)`` 后为 True：钉住的指令不再叠加 OU 扰动。
+        # 旧实现靠 ``_cmd_age < command_hold_steps`` 判 hold，而 ``_cmd_age`` 恒
+        # ∈ [0, hold_steps)（或 hold 的负数），条件恒真 ⇒ hold 也被扰动覆盖。
+        self._cmd_hold_active = False
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
@@ -515,6 +545,17 @@ class Go2StairsEnv(gym.Env):
             self.cfg.command.vx = float(vx)
         # 同步驻留值：缓变扰动/重抽以写入值为基准（hold=True 时扰动不生效）。
         self._cmd_hold[:] = [float(v) for v in self._command]
+        # hold 状态显式记在实例上（旧实现靠 ``_cmd_age < command_hold_steps``
+        # 判 hold，恒真，见 step() 里 B2 的说明）。
+        self._cmd_hold_active = bool(hold)
+        # 刷新「已经算好、还没被取走」的那一帧观测：控制器是在两次 ``step()``
+        # 之间下指令的，不刷新的话策略拿到的那一帧还带着上一步的指令（50 Hz
+        # 下 20 ms 的滞后）。指令是外生输入，改它不破坏马尔可夫性。
+        if self._hist:
+            frame = self._obs_frame()
+            if self._hist[-1].shape == frame.shape:
+                self._hist[-1] = frame
+        return list(self._command)
 
     def _sample_gait_cmd(self) -> None:
         """按地形采一条步态指令 ``(freq, swing)``,回合内固定。
@@ -546,14 +587,6 @@ class Go2StairsEnv(gym.Env):
         if swing is not None:
             self._gait_swing_cmd = float(swing)
         return self._gait_freq_cmd, self._gait_swing_cmd
-        # 刷新「已经算好、还没被取走」的那一帧观测：控制器是在两次 ``step()``
-        # 之间下指令的，不刷新的话策略拿到的那一帧还带着上一步的指令（50 Hz
-        # 下 20 ms 的滞后）。指令是外生输入，改它不破坏马尔可夫性。
-        if self._hist:
-            frame = self._obs_frame()
-            if self._hist[-1].shape == frame.shape:
-                self._hist[-1] = frame
-        return list(self._command)
 
     def _guidance_command(self) -> tuple[float, float]:
         """楼梯段的**闭环外部引导** ``(vy, wz)`` —— 「人在遥感操控」的机制化。
@@ -728,15 +761,29 @@ class Go2StairsEnv(gym.Env):
 
     @property
     def yaw_rate(self) -> float:
-        """偏航角速度，**机体系 z 轴分量**（rad/s）—— 偏航指令要跟踪的量。
+        """偏航角速度（rad/s）—— 偏航指令要跟踪的量；口径由
+        ``EnvConfig.yaw_rate_mode`` 决定（默认 "legacy" 只为复现旧结果）。
 
-        不用世界系公式（``wz + tan(pitch)·(cos yaw·wx + sin yaw·wy)``）：它被与
-        指令量程同阶的步态振荡污染，等于把一半权重扔进策略控制不到的通道
-        （experience.md §16）。机体系读数便宜、抖动小、贴近真机陀螺口径；
-        不引入地形信息，可进奖励。
+        MuJoCo free joint 的 ``qvel[3:6]`` **已经是机体系角速度**；旧实现又乘了
+        一次 ``R(yaw)^T``（``quat_to_mat(base_quat).T @ qvel[3:6]``），于是读数
+        变成「偏航旋转后的机身系」下的角速度 —— roll rate 直接漏进偏航分量。
+        2026-10-18 真实爬楼 rollout（ab_6_r1，1178 步）实测：旧口径与真实世界系
+        偏航角速度的误差 mean|.| 0.198 / p95 0.68 / max 1.05 rad/s，误差与 ``wx``
+        的相关系数 -0.90（与 pitch 无关，-0.02）。这个假信号同时污染观测的
+        vel_filter 第 2 维和奖励的偏航跟踪项，是「偏航跟踪学不出来」的强候选
+        根因。详见 doc/audit_report.md 的 B7。
         """
-        wx, wy, wz = quat_to_mat(self.base_quat).T @ self.data.qvel[3:6]
-        return float(wz)
+        if self.cfg.yaw_rate_mode == "legacy":
+            wx, wy, wz = quat_to_mat(self.base_quat).T @ self.data.qvel[3:6]
+            return float(wz)
+        if self.cfg.yaw_rate_mode == "body_z":
+            return float(self.data.qvel[5])
+        # "world"：世界系偏航角速度 ψ̇（= 绕竖直轴的角速度，与 wz 指令同口径）。
+        roll, pitch = float(self.base_rpy[0]), float(self.base_rpy[1])
+        wy = float(self.data.qvel[4])
+        wz = float(self.data.qvel[5])
+        return float((wy * np.sin(roll) + wz * np.cos(roll))
+                     / max(1e-6, np.cos(pitch)))
 
     @property
     def foot_clearance(self) -> np.ndarray:
@@ -1004,8 +1051,14 @@ class Go2StairsEnv(gym.Env):
             -self.cfg.reset_xy_noise, self.cfg.reset_xy_noise
         )
         yaw = self._rng.uniform(-self.cfg.reset_yaw_noise, self.cfg.reset_yaw_noise)
+        # 播种高度用**解析地形高度**（audit B4）：旧写法把 ``terrain_height_under_base``
+        # 作为实参，而它在写 qpos **之前**求值 —— 那时 data 还是 mj_resetData 后的
+        # qpos0（base 在原点），读到的是 x=0 处的地形。当前 spawn_back>0（spawn 在
+        # 第一级立面之前）时两种写法恰好都得到 0，属潜伏 bug；一旦把 spawn 点挪到
+        # 台阶上（负 spawn_back / 别的地形起点）机身就会埋进台阶里。
+        ground_z = float(self.stair.height_at(x))
         self.data.qpos[:] = home_qpos(self.meta, x=x, y=y,
-                                      z=self.terrain_height_under_base + self.cfg.reset_z,
+                                      z=ground_z + self.cfg.reset_z,
                                       yaw=yaw)
         noise = self._rng.uniform(
             -self.cfg.reset_joint_noise, self.cfg.reset_joint_noise, self.num_act
@@ -1022,6 +1075,7 @@ class Go2StairsEnv(gym.Env):
         self._command[:] = list(self._cmd_hold)
         self._sample_gait_cmd()
         self._cmd_wander[:] = 0.0
+        self._cmd_hold_active = False   # 新回合重新采样，不再钉住旧指令
         self._step_count = 0
         self._tracking_miss_count = 0
         self._track_n = 0
@@ -1100,8 +1154,12 @@ class Go2StairsEnv(gym.Env):
             scale = self._gait_scale() * float(self._gait_swing_cmd)
             gait = replace(gait, freq=float(self._gait_freq_cmd),
                            _scale_dyn=float(scale))
+            # 相位口径：``GaitParams.radians(t)`` 内部算的是 ``sin(2π·freq·t + φ)``，
+            # 所以这里必须传**秒制**的 ``_gait_phase``；传 ``_gait_theta()``
+            # （= 2π·f_cmd·_gait_phase）会再乘一次频率（audit B6）。观测里的
+            # gait_phase 仍是 ``_gait_theta``，两者同源、连续。
             return (self.cfg.gait_gain * self._prior_gate
-                    * gait.radians(self._gait_theta()))
+                    * gait.radians(self._gait_phase))
         scale = self._gait_scale()
         if scale != 1.0:
             gait = gait.with_dynamic_scale(scale)
@@ -1159,7 +1217,7 @@ class Go2StairsEnv(gym.Env):
         return 2.0 * np.pi * self._gait_freq_eff() * self._gait_phase
 
     def _gait_traj_from_params(self, action: np.ndarray) -> np.ndarray:
-        """P2：8 维步态参数 → 12 维关节角偏移（已乘先验 ``action_scale``）。
+        """P2：12 维步态参数 → 12 维关节角偏移（已乘先验 ``action_scale``）。
 
         ``action = [前对(amp_th, amp_ca, off_th, off_ca, hip_amp, hip_off), 后对(同六项)]``：
         每项以 ``gait_param_nominal``（标称步态）为**零点**做双侧线性映射 ——
@@ -1221,7 +1279,7 @@ class Go2StairsEnv(gym.Env):
         ``gait.action_scale`` 表示先验动作有多大；``cfg.action_scale`` 表示策略
         可以偏离它多少。共用一个尺度会让探索噪声随先验一起缩放，瞬间失稳。
 
-        **gait_params 模式**（8 维，P2）：动作**就是**步态参数，经 sin 结构 +
+        **gait_params 模式**（12 维，P2）：动作**就是**步态参数，经 sin 结构 +
         trot 相位生成轨迹 —— ``target = home + traj(params, θ)``。结构提供协调性
         （随机探索也落在协调步态上），参数的前/后分离提供受阻态的表达力。
 
@@ -1247,7 +1305,13 @@ class Go2StairsEnv(gym.Env):
             self._cmd_hold[:] = self._sample_command()
         # 指令缓变扰动（OU 过程）：模拟真实操作手的轻微无规律输入。只在未钉住
         # （训练流）时生效；回放/遥操作 hold=True 完全不受影响。
-        if self._cmd_age < self.cfg.command_hold_steps and self.cfg.command_wander_std > 0:
+        # 注意 hold 必须看 ``_cmd_hold_active``：``_cmd_age`` 在 hold 时是负数、
+        # 平时又总被重置到 [0, hold_steps) 内，所以 ``_cmd_age < hold_steps``
+        # 恒为真（audit B2），旧条件等于「扰动永远生效」，把 hold 的钉指令
+        # 每步覆盖成 hold+wander，回放/遥操作的指令因此带上了随机游走。
+        if (not self._cmd_hold_active
+                and self._cmd_age < self.cfg.command_hold_steps
+                and self.cfg.command_wander_std > 0):
             dt = self.cfg.control_dt
             self._cmd_wander *= float(np.exp(-dt / self.cfg.command_wander_tau))
             self._cmd_wander += (self.cfg.command_wander_std * np.sqrt(dt)
@@ -1257,7 +1321,12 @@ class Go2StairsEnv(gym.Env):
         # 楼梯段闭环外部引导：vy/wz 由引导控制器按状态生成（拉回中线 + 对准
         # 航向），vx 保留课程采样；缓变扰动仍叠加在引导值上（真实操作手也有
         # 手抖）。平地级不受影响。
-        if self.stair.n_up > 0 and self.cfg.stair_guidance:
+        # 引导是**训练期的指令成形**：hold=True（外部控制器接管指令）时默认仍生效
+        # 以复现训练条件；``stair_guidance_under_hold=false`` 时让 hold 真正钉住
+        # vy/wz（audit B8：否则 teleop/回放测的是引导量而非操作手量）。
+        if (self.stair.n_up > 0 and self.cfg.stair_guidance
+                and (self.cfg.stair_guidance_under_hold
+                     or not self._cmd_hold_active)):
             vy_g, wz_g = self._guidance_command()
             self._command[1] = float(np.clip(vy_g + self._cmd_wander[1], -0.2, 0.2))
             self._command[2] = float(np.clip(wz_g + self._cmd_wander[2], -0.8, 0.8))

@@ -4298,3 +4298,72 @@ s3 那组是唯一站得住的：躯干背线 **y 199→217 单调下沉**、剪
 **一个待验的假设**：A/B 的 warm-start 是**假 warm-start 时代**训出来的权重，
 R1 可能是在"修一份被拖坏的起点"，而不是在"提升本来就正常的策略"—— 若真如此，
 换到干净的起点上它自然就没用了。这条只是假设，没验。
+
+## 23.58 代码审计：**8 个缺陷，2 个在污染训练信号**（2026-10-18）
+
+整仓通读 + 真实回放量化 + 对照实证，确认 B1–B8；全部修复已落地，
+11 条回归测试在 `tests/test_env_contract.py`，完整报告 `doc/audit_report.md`。
+默认路径（`yaw_rate_mode=legacy`、引导照旧生效）回放**逐位不变**。
+
+### ① 最重要：`yaw_rate` 是"双重旋转"的产物（B7）
+
+- MuJoCo free joint 的 `qvel[3:6]` **已在机体系**；旧实现又 `quat_to_mat(base_quat).T @ qvel[3:6]` 取 z，
+  等于多投一次 `R(yaw)^T`。
+- 真实爬楼实测（6cm 权重 `runs/ab_6_r1`，n=1178 步）：以 ψ̇=(wy·sinφ+wz·cosφ)/cosθ 为真值，
+  旧口径误差 mean|·| **0.1976** / p95 0.6824 / max 1.0468；倾斜补偿口径 **0.0600** / 0.1894 / 0.4416（好 3.3 倍）。
+- `corr(err, pitch)=−0.022`，`corr(err, body wx)=**−0.903**` ⇒ 污染源是 **roll rate**，不是 pitch。
+- 偏航指令量程 ±0.3 rad/s，平均误差已占 **66%**；57.6% 的爬楼帧 `|err|>0.1`。
+  `vel_filter` 观测那一维 + `reward.py:231` 的偏航跟踪项**同时**被污染 ⇒ 「偏航跟踪学不出来」的强候选根因。
+- 教训：旧 docstring 声称"不用世界系公式因为被步态振荡污染"，实测正好相反 ——
+  **注释里的因果解释也要当假设去验**。
+- 已加 `env.yaw_rate_mode`：`legacy`（默认，只为复现）/`body_z`（`qvel[5]`，最像真机 IMU）/
+  `world`（倾斜补偿，与 wz 指令同口径）。训练侧 A/B 待做。
+
+### ② 恒真条件让 `hold=True` 形同虚设（B2）
+
+- `if _cmd_age < command_hold_steps`：上一行刚把 age 归零、hold 时又置 −1e9 ⇒ **恒真** ⇒
+  每步 `_command = hold + wander`。hold 语义全丢，回放/遥操/评测都带随机游走。
+- 同族的 B8：楼梯级引导（`stair_guidance` 默认 True）覆盖 hold 的 vy/wz，
+  teleop 的"跟踪误差"测的是引导量而不是操作手指令（平地级正常，所以难发现）。
+- 教训：**带哨兵值的变量（−1e9）要按语义写条件（hold_active），不要按数值范围写。**
+
+### ③ 死代码 / 别名 / 潜伏 bug
+
+- **B1**：`set_command_now` 的 `return` 与 obs 刷新被缩进进了 `set_gait_cmd_now` 的 return 之后 ⇒
+  遥操指令滞后 1 步（20 ms）。函数拆分时尾部代码没跟着搬。
+- **B3**：8 env 共享一个 cfg，而 `env._command is cfg.command._now` ⇒ 指令串台；
+  `DummyVecEnv` 串行「先写后读」侥幸自洽。修法：每 env `deepcopy(cfg)`（`env_method` 逐环境下发仍生效）。
+- **B4**：reset 播种高度用了赋值前 `qpos0` 的 x（`spawn_back>0` 时等价，潜伏）。
+- **B6**：条件化步态把**角度**当**秒**传给 `GaitParams.radians` ⇒ 频率乘两次（1.25 Hz → ≈12 Hz）。
+  `gait_cmd` 关闭所以不影响存量，但一开就全错。
+- **B5**：注释里的观测维数 51/53/55、六级/九级、8 维/12 维都漂了 —— 已把观测维数写成测试断言。
+
+### ④ 方法论（下次照做）
+
+1. **先量化再下结论**：B7 只有跑真实回合才看得见；静态读代码只能看到"多了一次转置"。
+2. **对照实证**：怀疑共享 cfg 就构造两个 env 试，不要从 `make_env_fn` 推断。
+3. **每条修复配一条可执行契约**：11 条 unittest 把 B1–B8 变成断言。
+4. **旧权重是最好的回归测试**：385/386/407 步、x≈3.90、3/3 成功，逐位对上才敢说"没动行为"。
+
+## 23.59 旧 checkpoint 回放：`_env.json` 缺 `gait_freq_*` 会把 2/3 打成 0/3（2026-10-18）
+
+审计里试「用今天的代码回放 2026-10-13 的 sub9_v5 权重」，9cm 楼梯确定性 3 回合从当年
+**2/3 掉到 0/3**（卡在第一级附近提前终止）；同一套代码回放 2026-10-16 的 crawl24 权重则
+与历史日志 96.0% 逐字一致（`--sampled-command`）。
+
+- **根因**：sub9_v5 那代 `_env.json` 里没有 `gait_freq_flat` / `gait_freq_stair` /
+  `gait_freq_stair_fixed`（「楼梯降频」是 10-14 之后才引入的设计）。
+  `env_config_from_summary` 的 `_rebuild` 只取已知字段，缺失项静默落当前默认（1.67 /
+  按台阶高插值），而当年相位时钟 = `cfg.gait.freq`（2.0 Hz）⇒ `_gait_theta()` 频率错、
+  `gait_phase` 两维观测错。注意 `_gait_freq_eff()` 的楼梯分支读的是
+  **`gait_freq_stair_fixed`** 而不是 `gait_freq_stair`，只补前者不够。
+- **修法**（已落 `robotdog/policy.py`，测试 `LegacyCheckpointCompatTest`）：字段缺失时把三者
+  都回填成 `cfg.gait.freq`；只对旧权重生效，新权重逐位不变。回填后 9cm 回到 **2/3**
+  （与 era `e4184ae` 一致）。
+- **但不是逐位**：10-14→10-18 之间 `reset()/step()` 的随机抽取序列变过（最早表现为 OU
+  wander 让 `_command[0]` 差 ~8e-3；逐维 obs 对比显示 obs0/act0 完全相同、第 1 步后只在
+  command_body 三维差 0.0037 再全维发散），旧权重的 sampled 回放只能**统计等价**；要逐位
+  复现必须用当年代码（`git worktree add <dir> e4184ae`）。
+- **教训**：「配置能按观测维度反推」只覆盖观测开关；**凡是不进观测、却能改行为的字段
+  （相位时钟频率、先验门限、奖励覆盖）都必须写进 `_env.json`**，否则旧权重回放会被默认值
+  悄悄改写 —— 又一个 §20.7 实例。

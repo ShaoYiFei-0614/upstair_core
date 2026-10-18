@@ -123,6 +123,15 @@ env:
   # 0%，experience.md §23.27），归档；其「楼梯更从容」的意图由 gait 指令条件化
   # （obs.gait_cmd，Walk These Ways 式：参数是观测条件而不是动作自由度）继承。
   action_mode: residual
+  # 偏航角速度（观测 vel_filter 第 2 维 / 奖励 command_follow 的实测侧）的口径：
+  #   legacy = 旧实现 R(yaw)^T·qvel[3:6]（**双重旋转**：qvel[3:6] 本就在机体系，
+  #            再乘一次 R^T ⇒ roll rate 漏进偏航读数）。只为复现旧结果保留。
+  #   body_z = qvel[5]（机体系 z 分量，真机陀螺口径）。
+  #   world  = (ω_y·sinφ + ω_z·cosφ)/cosθ（世界系偏航角速度，与 wz 指令同口径）。
+  # 2026-10-18 审计：legacy 在真实爬楼 rollout 上 mean|误差| 0.198 rad/s（≈ 指令
+  # 量程 0.3 的 66%），误差与 roll rate 相关 -0.90 ⇒ 偏航跟踪的实测/奖励信号
+  # 基本是噪声。**建议改 world 做 A/B**（legacy 保持默认仅为一个回合不动存量）。
+  yaw_rate_mode: legacy
   # 步态指令条件化的采样范围（obs.gait_cmd: true 时生效）：freq 回合内按地形
   # 采一次、回合内固定；档位中心平地 1.67（采样 [1.50,1.85]）。
   # ⭐ 楼梯档 1.25 Hz（用户降频诉求）+ 方案 A（air_time_target 随频率缩放，
@@ -168,10 +177,13 @@ env:
   # （指令带下沿），提速能靠 forward_vel 梯度 + action_scale=0.60 的权限由 RL
   # 学。重新启用前必须先在新先验上重做 experience.md §20 的标定。
   gait_speed_track: false
-  # 观测开关。gait_phase/step_height/vel_filter + gait_cmd 全开、history_len=1
-  # 时每帧 42 + 3 + 1 + 3 + 2 = 51…… 精确账：机身系线速度 3 + 三轴指令 3
-  # （结构固定块）+ gait_phase 2 + step_height 1 + vel_filter 2 + gait_cmd 2
-  # = 55 维。
+  # 观测维度（由 ObsConfig.__post_init__ 现算并与 observation_space 核对；
+  # 写错这里不会崩，但会误导调用方）：
+  #   base_frame_size 42 = joint_pos 12 + joint_vel 12 + rpy 3 + ang_vel 3 + last_traj 12
+  #   + 结构固定块 6（机身系线速度 3 + 三轴指令 3）
+  #   + gait_phase 2 + step_height 1 + vel_filter 2 [+ gait_cmd 2]
+  # 当前配置（gait_cmd=false）= 53 维；gait_cmd 打开 = 55 维；history_len=1 ⇒
+  # 整帧就是这两个数（历史上这里写的 51/55 都算错过）。
   # 每一项都有真机出处（编码器 / IMU / 上一步动作 / 本体感觉估计 / 上层指令），
   # 加上一个标量任务参数 step_height。信息来源清单见 agent.md §8.6。
   obs:
@@ -187,6 +199,8 @@ env:
     # 指令跟随读**滤波后**的横向速度 / 偏航角速度。必须打开：瞬时 yaw_rate 在小跑
     # 步态下 std 可达 0.37 rad/s，奖励和成功判据都会变成「在判步态相位」。这两个量
     # 同时进观测以保持马尔可夫性（奖励读的就是它们）。
+    # ⚠ 偏航这一维来自 ``env.yaw_rate``，其口径由 env.yaw_rate_mode 决定 ——
+    # legacy 口径在楼梯上被 roll rate 污染（审计 B7），换 world 才是真实偏航率。
     vel_filter: true
     # ⭐ 步态指令条件**撤下**(2026-10-14,wtw7 最后一格定案,experience.md
     # §23.29):gait_cmd 两维在四轮训练中系统性把 RL 推向贴地(4.8-7.0cm vs

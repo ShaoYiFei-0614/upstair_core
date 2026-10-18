@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import warnings
 from pathlib import Path
@@ -41,10 +42,21 @@ def make_env_fn(
     cfg: EnvConfig | None = None,
     seed: int = 0,
 ) -> Callable[[], Go2StairsEnv]:
-    """SB3 的 ``VecEnv`` 构造器要求一个零参工厂。"""
+    """SB3 的 ``VecEnv`` 构造器要求一个零参工厂。
+
+    ⚠ **每个环境必须拿到自己的一份 cfg**：``Go2StairsEnv._command`` 就是
+    ``cfg.command._now``（同一个 list），若各 env 共享 cfg，那么一个 env 写指令
+    （含每步的 OU 扰动）会同时改掉其它 env 的观测/奖励输入。审计实测（2026-10-18
+    的 audit_sharedcfg 探针）：两个共享 cfg 的 env 中 ``e0.set_command_now(...)``
+    之后 ``e1._command`` 也变了。deepcopy 不影响 :mod:`scripts.train` 的逐级下发
+    —— 它用 ``venv.env_method`` 对每个子环境单独调用 ``set_reward_overrides`` /
+    ``set_commands``。
+    """
 
     def _init() -> Go2StairsEnv:
-        return Go2StairsEnv(stair=stair, cfg=cfg, seed=seed)
+        return Go2StairsEnv(stair=stair,
+                            cfg=copy.deepcopy(cfg) if cfg is not None else None,
+                            seed=seed)
 
     return _init
 

@@ -267,6 +267,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hold", type=float, nargs=3, default=None,
                         metavar=("VX", "VY", "WZ"),
                         help="钉死一条指令跑满回合（同时默认切到平地地形）")
+    parser.add_argument("--strict-hold", action="store_true",
+                        help="让 hold 真正钉住 vy/wz：楼梯级不再被 stair_guidance "
+                             "改写（测真实指令跟踪时用，见 audit B8）")
     args = parser.parse_args(argv)
     raw = load_config(args.config)  # 早失败：配置有问题就不要等到环境建好才发现
 
@@ -285,6 +288,11 @@ def main(argv: list[str] | None = None) -> int:
     vy_limit, yaw_limit, limit_src = command_limits(stair, raw, target.model_path)
     dev = device(raw)
     runner, env, _venv = open_runner(target, stair=stair, device=dev)
+    if args.strict_hold:
+        # 训练时楼梯级的 vy/wz 由引导闭环生成；hold 默认沿用该行为以复现训练
+        # 条件。--strict-hold 关掉它，否则这里的「跟踪误差」测的是引导量而不是
+        # 控制器给的指令（audit B8）。
+        env.cfg.stair_guidance_under_hold = False
 
     if args.hold is not None:
         controller = HoldController(vx=args.hold[0], vy=args.hold[1],

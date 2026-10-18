@@ -11,7 +11,7 @@
 
     raw = load_config()                       # 默认 <仓根>/config.yaml
     cfg = config_to_env(raw)                  # EnvConfig（含 trot 先验）
-    stages = config_to_stages(raw)            # 六级 StageSpec
+    stages = config_to_stages(raw)            # 逐级 StageSpec（级数由 YAML 定）
 
 配置文件的完整键与含义见仓根 ``config.yaml`` 的注释，以及 ``README.md`` §4。
 """

@@ -105,7 +105,24 @@ def env_config_from_summary(summary_path: str | Path) -> EnvConfig:
         # ``_active_gait().freq`` 会当场 AttributeError（2026-10-15 实测踩到）。
         env_kw["gait_stair"] = GaitParams.from_dict(env_kw["gait_stair"])
     known = {f.name for f in fields(EnvConfig)}
-    return EnvConfig(**{k: v for k, v in env_kw.items() if k in known})
+    cfg = EnvConfig(**{k: v for k, v in env_kw.items() if k in known})
+    # 旧 checkpoint（2026-10-14 之前，如 output/sub9_v5）的 ``_env.json`` 里还没有
+    # ``gait_freq_flat`` / ``gait_freq_stair`` / ``gait_stair`` 这些字段；当年的相位
+    # 时钟就是 ``cfg.gait.freq``（trot_natural 2.0 Hz）。若不回填，当前默认值
+    # （平地 1.67 / 楼梯按台阶高插值）会让 ``gait_phase`` 那两维观测用错频率 ——
+    # 2026-10-18 审计实测：sub9_v5 的 9cm 权重在楼梯上由 2/3 成功掉到 0/3，回填后
+    # 恢复 2/3。**只在字段缺失（= 旧权重）时生效**，新权重逐位不受影响。
+    if "gait_freq_flat" not in env_kw:
+        cfg.gait_freq_flat = float(cfg.gait.freq)
+    if "gait_freq_stair" not in env_kw:
+        cfg.gait_freq_stair = float(cfg.gait.freq)
+    # 真正决定观测相位频率的是 ``_gait_freq_eff()``：楼梯级优先用
+    # ``gait_freq_stair_fixed``，否则按台阶高从 ``cfg.gait.freq`` 线性插值到 1.0
+    # （crawl 链的「楼梯降频」设计）。旧权重没有这个字段、当年也没有降频 ——
+    # 回填成 ``cfg.gait.freq`` 才等价于「相位时钟恒等于先验频率」。
+    if "gait_freq_stair_fixed" not in env_kw:
+        cfg.gait_freq_stair_fixed = float(cfg.gait.freq)
+    return cfg
 
 
 def _zip_data(model_path: str | Path) -> Any:
