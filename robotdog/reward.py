@@ -87,6 +87,43 @@ class RewardConfig:
     air_time_target: float = 0.30
     air_time_max: float = 0.60
 
+    # --- 接触 / 足端力奖励（2026-10-17 新增，设计见 doc/contact_reward_design.md）- #
+    # ⚠ **默认全关**：字段默认值让「导入即等于改动前」——`contact_rewards=False`
+    # 时下面这些键连 `terms` 都不进，逐步奖励逐位不变（`.tmp/regress_reward.py`）。
+    # 打开哪一项就把哪一项的权重给非 0；`set_reward_overrides` 按 `hasattr` 就地
+    # 覆盖，所以权重字段不用改任何课程/训练代码就能逐级下发。
+    contact_rewards: bool = False       # ★ 总开关（关 = 整组不结算、不进 terms）
+    contact_telemetry: bool = False     # 只把足端力写进 info，不改奖励（标定时用）
+
+    foot_scuff: float = 0.0             # R1 滑擦惩罚（负权重）
+    scuff_v_ref: float = 0.15           # 判「在切向滑动」的足端速度门 [m/s]
+    scuff_mu_soft: float = 0.35         # 切向/法向比死区（低于它不算滑擦）
+    scuff_mu_hard: float = 0.80         # 该比值达到它时罚满
+
+    foot_impact: float = 0.0            # R2 落地冲击惩罚（负权重）
+    # ⚠ 阈值默认值 = **标定值**（2026-10-17，§2.2 ③）：3.0×体重 = 落在落地尖峰
+    #   分布的 p50 与 p90 之间，只罚真砸下去的。**别把 tol 留成 0** —— 代码里
+    #   没有「0 = 用标定值」的兜底，tol=0/scale=1 会让每一项都瞬间罚满，
+    #   等于每步恒扣满权重（踩过这个坑就会白烧一整轮训练）。
+    impact_force_tol: float = 450.0     # N ≈ 3.0 W（W = 149.2 N）
+    impact_force_scale: float = 450.0   # N，罚满所需的超出量（≈ 6 W 罚满）
+
+    load_share: float = 0.0             # R3 负载分担（负权重）
+    # ⚠ 默认 = 标定值（§2.2 ④）：平地实测双足帧 p50 = 0.65 ⇒ cap 取 0.70（≈p75）
+    #   才只罚明确偏载；原设 0.55 会罚掉 79~84% 的双足帧。
+    load_share_cap: float = 0.70        # 单足法向力占比上限
+    # ⚠ 原设 3 已被推翻：平地三足着地只占 **6.2%**（§2.2 ①），门控等于常年关闭。
+    #   平地是对角双足步态（双足帧 30.3%），所以下限取 2。
+    load_share_min_feet: int = 2        # 着地足数少于它就不结算（否则奖励站桩）
+    load_share_flat_only: bool = True   # 楼梯上跨级站立天然不均，默认只罚平地
+
+    com_margin: float = 0.0             # R4 质心支撑裕度（负权重）
+    # ⚠ 默认 = 标定值（§2.2 ⑤）：实测 p50 = 0.16 m、p90 = 0.25 m ⇒ 原设 0.06
+    #   让 83% 的帧直接罚满，既无区分度又过大。tol 取 ≈p50，scale 让 0.30 m 罚满。
+    com_margin_tol: float = 0.15        # m，机身投影到力加权支撑中心的允许偏差
+    com_margin_scale: float = 0.15      # m，罚满所需的超出量（tol+scale = 0.30 m ≈ p97）
+    com_margin_flat_only: bool = True   # 楼梯的支撑多边形是跨级的，默认只罚平地
+
     # --- 辅助成形 ------------------------------------------------------------ #
     base_height: float = -2.0
     joint_vel: float = -2.0e-5
@@ -342,6 +379,83 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
         env._hold_phi = phi
     else:
         terms["foot_hold"] = 0.0
+
+    # 10) 接触 / 足端力（2026-10-17 新增；设计见 doc/contact_reward_design.md）。
+    #     **总开关关着就整段跳过**：这些键连 terms 都不进，逐步奖励逐位不变
+    #     （回归见 `.tmp/regress_reward.py`）。四项共用的量只在这里取一次。
+    #     力是**策略看不见的**（不进观测）：加观测维会让现有全部权重无法
+    #     warm-start，等于把 3→15cm 整条链作废。
+    if rc.contact_rewards and (rc.foot_scuff or rc.foot_impact
+                               or rc.load_share or rc.com_margin):
+        fn = env.foot_normal_force            # (4,) 本控制步末的法向力 [N]
+        ft = env.foot_tangential_force        # (4,) 同刻的切向力模长 [N]
+        if foot_contact is None:
+            foot_contact = env._contact_scan()[2]
+
+        # R1 滑擦：**接触中还在切向滑动**才算滑擦。速度门是关键 —— 支撑相里
+        # 切向力高是正常的（蹬地推进），但那时切向速度 ≈ 0。这一项正是
+        # `foot_lift` 的三维速度门控分不开的「抬高 vs 前扫」：抬高的脚没有力，
+        # 前扫的脚有力。
+        if rc.foot_scuff != 0.0:
+            ratio = ft / np.maximum(fn, 1e-6)
+            span = max(float(rc.scuff_mu_hard) - float(rc.scuff_mu_soft), 1e-6)
+            x = np.clip((ratio - float(rc.scuff_mu_soft)) / span, 0.0, 1.0)
+            sliding = foot_contact & (foot_speed > float(rc.scuff_v_ref))
+            terms["foot_scuff"] = rc.foot_scuff * float(np.mean(x * sliding))
+        else:
+            terms["foot_scuff"] = 0.0
+
+        # R2 冲击：只在**落地帧**结算，用的是本控制步内逐物理子步取到的法向力
+        # 峰值（50 Hz 控制步末的读数已经被柔顺接触吸收了，看不到真正的尖峰）。
+        if rc.foot_impact != 0.0:
+            landed = foot_contact & ~env._prev_foot_contact
+            over = np.clip((env.foot_impact_force - float(rc.impact_force_tol))
+                           / max(float(rc.impact_force_scale), 1e-6), 0.0, 1.0)
+            terms["foot_impact"] = rc.foot_impact * float(np.sum(over * landed))
+        else:
+            terms["foot_impact"] = 0.0
+
+        # R3 负载分担：罚「一只脚扛了太多」。**必须门控着地足数**，否则它会奖励
+        # 「保持四足着地」= 站桩。默认只罚平地：楼梯上四足跨级站立天然一头受力
+        # 大，在楼梯上罚不均等于在罚正确行为。
+        if rc.load_share != 0.0:
+            n_down = int(np.count_nonzero(foot_contact))
+            if (n_down >= int(rc.load_share_min_feet)
+                    and not (rc.load_share_flat_only and env.stair.n_up > 0)):
+                f = np.where(foot_contact, fn, 0.0)
+                total = float(np.sum(f))
+                if total > 1e-6:
+                    cap = float(rc.load_share_cap)
+                    worst = float(np.max(f)) / total
+                    terms["load_share"] = rc.load_share * float(
+                        np.clip((worst - cap) / max(1.0 - cap, 1e-6), 0.0, 1.0))
+                else:
+                    terms["load_share"] = 0.0
+            else:
+                terms["load_share"] = 0.0
+        else:
+            terms["load_share"] = 0.0
+
+        # R4 质心支撑裕度：机身水平投影到**按力加权**的支撑中心的距离。按力加权
+        # 而不是几何中心 —— 「三足着地、一足虚搭」时几何中心会给出错误的支撑点，
+        # 而那正是要把「虚搭」暴露出来的场景。支撑多边形用中心近似（平地够用；
+        # 楼梯的支撑多边形是跨级的，所以默认只在平地结算）。
+        if rc.com_margin != 0.0:
+            if rc.com_margin_flat_only and env.stair.n_up > 0:
+                terms["com_margin"] = 0.0
+            else:
+                f = np.where(foot_contact, fn, 0.0)
+                total = float(np.sum(f))
+                if total > 1e-6:
+                    support = (f[:, None] * feet[:, :2]).sum(axis=0) / total
+                    dist = float(np.linalg.norm(env.base_pos[:2] - support))
+                    terms["com_margin"] = rc.com_margin * float(
+                        np.clip((dist - float(rc.com_margin_tol))
+                                / max(float(rc.com_margin_scale), 1e-6), 0.0, 1.0))
+                else:
+                    terms["com_margin"] = 0.0
+        else:
+            terms["com_margin"] = 0.0
 
     # --- 终止 -----------------------------------------------------------
     # 到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出楼梯远端摔下去。

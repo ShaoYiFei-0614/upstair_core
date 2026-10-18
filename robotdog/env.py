@@ -281,6 +281,21 @@ class EnvConfig:
     def control_dt(self) -> float:
         return self.timestep * self.decimation
 
+    @property
+    def needs_foot_force(self) -> bool:
+        """本步要不要读足端接触力（2026-10-17 新增）。
+
+        **默认 False ⇒ 训练热路径上一次接触遍历都不多花**。开启条件只有两个：
+        遥测开关，或者「接触奖励总开关开着且至少一项权重非 0」。力只进奖励与
+        `info`，**绝不进观测**（加观测维会让现有全部权重无法 warm-start）。
+        """
+        rc = self.reward
+        if rc.contact_telemetry:
+            return True
+        return bool(rc.contact_rewards
+                    and (rc.foot_scuff or rc.foot_impact
+                         or rc.load_share or rc.com_margin))
+
 
 # --------------------------------------------------------------------------- #
 # 环境
@@ -370,6 +385,13 @@ class Go2StairsEnv(gym.Env):
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
+        # 足端接触力（2026-10-17）。**只在 cfg.needs_foot_force 时才有值** ——
+        # 默认全 0，关掉时一个字节都不会被读。三个数组的分工见
+        # ``foot_normal_force`` / ``foot_impact_force`` 的 docstring。
+        nfoot = len(self.meta.foot_geom_ids)
+        self._foot_fn = np.zeros(nfoot)        # 本控制步**末**的法向力 [N]
+        self._foot_ft = np.zeros(nfoot)        # 同刻的切向力模长 [N]
+        self._foot_fn_peak = np.zeros(nfoot)   # 本控制步内（逐物理子步）的法向力峰值
         # 步态先验时钟（自回合开始起的秒数）+ gait_params 模式的步态时钟（周期数）。
         self._gait_t = 0.0
         self._gait_phase = 0.0
@@ -835,6 +857,66 @@ class Go2StairsEnv(gym.Env):
                 mask[k] = True
         return trunk_hit, leg_hit, mask
 
+    def _scan_foot_forces(self) -> tuple[np.ndarray, np.ndarray]:
+        """扫一遍接触列表，返回 ``(法向力 [N], 切向力模长 [N])``，各 4 维。
+
+        与 :meth:`_contact_scan` 扫的是同一批接触对，但**故意不合并**：力只在
+        ``cfg.needs_foot_force`` 为真时才需要（默认关），合并进去等于让每一次
+        训练步都白付一趟。真要让力默认开启，再合并也不迟。
+
+        力取自 ``mujoco.mj_contactForce`` 的 6 维接触力，``res[0]`` 是法向分量、
+        ``res[1:3]`` 是切向。一只脚可能同时有多个接触点（球-面多点），逐点求和；
+        法向取绝对值只为防符号约定变化，正常解算下它就是压缩力。
+        """
+        foot_index = {int(g): k for k, g in enumerate(self.meta.foot_geom_ids)}
+        terrain = {int(self.meta.floor_geom_id)} | {
+            int(g) for g in self.meta.stair_geom_ids
+        }
+        nfoot = len(self.meta.foot_geom_ids)
+        fn = np.zeros(nfoot)
+        ft = np.zeros(nfoot)
+        res = np.zeros(6, dtype=np.float64)
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if g1 in terrain and g2 not in terrain:
+                other = g2
+            elif g2 in terrain and g1 not in terrain:
+                other = g1
+            else:
+                continue
+            k = foot_index.get(other)
+            if k is None:
+                continue
+            mujoco.mj_contactForce(self.model, self.data, i, res)
+            fn[k] += abs(float(res[0]))
+            ft[k] += float(np.hypot(res[1], res[2]))
+        return fn, ft
+
+    @property
+    def foot_normal_force(self) -> np.ndarray:
+        """(4,) 每只足端在本控制步**末**受到的**法向**接触力 [N]（无接触为 0）。
+
+        **策略不可见的特权量**（不进观测）：`foot_scuff` 的滑擦判据、`load_share`
+        的负载占比、`com_margin` 的力加权支撑中心都读它。真机上对应足端力传感器
+        或关节力矩残差估计，所以它不是仿真专属信息，只是暂不进观测。
+        """
+        return self._foot_fn
+
+    @property
+    def foot_tangential_force(self) -> np.ndarray:
+        """(4,) 与 :attr:`foot_normal_force` 同刻的**切向**力模长 [N]。"""
+        return self._foot_ft
+
+    @property
+    def foot_impact_force(self) -> np.ndarray:
+        """(4,) 本控制步内**逐物理子步**取到的法向力峰值 [N]。
+
+        为什么不直接用步末读数：控制步是 20 ms 而物理步是 2 ms，落地冲击在头
+        两个物理子步里就被柔顺接触吸收掉了，50 Hz 的步末读数**看不到真正的尖峰**。
+        """
+        return self._foot_fn_peak
+
     def _advance_foot_air_time(self, foot_contact: np.ndarray) -> None:
         """累加腾空时间；每个控制步调用一次，在奖励计算之后。"""
         self._foot_air_time = np.where(
@@ -960,6 +1042,9 @@ class Go2StairsEnv(gym.Env):
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = self._contact_scan()[2]
+        self._foot_fn[:] = 0.0
+        self._foot_ft[:] = 0.0
+        self._foot_fn_peak[:] = 0.0
         # 步态先验时钟，单位为自回合开始起的秒数。观测里报告的相位就是本步
         # 实际使用的那一个。
         self._gait_t = 0.0
@@ -1217,6 +1302,9 @@ class Go2StairsEnv(gym.Env):
         self._gait_t += self.cfg.control_dt
         self._gait_clock += self.cfg.control_dt * self._gait_freq()
 
+        need_force = self.cfg.needs_foot_force
+        if need_force:
+            self._foot_fn_peak[:] = 0.0
         for _ in range(self.cfg.decimation):
             q = self.data.qpos[self.meta.qpos_joint_adr]
             qd = self.data.qvel[self.meta.qvel_joint_adr]
@@ -1225,6 +1313,12 @@ class Go2StairsEnv(gym.Env):
                 tau, self.meta.ctrl_ranges[:, 0], self.meta.ctrl_ranges[:, 1]
             )
             mujoco.mj_step(self.model, self.data)
+            if need_force:
+                # 逐物理子步取力：峰值只在子步分辨率下看得见（见 foot_impact_force）。
+                fn_sub, ft_sub = self._scan_foot_forces()
+                np.maximum(self._foot_fn_peak, fn_sub, out=self._foot_fn_peak)
+                self._foot_fn[:] = fn_sub
+                self._foot_ft[:] = ft_sub
 
         self._step_count += 1
         trunk_contact, leg_contact, foot_contact = self._contact_scan()
@@ -1301,6 +1395,15 @@ class Go2StairsEnv(gym.Env):
                 self._peak_terrain_height / max(self.stair.step_height, 1e-9))),
             "gait_prior": bool(self.cfg.gait_prior),
         }
+        # 足端力遥测（2026-10-17）：只记录，不改奖励。标定 R1~R4 的阈值靠它 ——
+        # 没有分布就设阈值 = 拍脑袋（见 doc/contact_reward_design.md §2.2）。
+        if self.cfg.needs_foot_force and self.cfg.reward.contact_telemetry:
+            info["foot_force"] = {
+                "fn": [float(v) for v in self._foot_fn],
+                "ft": [float(v) for v in self._foot_ft],
+                "peak": [float(v) for v in self._foot_fn_peak],
+                "contact": foot_contact.astype(np.int8).tolist(),
+            }
         return self._observation(), float(reward), terminated, truncated, info
 
     # ---------------------------------------------------------------- 渲染

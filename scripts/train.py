@@ -60,11 +60,18 @@ from robotdog.training import (  # noqa: E402
     RunDir,
     build_ppo,
     make_vec_env,
+    restore_vecnormalize,
     save_vecnormalize,
 )
 
 #: 只打印进度，不训练的最小步数（避免把 0 步的配置跑成死循环）。
 MIN_STAGE_STEPS = 1
+
+
+def warm_norm_path(warm_start: str | Path) -> Path:
+    """warm-start 权重旁边那份观测统计（``<同目录同名前缀>_vecnormalize.pkl``）。"""
+    p = Path(warm_start)
+    return p.with_name(p.stem + "_vecnormalize.pkl")
 
 
 def kw_call(venv, method: str, **kwargs):
@@ -133,6 +140,14 @@ class CheckpointCallback(BaseCallback):
         self.model.save(str(base))
         save_vecnormalize(self.model, base)
         if self.env_cfg is not None:
+            # ⚠ **这里写的是 ``live_cfg``（含本级 ``reward_overrides``），而
+            # `<阶段>_final_env.json`（下面 ``save_env_json(target, self.cfg, …)``）
+            # 写的是 ``config.yaml`` 的**基线**。同一个 run 目录里两份 ``_env.json``
+            # 会对奖励字段给出**不同的值**，看起来像"覆盖没生效"或"中途被改了"。
+            # 两边都是**故意**的：``_env.json`` 按设计只记基线（下一级 warm-start
+            # 要"先叠基线再叠本级键"，见 ``env.py:set_reward_overrides``），
+            # 而逐 checkpoint 的这份用来事后查"那一刻环境到底长什么样"。
+            # ⇒ **复现某一级的奖励口径，唯一权威是 ``plan.json``**（train.py 课程循环）。
             save_env_json(base, self.env_cfg, step_height=self.step_height,
                           stage=self.stage)
         return True
@@ -205,6 +220,7 @@ class Trainer:
         return venv
 
     def train_stage(self, stage: StageSpec, venv, *, warm_start: str | None = None,
+                    warm_norm: str = "auto",
                     tensorboard_log: str | Path | None = None, **_: Any):
         arch = tuple(self.ppo.get("net_arch", (512, 256)))
         model = build_ppo(
@@ -229,6 +245,23 @@ class Trainer:
         if warm_start:
             model.set_parameters(str(warm_start))
             print(f"    [warm-start] 从 {Path(warm_start).name} 继承权重", flush=True)
+            # ⭐ 观测归一化统计必须跟权重一起过来，否则 warm-start 是**假的**：
+            #    新建的 venv 里 VecNormalize 是全 0/1 的初始统计，而权重是在
+            #    **归一化之后**的观测上训出来的 ⇒ 前几十万步全花在重新适应输入
+            #    分布上。实测（2026-10-17，R1~R4 的 A/B 起步）：六臂全部
+            #    摔倒率 100%、回合长度 ~150 步，而同一份权重直接回放能走满 1000 步。
+            #    统计缺失时只警告不中止（旧行为可用 ``--warm-norm off`` 显式要回）。
+            if warm_norm != "off":
+                npath = warm_norm_path(warm_start)
+                if npath.is_file():
+                    ok = restore_vecnormalize(venv, npath) is not None
+                    print(f"    [warm-start] {'装回' if ok else '⚠ 装不回'}"
+                          f"观测统计 {npath.name}", flush=True)
+                elif warm_norm == "on":
+                    raise SystemExit(f"--warm-norm on，但找不到 {npath}")
+                else:
+                    print(f"    [warm-start] ⚠ 没有 {npath.name}，观测统计从零开始",
+                          flush=True)
 
         callbacks = [ProgressCallback(log_every=int(self.run["log_every"]))]
         every = int(self.run["save_every"])
@@ -278,6 +311,10 @@ def parse_args(argv: Sequence[str] | None = None):
     ap.add_argument("--warm-start", default=None,
                     help="第一级从哪个 checkpoint 继承权重（跨 run 续训用；"
                          "例如从 runs/<旧 run>/checkpoints/stair9_final.zip 出发只训更高台阶）")
+    ap.add_argument("--warm-norm", default="auto", choices=("auto", "on", "off"),
+                    help="warm-start 时是否把权重旁边那份 *_vecnormalize.pkl 的观测统计"
+                         "一起装回：auto = 有就装（默认）、on = 必须有、off = 不装"
+                         "（回到 2026-10-17 之前的旧行为）")
     return ap.parse_args(argv)
 
 
@@ -364,6 +401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             _model, stats = trainer.train_stage(
                 stage, venv, warm_start=warm,
+                warm_norm=str(getattr(args, "warm_norm", "auto")),
                 tensorboard_log=str(rundir.tensorboard),
             )
         finally:

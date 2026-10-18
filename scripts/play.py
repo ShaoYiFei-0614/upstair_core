@@ -504,6 +504,27 @@ def mode_eval(env: Go2StairsEnv, policy: Runner, *, episodes: int, seed: int,
           f"平均爬升 {payload['mean_height_gain']:.2f}m   "
           f"平均速度 {payload['mean_speed']:.2f}m/s   "
           f"平均步数 {payload['mean_steps']:.0f}")
+
+    # ---- 诊断行：成功/失败**分开**看（纯打印，不参与任何奖励或决策） -------- #
+    # 全体平均步数把"很快登顶"和"磨到超时"混成一个数，判踏面/预算代价时读不出来。
+    # 见 `experience.md` §23.43：同一份权重在 15cm 上爬 8 级，训练踏面 30cm 用 507 步、
+    # 50cm 用 810 步 —— **这个差才是踏面的真实代价**；而成功率会被回合预算放大或掩盖
+    # （把 25cm 的预算从 20s 收到 16.7s，15cm 的成功率就从 80% 掉到 49%）。
+    ok_mask = np.asarray([o.success for o in outcomes], dtype=bool)
+    budget = int(getattr(env, "_max_steps", 0))
+    if ok_mask.any() and budget:
+        a = np.asarray([o.steps for o in outcomes], dtype=float)[ok_mask]
+        print(f"成功回合步数  中位 {np.median(a):.0f}  P90 {np.percentile(a, 90):.0f}  "
+              f"最大 {int(a.max())}   （预算 {budget} 步；用掉 >90% 预算的占 "
+              f"{100 * float(np.mean(a > 0.9 * budget)):.1f}%）")
+    mounted = np.asarray([o.steps_mounted for o in outcomes], dtype=float)
+    if mounted.any():                      # 平地恒为 0 ⇒ 自动跳过
+        parts = []
+        if ok_mask.any():
+            parts.append(f"成功均 {mounted[ok_mask].mean():.2f}")
+        if (~ok_mask).any():
+            parts.append(f"失败均 {mounted[~ok_mask].mean():.2f}")
+        print(f"登级（最高踏上）  {'   '.join(parts)}  / 共 {env.stair.n_up} 级")
     return 0
 
 
@@ -542,6 +563,13 @@ def parse_args(argv: Sequence[str] | None = None):
                     help="视频降采样因子（默认 %d）。**做视觉评审时给 1** —— "
                          "降采样后 480×270 里犬体仅 ~120px，3cm 台阶只有 9px，"
                          "「足端有没有离地」在原生分辨率下不可判读。" % VIDEO_SCALE)
+    ap.add_argument("--episode-length-s", type=float, default=None,
+                    help="覆盖回合时间预算 [s]（默认 None = **完全不变**，用权重自带 "
+                         "记载的原值）。⚠ 这个开关是补一个坑才加的：回放**不读 "
+                         "``--config`` 里的 ``episode_length_s``**，环境的配置来自权重旁 "
+                         "``<模型>_env.json``（见 ``env_config_for_model``）—— 2026-10-17 "
+                         "我在配置文件里改这个字段做了三组对照，结果八格数据与对照组"
+                         "**逐位相同**才发现旋钮没接上（experience.md §23.44）。")
     return ap.parse_args(argv)
 
 
@@ -794,6 +822,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = load_config(args.config)
     play = config_to_play(cfg)
     target = resolve_target(args.run)
+    # ⭐ 回合预算是**环境配置**的一部分，而环境配置来自权重旁 ``<模型>_env.json``
+    # （``env_config_for_model``，见 ``resolve_target``）—— **不是** ``--config``。
+    # 所以在回放配置文件里改 ``episode_length_s`` 是**空转**（2026-10-17 实测：
+    # 两组只有这一个字段不同的配置，八个格子连平均前进的两位小数都逐位相同）。
+    # 要动它只能用这个显式开关；默认 None ⇒ 行为与加这个参数之前**完全一致**。
+    if args.episode_length_s is not None:
+        old = target.cfg.episode_length_s
+        target.cfg.episode_length_s = float(args.episode_length_s)
+        print(f"⚠ 回合预算被覆盖: {old:g}s → {args.episode_length_s:g}s"
+              f"（{int(args.episode_length_s / target.cfg.control_dt)} 控制步）"
+              f" —— 与训练口径不同，读数不能与训练统计直接对账")
     # 设备取自 ppo.device（与训练同一个入口），不是 play 段 —— play 段没有这个键。
     dev = device(cfg)
     print(f"模型: {target.model_path}")
