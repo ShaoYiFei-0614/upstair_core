@@ -7,7 +7,11 @@
 
 把仓根 `config.yaml` 变成三类对象：`EnvConfig`（环境/奖励/观测的全部可调项）、
 课程阶段表（`StageSpec` 列表）、以及 `ppo:` / `run:` / `play:` 三段普通 dict。
-**config.yaml 是唯一的超参入口** —— 脚本不再暴露命令行开关（只剩 `--run-name` /
+**config.yaml 是唯一的超参入口**
+
+> 例外（受控）：`ablations/*.yaml` 是**消融/还原配置快照**，同样是「一份 yaml 定全部超参」，
+> 用来做单变量对照（见 `doc/ablation.md`）。`.gitignore` 忽略的 `configs/` 是本地训练快照，
+> 不进版本库；`ablations/` 进版本库。 —— 脚本不再暴露命令行开关（只剩 `--run-name` /
 `--config` / `--run` 这类运行标识）。
 
 ## 核心原则：打错的键必须当场报错

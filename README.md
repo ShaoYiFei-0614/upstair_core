@@ -61,6 +61,7 @@ upstair_core/
     teleop.py      外部控制器遥控                                → doc/teleop.md
     cmd_demo.py    指令跟踪量化                                  → doc/cmd_demo.md
     download_go2.py 拉取 Go2 模型                                → doc/download_go2.md
+  ablations/                                   消融配置（tracked；单变量分层）  → doc/ablation.md
   runs/<名字>/     训练产物（gitignored）
   output/videos/   视频交付件
 ```

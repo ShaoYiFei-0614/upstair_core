@@ -1489,3 +1489,94 @@ actor 仍 53 维）。两条路线都与对照组同配方、同预算、seed 0�
 `runs/asym12/`、`runs/asym13_5/`、`runs/asym15_ladder/`（各含 final + summary + 周期 ckpt）；
 日志 `.tmp/asym_chain/*.log`；脚本 `.tmp/run_asym_chain.py` / `.tmp/run_asym_chain_resume.py`。
 
+---
+
+## ablations — crawl24 还原与四段消融接口验证（2026-10-19，**接口验证，非能力对比**）
+
+**目的**：用户要求「保留非对称 AC 实现，把配置还原为 crawl24，验证 (1) 代码路径兼容、
+(2) 消融接口（Level 0→1/2/3）能否在同一训练脚本内靠配置切换」。
+
+**配置**（`ablations/`，tracked —— `.gitignore` 忽略 `configs/`，所以实验配置放这里）：
+
+| 文件 | Level | 唯一差异 |
+| --- | --- | --- |
+| `crawl24.yaml` | —（还原基准） | crawl24 原配方 + 新字段显式钉旧默认：`privileged_foot_contact: false`、`yaw_rate_mode: legacy`、`stair_guidance_under_hold: true` |
+| `level0.yaml` | L0 | 同 crawl24（基线） |
+| `level1.yaml` | L1 | + `privileged_foot_contact: true`（57 维；actor 53 / critic 57） |
+| `level2.yaml` | L2 | + `reward.contact_rewards: true`、`foot_scuff: -8.0`（scuff 标定参数） |
+| `level3.yaml` | L3 | + 两级课程采样器（10.5/15cm、逐级 timesteps/LR/指令区间/overrides） |
+
+**验证结果**：
+
+- **语义等价**：`ablations/crawl24.yaml` 重建 `EnvConfig` vs `runs/crawl24/checkpoints/
+  stair15_final_env.json` 的 `env_config` —— 旧键 deep-diff 为空；新字段全部等于旧行为默认。
+- **回放等价**（100 回合、`--sampled-command --stage stair15`，`ablations/crawl24.yaml`）：
+  900k = **96.0%**/摔 4.0%/2.90m/1.14m/0.29m·s⁻¹/507 步/登级 7.72；
+  final = **91.0%**/摔 9.0%/2.83m/1.12m/0.32m·s⁻¹/453 步/登级 7.81 ——
+  与历史记录**逐项相同**。
+- **权重结构**：crawl24 final = `ActorCriticPolicy`（对称）、obs 53、actor/critic in 53、
+  `policy_kwargs` 无 `actor_obs_index` ⇒ 旧权重不受新代码影响。
+- **四段冒烟**（同一 `scripts/train.py`，每级 512 步/2 envs，`runs/ablation_l{0..3}_smoke`）：
+  exit 全 0；L0 `每帧 53 维`；L1/L2 `每帧 57 维 + 非对称 AC: actor 53 / critic 57`；
+  L3 `两级课程`（stair10_5 → stair15，逐级 LR/指令区间/奖励覆盖生效）。
+- **产物核对**：`_env.json` 记录 `privileged_foot_contact` 与 `contact_rewards`/`foot_scuff`；
+  `load_policy` 重建 L0=对称(53/53)、L1–L3=非对称(53/57)；zip 的 `policy_class`/
+  `policy_kwargs` 留痕。奖励项：L0/L1 = 18 个基线项，L2/L3 额外出现 4 个 contact 项、
+  其余项逐位不变（开关是「加项」）。
+- **单测**：`tests/test_ablation_levels.py` 4 条；全套 32 条 OK。
+
+**边界**：冒烟 512 步只证明链路与装配，**不是能力对比**；四段消融的训练结论要等实际训练。
+证据脚本全部在 `.tmp/`（`_verify_crawl24_semantics.py`、`_verify_ablation.py`、
+`_verify_ablation_artifacts.py`、`_replay_crawl24_*_abl.log`、`_smoke_l{0..3}.log`）。
+详见 `doc/ablation.md`。
+
+---
+
+## ablation 训练对照 — L0/L1/L2/L3 正式跑（2026-10-19 夜，**单 seed，n=1**）
+
+**设计**：四臂同一 warm-start `runs/crawl23/checkpoints/stair13_5/stair13_5_850000_steps.zip`、
+各 1.2M 步（L3 为 10.5cm 600k + 15cm 600k）、同一 `scripts/train.py`；两两并行（L0+L1、L2+L3，
+内存门控），每臂训练完立刻 `play.py --mode eval --stage stair15 --sampled-command` 100 回合。
+
+**训练侧**：
+
+| 臂 | 观测/策略 | 步数 | PPO updates | 回合数 | 末窗成功率/摔倒 | 末窗均步数 | 均回报 | 用时 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L0（对称基线） | 53 / `ActorCriticPolicy` | 1.2M | 585 | 1925 | **90% / 8%** | 653.1 | −34.5 | 57.8min |
+| L1（+特权观测） | 57 / `Asymmetric` | 1.2M | 585 | 2066 | 76% / 24% | 501.7 | 163.4 | 57.8min |
+| L2（+contact 奖励） | 57 / `Asymmetric` | 1.2M | 585 | 2066 | 76% / 24% | 501.7 | 163.4 | 61.0min |
+| L3（+两级课程） | 57 / `Asymmetric` | 0.6M+0.6M | 292+292 | 1234+1374 | stage1 **86%**/14%；stage2 **66%**/34% | 458.8 / 441.9 | +1586.1 / −807.7 | 61.2min |
+
+**回放（100 回合、15cm、`--sampled-command`）**：
+
+| 臂 | 成功率 | 摔倒 | 平均前进 | 平均爬升 | 平均速度 | 平均步数 | 成功回合登级 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| L0 | **97.0%** | 3.0% | 2.89m | 1.16m | 0.28m/s | 530 | 7.80/8 |
+| L1 | 90.0% | 10.0% | 2.83m | 1.11m | 0.31m/s | 456 | 7.90/8 |
+| L2 | 90.0% | 10.0% | 2.83m | 1.11m | 0.31m/s | 456 | 7.90/8 |
+| L3 | 83.0% | 17.0% | 2.80m | 1.11m | 0.32m/s | 447 | 7.96/8 |
+
+爬升速度（平均爬升 /（步数×0.02s））：L0 **0.109 m/s**、L1/L2 **0.122**、L3 **0.124**。
+
+**三个必须说的发现**：
+
+1. **L1 与 L2 的训练是逐位相同的**：两臂 checkpoint 的 `policy.pth` 与 `policy.optimizer.pth`
+   md5 一致、2011 条进度行逐行相同、末窗统计相同 —— 只差 `_env.json` 里的 flag。原因不是接口
+   没切换（L2 env 确有 22 个 reward term，比 L1 多 `foot_scuff/foot_impact/load_share/com_margin`），
+   而是这四个 term 在 stair15 上**数值恒为 0**：随机动作 66 步、训练策略 392 步行走，四个 term
+   非零次数都是 0 ⇒ 奖励完全相同 ⇒ 训练轨迹相同。
+   ⇒ **本轮 L1 vs L2 不能作为「contact 奖励有没有用」的证据**；L2 的 `foot_scuff=-8.0` 需要先
+   重新标定触发条件（或用会触发的 term / 平地阶段）再 A/B。
+2. **L0 的 97% 高于历史 crawl24 的 91%**：同一份配方的**重训**，就差 6 个点（单 seed）。
+   所以 L0(97%) vs L1(90%) 的 7 点差**不能归因给特权观测** —— 它落在「同配方重跑」的方差里。
+   另注意训练窗口与回放会反向（L0 窗口 90%→回放 97%；L1 窗口 76%→回放 90%）。
+3. **L3 的 83% 不宜直接比**：它的 15cm 阶段只有 600k 预算（L0–L2 是 1.2M），且从 10.5cm
+   迁移；它证明的是「两级课程采样器能在同一脚本里跑通并逐级切换」，不是「课程更好/更差」。
+
+**本轮能确认的**：消融接口真的能靠配置切换、产物可追溯（policy 类/obs 维/奖励 flag 都写进
+`_env.json`）；**不能确认**能力排序（n=1 + L2 是 no-op）。要判能力，至少每臂 3 seeds（≈6h）。
+
+**产物**：`runs/abl_l{0..3}/`（final + 周期 ckpt + plan/summary + `_env.json`）；
+日志 `.tmp/ablation/train_l{0..3}.log`、`eval_l{0..3}.log`、`train.jsonl`、`eval.jsonl`；
+跑批脚本 `.tmp/run_ablation_pairs.py`；contact 项不触发的证据 `.tmp/_probe_contact_fire.log`。
+

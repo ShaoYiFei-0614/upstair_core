@@ -4503,3 +4503,54 @@ seed 0，与 upstairs_v1 / crawl21–24 同配方同预算：从零九级 7.45M 
 `runs/asym13_5/`、`runs/asym15_ladder/`；日志与 eval `.tmp/asym_chain/*.log`；
 复刻脚本 `.tmp/run_asym_chain.py` / `.tmp/run_asym_chain_resume.py`；详见 `train.md` 的
 「asym 复刻」条目与 `doc/training.md` 的跨观测维 warm-start 一节。
+
+## 23.64 还原历史配置 + 消融分层：以 `_env.json` 为准，新字段显式钉旧默认（2026-10-19）
+
+用户要求「保留非对称 AC 实现、把配置还原为 crawl24」并验证消融接口（L0→L1/L2/L3 的
+actor/critic 输入维拼接、reward 项开关、课程采样器）。
+
+- **还原的正确姿势**：不要「把新 config 的老键抄一遍」就宣布还原 —— 新代码引入的字段
+  会落**当前默认**（如 `yaw_rate_mode` 默认 `legacy`、`stair_guidance_under_hold` 默认
+  `true`、四个 contact 权重默认 0），必须**逐个显式钉死成旧行为值**，再用
+  `runs/<name>/checkpoints/<stage>_final_env.json` 做 deep-diff：旧键必须为空、新字段必须
+  等于旧默认。证据：`ablations/crawl24.yaml` 重建 ↔ crawl24 `_env.json`，旧键 0 差异。
+- **回放是最终判据**：配置还原是否真的等价，看 100 回合回放是否与历史记录**逐项相同**
+  （900k 96.0%/摔4.0%/2.90m/507 步；final 91.0%/摔9.0%/2.83m/453 步，全部对上）。
+- **`configs/` 被 gitignore**（训练快照约定）⇒ 需要版本化的实验配置放**新建 tracked 目录**
+  `ablations/`；否则别人 clone 下来既看不到配置、测试也找不到文件。
+- **消融分层的实现**（已验证可全靠配置切换，同一 `scripts/train.py`）：
+  1) 观测维拼接：`obs.privileged_foot_contact` 决定 `ObsConfig.size` 与 `actor_index`，
+     `build_ppo` 自动选 `MlpPolicy`/`AsymmetricActorCriticPolicy`（策略类也由配置推导，
+     checkpoint 自描述留痕）；
+  2) 奖励项开关：`reward.contact_rewards` 控制是否**追加**四项，旧项权重不受影响
+     （20 步随机动作核对：L0/L1 = 18 项，L2/L3 多 4 项，其余逐位不变）；
+  3) 课程采样器：`heights_cm/timesteps/learning_rate/command_*/reward_overrides` 逐级展开，
+     L3 两级（10.5→15cm）冒烟确认逐级 LR/指令区间/覆盖都生效。
+- **教训**：新特性上默认关 ≠ 旧配置等价；还原要按「旧 `_env.json` 语义」对齐，并用回放
+  对账。消融分层不要把开关写进代码分支 —— 全部走配置，才能在同一脚本里逐级切换、
+  且 `_env.json` 自描述可重建。
+
+证据：`tests/test_ablation_levels.py`（4 条）、全套 32 条单测；`doc/ablation.md`；
+`train.md` 的「ablations」条目；`.tmp/_verify_crawl24_semantics.py`、`_verify_ablation.py`、
+`_verify_ablation_artifacts.py`、`_replay_crawl24_{900k,final}_abl.log`。
+
+## 23.65 消融首轮实测：开关「存在」≠「生效」；同配方重训方差 ≥6 点（2026-10-19 夜）
+
+四臂（L0 对称基线 / L1 +特权观测 / L2 +contact 奖励 / L3 +两级课程）同起点、同 1.2M 步骤、
+100 回合回放：L0 **97.0%**、L1 **90.0%**、L2 **90.0%**、L3 **83.0%**。
+
+- ⭐ **L1 与 L2 训练逐位相同**：`policy.pth`/`policy.optimizer.pth` md5 一致、2011 条进度行相同。
+  原因：L2 的四个 contact term 在 stair15 上**恒为 0**（随机动作 66 步、训练策略 392 步行走，
+  非零次数 0/0/0/0）。⇒ **开关接上了（`reward_terms` 里确实多 4 项）但没生效**。
+  教训：**做奖励 A/B 前必须先测「term 触发率/量级」**，否则两个臂的训练会逐位相同，
+  还会给出「加了这个奖励没效果」的错误结论。
+- **同配方重训方差 ≥6 点**：L0 用 crawl24 的配方+同 seed 重训，回放 97% vs 历史 91%。
+  ⇒ 单 seed、100 回合下，**~7 点以内的臂间差异不能归因**；判能力排序至少每臂 3 seeds。
+- **训练窗口 ≠ 回放**，且方向可能相反：L0 窗口 90%→回放 97%；L1 窗口 76%→回放 90%。
+  报能力只认回放（`--sampled-command`，≥40 回合）。
+- 工程侧：两臂并行（8 envs/臂）可行，单臂耗时从 36–42min 升到 58–61min，总吞吐仍有收益；
+  启动前用内存门控（可用 ≥1.6GB/臂）避免 §23.36 的 OOM 伪装成 MJCF 编译失败。
+- L3 的 15cm 阶段只有 600k 预算（其余臂 1.2M），**不可直接比**；它证明的是课程采样器可切换。
+
+产物：`runs/abl_l{0..3}/`；日志 `.tmp/ablation/*`；跑批 `.tmp/run_ablation_pairs.py`；
+不触发证据 `.tmp/_probe_contact_fire.log`；详见 `train.md` 的「ablation 训练对照」条目。
