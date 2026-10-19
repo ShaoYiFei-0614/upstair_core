@@ -233,6 +233,8 @@ def env_config_for_model(model_path: str | Path) -> EnvConfig:
             f"模型观测维度 {dim} 无法用 EnvConfig 的观测块还原。"
             f"请把模型放回它的 runs/<name>/ 目录（读 summary.json），"
             f"或显式指定观测开关。"
+            f"（若权重是用非对称 AC 训练的、观测里含 critic 特权块，按维度反推"
+            f"在结构上不成立 —— 必须带 <模型>_env.json 才能还原。）"
         )
     print(f"[配置] 模型旁没有 summary.json，已从观测维度 {dim} 反推: "
           f"frame={obs.frame_size} history={obs.history_len}")
@@ -299,6 +301,10 @@ def _obs_config_for_dim(total: int, history_len: int = 1) -> ObsConfig | None:
     一个位置翻转最快，所以把 ``gait_phase`` 放最前（恒 False 持续最久）、
     ``vel_filter`` 居中：51 维会先命中 vel+step 组合而非 gait+step。
     ``history_len`` 与帧大小是乘积关系、单靠总维数不可分离，默认取本仓最常用的 1。
+
+    ``privileged_foot_contact``（非对称 AC 的 critic 特权块）**不在枚举里**：它只
+    给 critic，含它的观测维无法从总维数反推出来 —— 这类权重必须依赖同目录
+    ``<模型>_env.json``（``env_config_for_model`` 的第一层退路）。
     """
     flags = ("gait_phase", "vel_filter", "step_height")
     for combo in product((False, True), repeat=len(flags)):

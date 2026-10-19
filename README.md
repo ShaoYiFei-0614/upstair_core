@@ -46,6 +46,7 @@ upstair_core/
     curriculum.py  课程数据类与报表                              → doc/curriculum.md
     training.py    向量环境 / PPO / RunDir / 权重加载            → doc/training.md
     policy.py      checkpoint 的配置/结构/归一化恢复             → doc/policy.md
+    asymmetric.py  非对称 actor-critic：actor/critic 观测切分    → doc/training.md（并入）
     gait.py        开环先验（数据化、速度参数化）                → doc/gait.md
     go2_model.py   MJCF 装配 / 场景编译 / 元信息                 → doc/go2_model.md
     tools/         工具层（不 import 上层）
@@ -56,6 +57,7 @@ upstair_core/
   scripts/
     train.py       训练入口（逐级循环）                          → doc/train.md
     play.py        评估 / 视频                                    → doc/play.md
+    frames.py     视频切片（粗 / 细），供视觉评审                 → doc/frames.md
     teleop.py      外部控制器遥控                                → doc/teleop.md
     cmd_demo.py    指令跟踪量化                                  → doc/cmd_demo.md
     download_go2.py 拉取 Go2 模型                                → doc/download_go2.md

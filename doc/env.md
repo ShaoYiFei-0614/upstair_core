@@ -28,8 +28,11 @@
 
 拼接规则（`_obs_frame()`）：**恒在 48 维**（42 维本体 + 两个必选块），再按
 `ObsConfig` 的开关依声明顺序追加可选块，最后沿时间堆叠 `history_len` 帧。
-当前 `config.yaml`（`history_len: 1`、全部开关开）= 每帧
-**55 维**（48 + gait_phase 2 + step_height 1 + vel_filter 2 + gait_cmd 2）。
+当前 `config.yaml`（`history_len: 1`，gait_phase/step_height/vel_filter 开、
+gait_cmd 关）每帧 **53 维**；「全部可选开关开」的 actor 帧是 **55 维**
+（48 + gait_phase 2 + step_height 1 + vel_filter 2 + gait_cmd 2）。打开特权块
+（`privileged_foot_contact`，仅 critic）时 `frame_size`/`size` 再 **+4**，而
+`actor_size` 不变。
 
 **恒在 48 维（全部真机口径；后两块为必选项，构造期强制，改 false 直接抛
 ValueError）：**
@@ -53,16 +56,39 @@ ValueError）：**
 | `step_height` | 1 | 本回合台阶高（m） | **任务参数**，随任务下发 | 唯一非传感器项：告诉策略「在哪条楼梯上」，但**不含下一道立面在哪** |
 | `gait_cmd` | 2 | 步态指令（freq [Hz] + swing 缩放） | 上层指令（Walk-These-Ways 式条件化） | 策略**伺服**的步态参数：楼梯档/平地档是同一策略的两个条件点，部署时 `set_gait_cmd_now()` 实时切换；P2 的教训是参数放 action、WtW 放 obs |
 
-**盲走契约（硬边界）**：观测里不得出现任何**地形几何真值**。`base_height`
+**特权块（`privileged_foot_contact`，**只给 critic**，默认关）：**
+
+| 块 | 维 | 物理量 | 真值来源 | 为什么只给 critic |
+| --- | --- | --- | --- | --- |
+| `privileged_foot_contact` | 4 | 逐足是否接触地形（足端 geom × floor/stair geom） | MuJoCo 接触对（仿真器真值） | actor 部署到真机必须盲走；critic 只是训练期的价值函数，吃特权信息降低价值方差（非对称 actor-critic，`robotdog/asymmetric.py`） |
+
+打开后每帧末尾 `+4` 维，`ObsConfig.size` 变大而 `actor_size` **不变**：`step()` 返回的
+观测是**全量**（critic 用），actor 的切片由 `ObsConfig.actor_index` 给出（帧优先条带，
+支持 `history_len > 1`），策略侧在 `AsymmetricActorCriticPolicy` 里 `index_select`。
+关闭（默认）时与对称 AC 的观测**逐位相同**（前向兼容的判据，见 `train.md` 的冒烟条目）。
+
+注意：无论开关开不开，`info["foot_contact"]`（4 个 float）**每步都在**，它是只读诊断量，
+不进观测、不进奖励/终止 —— 写对比 `info` 键集合的探针时要把它排除在外。
+
+**盲走契约（硬边界）**：**actor 的观测**里不得出现任何**地形几何真值**。`base_height`
 （机身相对正下方地形的高度）曾被实现过 —— 它等于把地形读数塞进观测；现在
 `ObsConfig.__post_init__` 构造期直接拒绝，实现分支也整体删除（「默认关掉」
 不是保证，experience.md §11）。
+
+特权块是这条硬边界的**唯一例外形态**：它只进 critic 的 value 网络（训练期存在、
+部署时不存在），由非对称 AC 在结构上切开（`ObsConfig.actor_index`），因此 actor 的
+输入里依然没有任何真值。**不要把特权维直接追加给 actor** —— 那就是把 `base_height`
+的事故重演一遍。
 
 **特权信息白名单**（真值只进奖励/终止，绝不进观测 —— RL 里这是允许的「上帝
 视角」，但一进观测就破坏盲走）：`foot_clearance`（足端离地）、
 `_support_height`（四足支撑面：摔倒判据与 stair_progress）、`_contact_scan`
 （接触掩码：碰撞罚与 air_time）。逐项真机等价物与审计结论见
 `experience.md` §11.4。
+
+以上约束的是 **actor 的观测**；critic 的**特权观测**是唯一例外形态（非对称
+actor-critic，见上文特权块与 `experience.md` §23.60）：它只进 value 网络、
+部署时不存在，不进 actor 的输入。
 
 ### 动作：从策略输出到电机
 

@@ -652,6 +652,8 @@ def _height_reference(self) -> float:
   实现路径一并删掉——留着代码就是留着被重新接上的可能。
 * 审计「一个方法是否引入了额外信息」时，要区分两件事：**它读了什么**（可能是真值）与
   **它去了哪里**（观测 / 奖励 / 终止）。本仓允许读真值做奖励与终止，只禁止进观测。
+  （**更正/例外**：§23.60 起 critic 的**特权观测**允许存在 —— 约束的准确表述是
+  「不得进 **actor** 的观测」；非对称 AC 在结构上把两者切开。）
 * 这类审计是一次性的判断题，**不会**被任何自动检查器抓到（就像 §10 的行号漂移）。
   所以结论要写进文档，而不是只留在当次对话里。
 
@@ -4367,3 +4369,137 @@ R1 可能是在"修一份被拖坏的起点"，而不是在"提升本来就正�
 - **教训**：「配置能按观测维度反推」只覆盖观测开关；**凡是不进观测、却能改行为的字段
   （相位时钟频率、先验门限、奖励覆盖）都必须写进 `_env.json`**，否则旧权重回放会被默认值
   悄悄改写 —— 又一个 §20.7 实例。
+
+## 23.60 非对称 actor-critic：critic 吃特权观测、actor 保持盲走（2026-10-18）
+
+用户要求把架构改成非对称 actor-critic（critic 可输入更多观测）、保证前向兼容，
+并在 critic 观测里加入足底-地形接触用于验证。落地方式与结论：
+
+- **实现只碰 `mlp_extractor`**：SB3 2.9 在 `share_features_extractor=True` 时，
+  `features = FlattenExtractor(obs)` 是完整观测，`forward`/`evaluate_actions`/
+  `get_distribution`/`predict_values` 全部经 `mlp_extractor.forward_actor/critic` 分叉。
+  所以自定义 `AsymmetricMlpExtractor`（actor 分支 `index_select` 只取 actor 维、critic
+  分支用全量）+ 覆写 `_build_mlp_extractor` 就够了，**不需要重写任何 policy 方法**。
+- **前向兼容**：观测开关 `obs.privileged_foot_contact=false`（默认）时 `build_ppo`
+  仍构造 `MlpPolicy`、policy_kwargs 不变；`eq_check` 三场景 450 步 `reward_terms`
+  **逐位为 0 差异**；旧 53 维 checkpoint 仍走原加载路径。
+- **actor 绝不能拿到特权维**：切分下标是 `ObsConfig.actor_index`（帧优先条带，
+  `history_len > 1` 时 actor 维**不是前缀**），以**非持久 buffer** 存在策略里
+  （不进 `state_dict`，`set_parameters` 不会因多键报错）。检验方式：
+  `policy.mlp_extractor.policy_net[0].in_features == actor_size` 且
+  `value_net[0].in_features == size`。
+- **接触通道**：4 维逐足「足端 geom × floor/stair geom」接触，来自 `_contact_scan()`
+  的真值，每帧末尾追加、同时进 `info["foot_contact"]` 便于验证；它**只进 critic**，
+  不进奖励/终止，也不进 actor 观测 —— 盲走契约（§11）的边界是「actor 的观测」，
+  critic 的特权输入是训练期存在、部署不存在的标准做法。
+- **教训**：以后再加任何 critic 特权量（地形高度、未来台阶序列……）都走同一通道：
+  1) `ObsConfig` 加块 + 帧末追加 + `actor_index` 自动切分；2) `build_ppo` 不用改
+  （index 由 cfg 推导）；3) 文档必须同时写清「它为什么可以只给 critic」。
+
+## 23.61 跨观测维 warm-start：补零迁移与「count 不拷 = 假 warm-start」（2026-10-18）
+
+场景：把 crawl23 的 **53 维对称 AC** 权重迁到 `privileged_foot_contact: true` 的
+**57 维非对称 AC** 配置（asym15 vs crawl24 的单变量对照需要同一起点）。
+
+- **权重迁移规则**（`robotdog/training.py::set_parameters_compat`）：只支持「actor 维
+  不变、critic 首层变宽」—— actor 原样搬（两边 actor 都只看 `actor_size` 维）；
+  critic 首层 `(H,53)→(H,57)` **按 `ObsConfig.actor_index` 放回旧列、其余 4 个特权列补零**
+  （`history_len>1` 时特权块在每帧末尾，actor 维不是前缀，前缀法会静默错位）。因此
+  **初始 value 与旧权重逐位相同**（验收判据：`predict_values` 在 t=0 与旧模型逐位一致、
+  actor 输出逐位一致；`.tmp/probe_ws_equiv.py` 8/8 PASS）。窄化、net_arch/actor 维变化、
+  旧权重多键一律 `ValueError`，不静默降级。
+- **观测统计迁移**（`restore_vecnormalize_compat`）：`VecNormalize.load(str(pkl), venv)`
+  会校验「pkl 的观测空间 == venv 的观测空间」形状，跨维直接 `AssertionError: spaces must
+  have the same shape` ⇒ 只能反 `pickle` 后手工搬：旧统计按 `ObsConfig.actor_index`
+  放回、新增特权维 **mean 0 / var 1**（不放大）。
+- ⭐ **`RunningMeanStd.count` 必须一起拷**（第一版漏了，被 reviewer 抓为 blocker）：
+  SB3 的更新是 `mean ← mean + delta * batch / (count + batch)`，新建 VecNormalize 的
+  `count = epsilon = 1e-4` ⇒ 第一次 `reset()`（8 env）就以 `8/(8+1e-4)≈100%` 的权重把
+  刚装回的统计**整份替换**掉，而日志照样打印「装回观测统计」。这正是 §23.34 的
+  「假 warm-start」同型问题，但更隐蔽：形状/日志都对，只有 count 不对。
+  **验收方式**：restore 之后 `reset()+step()` 一步，断言 `obs_rms.count` 仍是旧 pkl 的
+  量级、`mean` 仍≈旧值（`tests/test_asymmetric.py::WarmStartCompatTest` 已钉住）。
+- **日志口径**：跨维 warm-start 打印「兼容迁移 … 53->57 维（actor 不变，critic 首层补零）」
+  与「装回观测统计」；同维时仍走原来的 `model.set_parameters` + `VecNormalize.load`。
+- **等价性的边界**：迁移只保证「起点 actor 逐位相同、初始 value 逐位相同」，不保证
+  瞬态行为一致（critic 是「旧列 + 0 列」的新组合，前若干 update 的价值梯度不同）。
+  对比两条 run 时应看同预算收敛段，而不是起步前 50–100k。
+
+## 23.62 非对称 AC 首轮对照（asym15 vs crawl24）：final 打平、900k 更低 —— 特权 critic 未见收益（2026-10-18）
+
+**设计**（单变量）：`asym15` = `crawl24` 配置逐字段复制（单级 15cm、tread 0.30、1.2M 步、
+LR 7e-5、`[512,256,128]`、seed 0、同 reward_overrides、同 warm-start
+`runs/crawl23/checkpoints/stair13_5/stair13_5_850000_steps.zip`），唯一变量
+`env.obs.privileged_foot_contact: true`（critic 多 4 维足端-地形接触，actor 53 维不变）。
+起点经 53→57 兼容迁移（actor 逐位相同、critic 首层旧列搬 + 4 列补零、初始 value 逐位相同、
+obs_rms 的 mean/var/**count** 一起恢复）。
+
+**结果**（100 回合、`--sampled-command --stage stair15`，与 crawl24 同口径）：
+
+| 指标 | asym15 900k | crawl24 900k | asym15 final | crawl24 final |
+| --- | --- | --- | --- | --- |
+| 成功率 | **80.0%** | **96.0%** | **90.0%** | **91.0%** |
+| 摔倒率 | 20.0% | 4.0% | 10.0% | 9.0% |
+| 平均前进 / 爬升 | 2.78m / 1.10m | 2.90m / 1.14m | 2.83m / 1.11m | 2.83m / 1.12m |
+| 平均步数 | 473 | 507 | 456 | 453 |
+
+训练滑窗 76%/摔 24%（crawl24 82%/18%），耗时 35.9min。
+
+**结论**（n=1，描述性，不作能力带）：**没有观察到「critic 多吃 4 维接触」带来收益**。
+final 两条 run 在同一水平（90.0 vs 91.0，100 回合二项噪声 ~±3–4 点）；但 900k 那一份
+asym15 明显更低（80.0 vs 96.0），训练滑窗也同向 ⇒ 这次特权 critic 的**收敛轨迹更抖**，
+末段才追平，而不是更强。
+
+**可能原因**（下轮的假设，不是结论）：① **特权维近乎未标准化**：迁移时新 4 维取
+mean 0/var 1，训练到 50k 时 `obs_rms.var[53:] ≈ 0.965`，critic 实际吃的是 raw 0/1，
+量纲与其它 53 维（var 0.03–1）差得远；② 4 维接触信息对价值估计的**边际信息量小于噪声**
+（步态相位、足端动作历史已在 actor 观测里，接触是可由前两者弱推断的冗余量）；
+③ critic 首层新增列**零初始化**，早期梯度几乎不更新这 4 列（只有部分样本能给出信号）。
+
+**教训**：给 critic 特权信息 ≠ 价值函数一定更好；单 seed + 100 回合只能描述现象，
+「有效/无效」必须 3 seeds 同口径（约 2h）才能判；另外训练日志滑窗与回放会系统性背离
+（crawl24 窗口 82% 而回放 96%），不能拿窗口值下结论。
+
+**产物**：`runs/asym15/`（1.2M 步、9 个周期 ckpt + final + plan/summary，summary `obs_size=57`）；
+日志 `.tmp/asym15.log`；eval `.tmp/_eval_asym15_900k.log` / `_eval_asym15_final.log`；
+视频 `runs/asym15/videos/asym15/stair15_15cm/`（对照 `runs/crawl24/videos/crawl24/stair15_15cm/`）。
+
+## 23.63 特权 critic 的完整复刻：从零九级 + 延伸链**没有收益，延伸链 4/4 回放偏低**（2026-10-19）
+
+**实验**：唯一变量 `privileged_foot_contact=true`（critic +4 维足端-地形接触，actor 不变），
+seed 0，与 upstairs_v1 / crawl21–24 同配方同预算：从零九级 7.45M 步 + 延伸链 10.5/12/13.5/15cm
+各 1.2M 步（10.5cm 部分先跑到 968k 被 kill，用 950k 补 250k 尾巴）。**约 12.27M 步 / 6h02m**。
+
+**结果（100 回合回放，同 `--sampled-command` 口径）**：
+
+| 高度 | asym | crawl 对照 | Δ |
+| --- | --- | --- | --- |
+| 10.5cm | 89% | 98% | −9 |
+| 12cm | 78% | 82% | −4 |
+| 13.5cm | 85% | 88% | −3 |
+| 15cm（阶梯） | 81% | 96%/91% | −15/−10 |
+| 15cm（单级，从 crawl23 warm） | 90% | 91% | −1 |
+
+训练滑窗：九级 3/4.5/6/7.5/9cm = `0/86/100/100/92` vs `96/90/74/92/98`（stair3 单级崩溃后自愈；
+6/7.5cm 反超）；延伸链 = `86/48/68/66` vs `96/84/68/82`。爬升速度：10.5/12cm 慢 8%/20%，
+13.5/15cm 持平或略快。
+
+**结论**：**没有观察到收益；高台阶（延伸链）上 4/4 回放一致偏低**。但 n=1，不能归因 ——
+既可能是特权 critic 真有负作用，也可能是这一 seed 在高台阶上走差。**判决需要 2–3 seeds**
+（最小：12/15cm 各补 2 seeds，约 2.5h）。
+
+**新的教训**：
+1. **训练滑窗与回放会系统性背离**（本轮 10.5cm 尾巴窗口 86% 而此前的 950k 回放 98%；
+   crawl24 窗口 82% 而回放 96%）⇒ 只有 ≥100 回合回放能当成功率，滑窗只能看趋势。
+2. **单级能训练不等于链上能保住**：同为 15cm，「从 crawl23 单级 warm-start」= 90%，
+   「从自建 13.5cm 阶梯 warm-start」= 81% —— 链越长，中间级的坏权重/分布漂移越会被下一级继承；
+   评估「架构改动」必须跑完整链，不能只看单级 A/B。
+3. **训练中段可以掉点**：同一 10.5cm run 的 950k（98%）比 1.2M final（89%）更好，
+   说明「训练预算给满」不等于「最后一份权重最好」——选点应该看回放，不看步数。
+4. **成本对比要同机同时段**：本轮 565 步/秒 vs 对照 493（甚至 311）步/秒，机器负载差异
+   比架构差异大得多；报成本时必须注明口径。
+
+**产物**：`runs/asym_upstairs/`、`runs/asym10_5/`、`runs/asym10_5_tail/`、`runs/asym12/`、
+`runs/asym13_5/`、`runs/asym15_ladder/`；日志与 eval `.tmp/asym_chain/*.log`；
+复刻脚本 `.tmp/run_asym_chain.py` / `.tmp/run_asym_chain_resume.py`；详见 `train.md` 的
+「asym 复刻」条目与 `doc/training.md` 的跨观测维 warm-start 一节。

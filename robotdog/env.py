@@ -76,6 +76,11 @@ class ObsConfig:
     # **观测条件**而不是动作自由度（P2 的教训：参数放 action 两次全败，
     # experience.md §23.27/§23.28）。旧权重 json 缺此键，重建时按 False 还原 53 维。
     gait_cmd: bool = False
+    # 4：足端-地形接触（逐足 0/1）—— **只给 critic 的特权块**。actor 绝不允许
+    # 看到它：非对称切分在 robotdog/asymmetric.py 里做，打开后每帧末尾多 4 维，
+    # 但 actor 的网络输入维数不变（= actor_frame_size × history_len）。
+    # 动机：critic 用仿真器真值降低价值估计方差，actor 保持盲走（doc/env.md）。
+    privileged_foot_contact: bool = False
     base_frame_size: int = 42
 
     def __post_init__(self) -> None:
@@ -96,11 +101,43 @@ class ObsConfig:
         extra += 1 if self.step_height else 0
         extra += 2 if self.vel_filter else 0
         extra += 2 if self.gait_cmd else 0
+        extra += 4 if self.privileged_foot_contact else 0
         return self.base_frame_size + extra
+
+    @property
+    def privileged_frame_size(self) -> int:
+        """每帧**只给 critic** 的特权维数（足端-地形接触 4 维；关时为 0）。"""
+        return 4 if self.privileged_foot_contact else 0
+
+    @property
+    def actor_frame_size(self) -> int:
+        """actor 能看到的每帧维数（= 全帧 − 特权块）。"""
+        return self.frame_size - self.privileged_frame_size
 
     @property
     def size(self) -> int:
         return self.frame_size * self.history_len
+
+    @property
+    def actor_size(self) -> int:
+        """actor 的**输入**维数（特权块不算）—— 非对称 AC 的切分依据。"""
+        return self.actor_frame_size * self.history_len
+
+    @property
+    def actor_index(self) -> tuple[int, ...]:
+        """actor 在**整帧堆叠观测**里的下标（帧优先条带切分）。
+
+        特权块追加在每帧末尾，所以 ``history_len > 1`` 时 actor 维**不是**前缀，
+        必须按「帧号 × 每帧宽度 + 帧内偏移」取。``history_len == 1`` 时它就是
+        ``range(actor_frame_size)``。
+        """
+        if self.privileged_frame_size == 0:
+            return tuple(range(self.size))
+        return tuple(
+            i * self.frame_size + j
+            for i in range(self.history_len)
+            for j in range(self.actor_frame_size)
+        )
 
 
 @dataclass
@@ -415,6 +452,10 @@ class Go2StairsEnv(gym.Env):
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
+        # 足端-地形接触（逐足 bool）：**只给 critic 的特权观测块**用（见
+        # ObsConfig.privileged_foot_contact 与 robotdog/asymmetric.py）。默认关时
+        # 仍然每步维护它 —— 只是一次赋值，打开开关不需要改数据流。
+        self._foot_contact_now = np.zeros(len(self.meta.foot_geom_ids), dtype=bool)
         # 足端接触力（2026-10-17）。**只在 cfg.needs_foot_force 时才有值** ——
         # 默认全 0，关掉时一个字节都不会被读。三个数组的分工见
         # ``foot_normal_force`` / ``foot_impact_force`` 的 docstring。
@@ -836,6 +877,10 @@ class Go2StairsEnv(gym.Env):
             # 与 _gait_action 生成先验用的是同一组值（马尔可夫性）。
             parts.append(np.array([float(self._gait_freq_cmd),
                                    float(self._gait_swing_cmd)]))
+        if obs_cfg.privileged_foot_contact:
+            # 特权块（仅 critic）：足端-地形接触真值（floor + stair geom）。
+            # actor 的输入维数不受影响 —— 非对称切分在 robotdog/asymmetric.py。
+            parts.append(self._foot_contact_now.astype(np.float64))
         return np.concatenate(parts).astype(np.float64)
 
     def _observation(self) -> np.ndarray:
@@ -873,9 +918,11 @@ class Go2StairsEnv(gym.Env):
 
         ``foot_contact_mask`` —— 逐足布尔量：这个足端 geom 此刻是否接触地形。
         **信息来源：仿真器的接触真值。** 真机上对应的是「用关节力矩残差 / 电流
-        尖峰估计足端触地」，这是标准的 sim-to-real 做法，所以它不是特权信息 ——
-        但它**只进奖励与腾空时间统计，绝不进观测**（``reward.py`` 的 ``air_time``
-        项与 ``clearance`` 的分布都靠它区分摆动相与支撑相）。
+        尖峰估计足端触地」，这是标准的 sim-to-real 做法。**本轮的设计选择仍然不
+        给 actor**（即使真机能估计）：它只进奖励与腾空时间统计（``reward.py`` 的
+        ``air_time`` 项与 ``clearance`` 的分布都靠它区分摆动相与支撑相）；
+        ``ObsConfig.privileged_foot_contact`` 打开时它作为 **critic 特权块**进观测
+        （非对称 AC，见 ``robotdog/asymmetric.py``），actor 仍然看不到。
         """
         foot_index = {int(g): k for k, g in enumerate(self.meta.foot_geom_ids)}
         terrain = {int(self.meta.floor_geom_id)} | {
@@ -1096,6 +1143,7 @@ class Go2StairsEnv(gym.Env):
         self._prev_foot_pos = self.foot_pos.copy()
         self._foot_air_time = np.zeros(len(self.meta.foot_geom_ids))
         self._prev_foot_contact = self._contact_scan()[2]
+        self._foot_contact_now = self._prev_foot_contact.copy()   # 特权观测块（critic 用）
         self._foot_fn[:] = 0.0
         self._foot_ft[:] = 0.0
         self._foot_fn_peak[:] = 0.0
@@ -1391,6 +1439,9 @@ class Go2StairsEnv(gym.Env):
 
         self._step_count += 1
         trunk_contact, leg_contact, foot_contact = self._contact_scan()
+        # 特权观测块（仅 critic，见 ObsConfig.privileged_foot_contact）：每步存一份
+        # 逐足接触，``_obs_frame`` 在开关打开时把它追加到帧末尾。
+        self._foot_contact_now = foot_contact
         # 奖励结算之前推进势函数状态（状态机数学在 reward.py，见 doc/reward.md）。
         track_swing_peak(self, foot_contact)
         update_probe_state(self)
@@ -1438,6 +1489,7 @@ class Go2StairsEnv(gym.Env):
             "reward_terms": terms,
             "trunk_contact": float(trunk_contact),
             "leg_contact": float(leg_contact),
+            "foot_contact": [float(v) for v in self._foot_contact_now],
             "leg_contact_streak": int(self._leg_contact_streak),
             "blocked": float(self._blocked),
             "probe_count": int(self._probe_count),

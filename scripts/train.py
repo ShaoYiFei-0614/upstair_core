@@ -54,14 +54,16 @@ from robotdog.curriculum import (  # noqa: E402
     write_summary,
 )
 from robotdog.env import EnvConfig  # noqa: E402
-from robotdog.policy import env_json_path, save_env_json  # noqa: E402
+from robotdog.policy import env_json_path, observation_dim, save_env_json  # noqa: E402
 from robotdog.tools import console  # noqa: E402
 from robotdog.training import (  # noqa: E402
     RunDir,
     build_ppo,
     make_vec_env,
     restore_vecnormalize,
+    restore_vecnormalize_compat,
     save_vecnormalize,
+    set_parameters_compat,
 )
 
 #: 只打印进度，不训练的最小步数（避免把 0 步的配置跑成死循环）。
@@ -239,12 +241,33 @@ class Trainer:
             target_kl=self.ppo.get("target_kl", 0.03),
             log_std_init=float(self.ppo.get("log_std_init", -2.0)),
             net_arch=arch,
+            # 非对称 AC：观测里有特权块时 actor 只看 actor 维（critic 看全量）。
+            # 默认 cfg 没有特权块 ⇒ None ⇒ 仍是 MlpPolicy，与历史逐位一致。
+            actor_obs_index=(self.cfg.obs.actor_index
+                             if self.cfg.obs.privileged_frame_size > 0 else None),
             tensorboard_log=tensorboard_log,
             device=str(self.ppo.get("device", "cpu")),
         )
         if warm_start:
-            model.set_parameters(str(warm_start))
-            print(f"    [warm-start] 从 {Path(warm_start).name} 继承权重", flush=True)
+            # 观测维变了（对称 AC 53 维 → 非对称 AC 57 维）时必须走兼容迁移：
+            # actor 维不变、原样搬；critic 首层左侧旧列搬、新增特权列补零
+            # （初始 value 与旧权重逐位相同，新输入的影响由训练学）。
+            # 正常同维时行为与旧实现完全一致。
+            new_dim = int(venv.observation_space.shape[0])
+            old_dim = observation_dim(warm_start)
+            if old_dim is not None and int(old_dim) != new_dim:
+                note = set_parameters_compat(
+                    model, warm_start, old_obs_dim=int(old_dim),
+                    new_obs_dim=new_dim,
+                    actor_index=(self.cfg.obs.actor_index
+                                 if self.cfg.obs.privileged_frame_size > 0 else None))
+                print(f"    [warm-start] 兼容迁移 {Path(warm_start).name}："
+                      f"观测 {note} 维（actor 不变，critic 首层补零）",
+                      flush=True)
+            else:
+                model.set_parameters(str(warm_start))
+                print(f"    [warm-start] 从 {Path(warm_start).name} 继承权重",
+                      flush=True)
             # ⭐ 观测归一化统计必须跟权重一起过来，否则 warm-start 是**假的**：
             #    新建的 venv 里 VecNormalize 是全 0/1 的初始统计，而权重是在
             #    **归一化之后**的观测上训出来的 ⇒ 前几十万步全花在重新适应输入
@@ -254,7 +277,13 @@ class Trainer:
             if warm_norm != "off":
                 npath = warm_norm_path(warm_start)
                 if npath.is_file():
-                    ok = restore_vecnormalize(venv, npath) is not None
+                    if old_dim is not None and int(old_dim) != new_dim:
+                        ok = restore_vecnormalize_compat(
+                            venv, npath, old_obs_dim=int(old_dim),
+                            new_obs_dim=new_dim,
+                            actor_index=self.cfg.obs.actor_index) is not None
+                    else:
+                        ok = restore_vecnormalize(venv, npath) is not None
                     print(f"    [warm-start] {'装回' if ok else '⚠ 装不回'}"
                           f"观测统计 {npath.name}", flush=True)
                 elif warm_norm == "on":
@@ -361,6 +390,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[运行] {rundir.root}  (seed={run['seed']}, n_envs={n_envs})")
     print(f"[观测] 每帧 {cfg.obs.frame_size} 维 × history {cfg.obs.history_len} "
           f"= {cfg.obs.size} 维")
+    if cfg.obs.privileged_frame_size > 0:
+        # 非对称 AC：actor 的输入维数不含特权块（足端-地形接触只给 critic）。
+        print(f"[观测] 非对称 AC: actor {cfg.obs.actor_size} 维 / critic "
+              f"{cfg.obs.size} 维（critic 多 "
+              f"{cfg.obs.privileged_frame_size * cfg.obs.history_len} 维特权：足端-地形接触）")
     if cfg.action_mode == "gait_params":
         print(f"[动作] gait_params 模式（12 维步态参数：前/后对各 amp_th/amp_ca/"
               f"off_th/off_ca/hip_amp/hip_off → sin 结构 + trot 相位）"

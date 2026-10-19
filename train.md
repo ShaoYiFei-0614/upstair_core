@@ -1288,3 +1288,204 @@ ctl=B，平地 R4 组 ctl=A）。**本轮还多做了一步**：抽帧目录从 
 正确口径是 `.tmp/eval_bigbudget/`（`--episode-length-s 40`），结论见上面「踏面泛化」一节
 与 `experience.md` §23.48。
 
+---
+
+## asym_ac — 非对称 actor-critic（critic 特权接触观测）架构落地（2026-10-18，**[冒烟]**）
+
+**改动**：新增 `robotdog/asymmetric.py`；`ObsConfig.privileged_foot_contact`（每帧末尾
+4 维足端-地形接触，**仅 critic**）；`build_ppo(actor_obs_index=...)` / `load_policy` 接线；
+配置键 `env.obs.privileged_foot_contact`（默认 false）。变更简报 `.tmp/change_asym_ac.md`，
+diff `.tmp/change_asym_ac.diff`。
+
+**门禁**：G1 compileall OK；G2 `eq_check` 三场景 450 步与补丁前基线
+（`.tmp/eq_pre_asym.json`）**reward_terms 逐位 0 差异**；单测 `tests.test_env_contract` +
+`tests.test_asymmetric` **28 条 OK**（13 env_contract + 15 asymmetric，含 `WarmStartCompatTest`/`WarmStartFailFastTest`）；G4 探针（`.tmp/probe_asym.py`，固定种子/动作）
+特权开/关 reward 逐位一致、actor 切片与关闭时逐位一致、接触图样 47 种、TOTAL_MISMATCH=0。
+
+**[冒烟]** `smoke_asym_ac_1`：`.tmp/smoke_asym.yaml`（config.yaml + 每级 2000 步 +
+privileged 开），9 级 × 2000 = 18,000 步、43.7s、exit 0；`[课程] >>>/<<<` 齐全、
+`plan.json`/`summary.json`/`<stage>_final.zip` 齐全；训练启动打印「非对称 AC:
+actor 53 维 / critic 57 维」；冒烟成功率 0%（预算 2000 步，仅验链路）。
+**加载验证**：`load_policy(runs/smoke_asym_ac_1/model_final.zip)` →
+`AsymmetricActorCriticPolicy`、obs dim 57、arch `(512,256,128)`、actor 首层 in=53 /
+critic in=57、`predict` 正常（(12,)）。
+
+**结论**：架构与链路可用，默认关闭时与对称 AC **逐位兼容**；**未启动正式训练**（用户未要求）。
+后续验证特权信息对价值估计的收益：单级 15cm A/B（`privileged_foot_contact` on/off，
+其余逐字段相同，3 seeds），评估口径 `--sampled-command --stage stair15`。
+
+**补测（reviewer/scenario 门禁后追加）**：V2 策略层盲走探针 `.tmp/probe_actor_blind.py`
+PASS（翻转特权 4 维 ⇒ d_action=0、d_mean=0、d_value≈1.5e-1；负对照改 actor 维
+d_action≈1.3e-3；history_len=2 同样 PASS：actor 106 / critic 114）；V3 加载/评测链路
+`runs/smoke_asym_ac_1/checkpoints/stair3_final.zip` → `观测: (57,)`、归一化指对该 ckpt、
+`predict` (12,) finite、`play.py --mode eval --stage stair3 --sampled-command` exit 0
+（3 回合；0% 成功率属 2000 步权重，不作能力结论）。
+
+**未覆盖**：正式训练 / 能力评估 / 视觉评审（用户未要求，冒烟权重仅 2000 步/级）；
+**产物**：`runs/smoke_asym_ac_1/`（9 级 checkpoint + plan/summary + model_final）。
+
+---
+
+## asym15 — critic 特权接触 vs crawl24 的单级 15cm 对照（2026-10-18 晚，**已完成**）
+
+**改动 / 对照设计**：`.tmp/asym15_config.yaml` = `.tmp/crawl24_config.yaml` 逐字段复制，
+仅两处不同（`.tmp/_cfg_parity.py`：96 个叶子键，diff=2）：
+`env.obs.privileged_foot_contact: true`（critic 多 4 维足端-地形接触）与 `run.name: asym15`。
+其余完全一致：单级 stair15、tread 0.30、1.2M 步、LR 7e-5、net_arch `[512,256,128]`、seed 0、
+save_every 50000、同组 reward_overrides、同 warm-start
+`runs/crawl23/checkpoints/stair13_5/stair13_5_850000_steps.zip`、`play.episodes_eval: 100`。
+
+**warm-start 兼容迁移**（本轮新增，`robotdog/training.py`）：53 维对称权重 → 57 维非对称配置。
+actor 权重重样搬（两边 actor 都只看 53 维）；critic 首层 (H,53)→(H,57) 左侧旧列搬、新增 4 列
+补零（初始 value 与旧权重逐位相同）；VecNormalize 观测统计按 `actor_index` 放回、新维 mean 0/var 1。
+启动前检查 `.tmp/_prelaunch_check.py` 通过（critic 首层 (512,57)、extra cols 全零、obs_rms 搬入、
+action finite）。冒烟 `.tmp/smoke_asym_ws.yaml`（512 步）日志出现「兼容迁移 … 53->57 维」+
+「装回观测统计」，exit 0（`runs/smoke_asym_ws_1`）。
+
+**reviewer（增量 round 1）**：CHANGES_REQUIRED，唯一 blocker = `restore_vecnormalize_compat`
+漏拷 `RunningMeanStd.count` ⇒ 装回的统计在第一次 reset 就被整批观测覆盖（n_envs=8 时
+8/(8+1e-4)≈100%），属 §23.34 同型「假 warm-start」，且两条 run 的 warm-start 口径不同、
+单变量对比失效。**已修**：`obs_rms.count`/`ret_rms.count` 一起从 pkl 恢复；
+`set_parameters_compat` 增加「旧权重多余键 raise」与 device 对齐；`__all__` 补三函数；
+`doc/training.md` 补跨维 warm-start 设计说明；`experience.md` 新增 §23.61；测试补 count
+持久性与负向路径。scenario 矩阵 must 项 V1/V3/V2 按序复测（结果见下）。
+
+**修复后复测**：单测 `tests.test_asymmetric` **13 条 OK**（含 count 持久性、net_arch 不匹配
+raise、actor_index 长度不匹配 raise、policy_kwargs 含 actor_obs_index）；scenario must **V3**
+`.tmp/probe_ws_equiv.py` **8/8 PASS**（raw 前 53 维逐位、归一化前 53 维逐位、action 逐位、
+value 逐位、给 critic 新列随机权重后翻特权维只动 value 不动 action、critic 新列迁移后全零、
+actor 权重逐位、obs_rms 摆放/新维 mean0 var1）；**V2** 真实配对冒烟 `runs/smoke_asym_ws_2`
+（`.tmp/smoke_asym_ws.yaml --run-name smoke_asym_ws_2 --warm-start runs/crawl23/.../
+stair13_5_850000_steps.zip`）日志齐全 + 产物齐全 + exit 0；**V6** `play.py --mode eval --run
+runs/smoke_asym_ws_2/checkpoints/flat_final.zip --stage flat --sampled-command --config
+.tmp/eval_link.yaml` 打印 `观测: (57,)`、exit 0。迁移中性对照：同一份旧 53 维权重在平地
+回放也是「摔 100%、前进 0.53m」（3 回合），与迁移后行为一致 ⇒ 平地摔倒来自策略/地形分布，
+不是迁移引入。
+
+**命令**：`$env:PYTHONUNBUFFERED="1"; .venv\Scripts\python.exe scripts/train.py --config .tmp/asym15_config.yaml --run-name asym15 --warm-start runs/crawl23/checkpoints/stair13_5/stair13_5_850000_steps.zip`
+（HEAD `d1164e3`；预估约 42 min / 1.2M 步；中止条件：崩溃/NaN/OOM）。
+
+**训练结果**：1.2M 步跑满，**35.9 min**（557 步/秒、wall 2156s），exit 0；训练滑窗
+**成功率 76.0% / 摔倒率 24.0% / 均回报 163.4 / 均步数 501.7**（crawl24 同窗口 82%/18%；
+历史记录里滑窗会低估，以回放为准）。产物：`runs/asym15/`（`checkpoints/stair15/
+stair15_<50k..1200k>_steps.zip` + `_env.json`(privileged=true) + `_vecnormalize.pkl`，
+`stair15_final.zip`、`model_final.zip`、`plan.json`/`summary.json`；summary 里 `obs_size=57`）。
+
+**回放实测**（100 回合，`play.py --mode eval --stage stair15 --sampled-command
+--config .tmp/asym15_config.yaml`；与 crawl24 同口径）：
+
+| 指标 | asym15 900k | crawl24 900k | asym15 final | crawl24 final |
+| --- | --- | --- | --- | --- |
+| 成功率 | **80.0%** | **96.0%** | **90.0%** | **91.0%** |
+| 摔倒率 | 20.0% | 4.0% | 10.0% | 9.0% |
+| 平均前进 | 2.78 m | 2.90 m | 2.83 m | 2.83 m |
+| 平均爬升 | 1.10 m | 1.14 m | 1.11 m | 1.12 m |
+| 平均速度 | 0.30 m/s | 0.29 m/s | 0.31 m/s | 0.32 m/s |
+| 平均步数 | 473 | 507 | 456 | 453 |
+| 成功回合登级均 | 7.76/8 | 7.72/8 | 7.90/8 | —（历史 log 未记） |
+
+**解读（n=1，描述性，不作能力带）**：① **final 两条 run 在同一水平**（90.0% vs 91.0%，
+100 回合的二项噪声 ~±3–4 点）；② **900k 那一份 asym15 明显更低**（80.0% vs 96.0%）——
+说明这次特权 critic 的**收敛轨迹更抖**，末段才追平，而不是「更强」；③ 训练滑窗也同向
+（76% vs 82%）。⇒ **本轮没有观察到「critic 多吃 4 维接触」带来收益**；这符合预期下限
+（特权信息只在 critic 侧、且新 4 维 mean0/var1 近乎未标准化，critic 实际吃的是 raw 0/1，
+见下）。要判「有效/无效」需 3 seeds × 同口径（约 2h），不属于本轮。
+
+**视觉评审**（stair15、`--video-scale 1`、两臂各自 fresh 盲评、n=1）：
+
+- 素材：asym15 final `runs/asym15/videos/asym15/stair15_15cm/stair15_15cm.mp4`（217 帧/8.68s）；
+  crawl24 final `runs/crawl24/videos/crawl24/stair15_15cm/stair15_15cm.mp4`（200 帧/8.00s）；
+  粗切片 `scripts/frames.py ... --coarse 12`，细看窗口 `--window` 25 fps 摊开。
+- **首轮粗切片（每臂 fresh monitor、各 6 图）**：两段画面**观感几乎一致** —— 均成功登顶
+  （HUD 8/8 级、前进 +2.92m、0.34–0.36 m/s），均为「低伏、头颈前探、四肢大幅伸展」的
+  探步/爬行形态而非清晰对角小跑；均判「通过（带可疑项）」并请求细看顶沿过渡与起步步态。
+  两臂之间**没有肉眼可辨的差异**（首轮分数 17.5/25 与 7.0/10，量纲不同不可直接比）。
+- **第二轮细看**（顶沿 t≈6.6–7.4s、步态窗口 t≈1.2–2.0s；fresh monitor、每窗连续帧）：
+  asym15 final —— 顶沿过渡「平稳平移上台，未见压唇口/穿模」，起步「前足落在踏面上缘、
+  不是贴立面蹭；姿态偏低、起伏小、伸展够台阶，更像慢速攀爬而非弹性小跑」；
+  置信度 中/低-中（768px 下 <2cm 悬空不可辨）。
+- **第二轮细看（crawl24，monitor fea11ac2，后补返回）**：顶沿过渡「腹底与棱线间有缝、
+  未见压唇口/穿模；前足落在踏面内侧、踩实不悬空；俯仰平滑无跳变；后腿有蹬撑」；
+  步态「13 帧内无高抬跨立面，是低弧前伸够踏的爬行式；后足无明显拖行/勾棱；摆动相几乎
+  不可辨」⇒ 与 asym15 的细看结论一致。
+
+**视觉总结**：两臂都是「低幅伸展、够踏式爬行（crawl）」而非小跑；顶沿过渡平稳、无穿模
+与压唇口；两臂之间**没有肉眼可辨的差异**——与数值结论（final 90.0% vs 91.0%，噪声内）
+一致。视觉评审为 n=1、每窗 0.5s/13 帧，摆动相与节奏类结论不具统计意义。
+- **视觉结论**：两臂都成功登顶、观感形态同类（低伏+伸展够台阶的爬行式上楼），
+  没有肉眼可辨的「哪一臂更好」——与数值结论一致（final 90.0% vs 91.0%，差异在噪声内）。
+
+---
+
+## asym 复刻 — 从零九级 + 延伸链（critic 特权接触）vs upstairs_v1 / crawl21–24（2026-10-19，**已完成**）
+
+**设计**：唯一变量 = `env.obs.privileged_foot_contact: true`（critic 多 4 维足端-地形接触，
+actor 仍 53 维）。两条路线都与对照组同配方、同预算、seed 0：
+- **从零九级**：`runs/asym_upstairs`（= upstairs_v1 的九级课程，7.45M 步，从无到有）；
+- **延伸链**：10.5 → 12 → 13.5 → 15cm，各 1.2M 步（lr 9e-5/8e-5/7e-5/7e-5）。
+  10.5cm 的第一段在原 campaign 被 kill 前跑到 968k，之后用 950k 检查点补 250k 尾巴
+  （`runs/asym10_5_tail`）；再自建链 warm-start 到 12/13.5/15cm。
+
+**命令**：`.tmp/run_asym_chain_resume.py`（可重复执行、按 `state.json` 跳过已完成；
+每级训练后自动 100 回合 `--sampled-command` 回放）；配置 `.tmp/asym_chain/asym*.yaml`；
+日志与 eval 在 `.tmp/asym_chain/{campaign_resume.log,train_*.log,eval_*.log}`。
+
+### 训练成本（实测）
+
+| 阶段 | 步数 | wall time | 回合 | 训练滑窗成功率 | 100 回合回放 |
+| --- | --- | --- | --- | --- | --- |
+| Phase1 九级（从零） | 7.45M | **217.4 min** | 13,105 | 2 / 88 / 100 / 96 / **0** / 86 / 100 / 100 / 92 % | 3cm **0%**、9cm 90% |
+| 10.5cm（968k 断点 + 250k 尾巴） | 1.218M | 29 + 6.9 min | — | 断点 96% → 尾巴 **86%** | **89%**（摔 11%） |
+| 12cm | 1.2M | 31.0 min | 2,710 | **48%** | **78%**（摔 22%） |
+| 13.5cm | 1.2M | 45.0 min | 2,735 | 68% | **85%**（摔 15%） |
+| 15cm | 1.2M | 32.5 min | 2,681 | 66% | **81%**（摔 18%，超时 1%） |
+| **合计（从零到 15cm）** | **≈12.27M** | **≈361.8 min（6h02m）** | — | — | — |
+
+对照：upstairs_v1 193.5 min（7.45M）+ crawl21–24 64.2/59.3/55.0/42.1 min（4.8M）
+= **414.1 min（6h54m）/ 12.25M 步**。本轮 Phase1 **+12%**（217.4 vs 193.5），延伸链因中途 kill
+多算了 29 min 仍比对照快（144.4 vs 220.6 min）——**吞吐口径受机器负载影响，不能当结论**：
+本轮 565 步/秒 vs 对照 493 步/秒（crawl21 单级一度只有 ~311 步/秒）。
+
+### 成功率（100 回合回放，`--sampled-command`，与 crawl21–24 同口径）
+
+| 高度 | **asym（privileged）** | crawl 对照 | Δ |
+| --- | --- | --- | --- |
+| 10.5cm | **89.0%**（摔 11%） | 98.0%（摔 4%） | **−9.0** |
+| 12cm | **78.0%**（摔 22%） | 82.0% | **−4.0** |
+| 13.5cm | **85.0%**（摔 15%） | 88.0%（850k） | **−3.0** |
+| 15cm（阶梯） | **81.0%**（摔 18%） | 96.0%（900k）/ 91.0%（final） | **−15.0 / −10.0** |
+| 15cm（单级，从 crawl23 warm） | 90.0% | 91.0% | −1.0 |
+
+训练滑窗对照（同口径）：九级 3/4.5/6/7.5/9cm = asym `0/86/100/100/92` vs upstream `96/90/74/92/98`；
+延伸链 10.5/12/13.5/15cm = asym `86(尾巴)/48/68/66` vs crawl `96/84/68/82`。
+
+### 爬升速度（回放：平均爬升 ÷ (平均步数×0.02s)，含失败回合）
+
+| 高度 | asym | crawl | Δ |
+| --- | --- | --- | --- |
+| 10.5cm | 0.77m / 8.76s = **0.088 m/s** | 0.79m / 8.26s = 0.096 m/s | −8% |
+| 12cm | 0.84m / 9.78s = **0.086 m/s** | 0.91m / 8.40s = 0.108 m/s | −20% |
+| 13.5cm | 0.94m / 9.20s = **0.102 m/s** | 0.99m / 10.36s = 0.096 m/s | +6% |
+| 15cm | 1.04m / 9.16s = **0.114 m/s** | 1.14m / 10.14s = 0.112 m/s | +2% |
+
+### 结论（n=1，描述性，不作能力带）
+
+1. **从零九级**：滑窗大体相当，但 `stair3` 出现一次**单级崩溃**（滑窗 0%、回放 0%，摔 78%），
+   之后 4.5cm 自愈到 86%，6/7.5cm 反超对照（100/100 vs 74/92）、9cm 略低（92 vs 98）。
+2. **延伸链（真正接近部署的高台阶）**：滑窗 12cm 明显更低（48 vs 84），15cm 也低（66 vs 82）；
+   **100 回合回放四级全部低于对照（−3 ~ −15 点）**。
+3. **爬升速度**：低台阶（10.5/12cm）更慢，高台阶（13.5/15cm）持平/略快。
+4. **10.5cm 训练不稳定**：同一权重在 950k 回放 98%，补 250k 尾巴后掉到 89%（尾巴滑窗 86%）——
+   不是评测噪声量级，属训练震荡；若只看一级结果，950k 更好。
+5. **阶梯 15cm（81%）反而低于单级 15cm（90%）**：越长的链，特权 critic 的“逐级衰减”越明显
+   （或 RNG 累积）。
+
+⇒ **没有观察到 critic 特权接触带来的收益；延伸链上呈现一致的负向趋势（4/4 回放偏低）**。
+但这是 **1 个 seed**、每条 run 只跑一次：既不能排除“特权 critic 真的有害”，也不能排除
+“这次 seed 恰好在高台阶上走差了”。要下判决，最小实验是 **12cm 与 15cm 各补 2 个 seed**
+（privileged 与对照各 2×~35min，约 2.5h），看 Δ 是否稳定为负。
+
+**产物**：`runs/asym_upstairs/`、`runs/asym10_5/`（断点）、`runs/asym10_5_tail/`、
+`runs/asym12/`、`runs/asym13_5/`、`runs/asym15_ladder/`（各含 final + summary + 周期 ckpt）；
+日志 `.tmp/asym_chain/*.log`；脚本 `.tmp/run_asym_chain.py` / `.tmp/run_asym_chain_resume.py`。
+

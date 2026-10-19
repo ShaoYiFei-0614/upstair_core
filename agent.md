@@ -147,16 +147,16 @@
 ## 8. 视觉评审闭环（主代理 × 监视器子代理）
 
 > 操作细节（抽帧命令、评审 prompt 模板、rubric 全文）在
-> `.claude/skills/visual-monitor/SKILL.md`，本节只定规程。
+> `.dsh/skills/visual-monitor/SKILL.md` 与 `scripts/frames.py`，本节只定规程。
 
 **分工**：主代理改代码/配置、跑训练、渲染视频；**逐帧看片派给子代理**
-（Agent 工具，general-purpose）——看图吃上下文，逐帧读图的工作不要占主代理
-的窗口。监视器**只读**：不改代码、不写文档、不跑训练，它的产出只有一份
-结构化评审。
+（DSH 的 `subagent` 工具，fresh context）——看图吃上下文，逐帧读图的工作
+不要占主代理的窗口。监视器**只读**：不改代码、不写文档、不跑训练，它的产出
+只有一份结构化评审。
 
-**流程**：训练结束（或停止）→ `play.py --mode video` 渲染 →
-`read_video.py` 抽帧（≤16 帧/视频）→ 派监视器按 rubric 盲评 → 主代理回收
-结论落账。可疑时间点用 `--start/--end` 加密抽帧再评一轮。
+**流程**：训练结束（或停止）→ `play.py --mode video --video-scale 1` 渲染 →
+`scripts/frames.py --coarse 12` 粗切片（≤2 张拼图）→ 派监视器评整体（姿态 / 步态 /
+结局 / 指令跟踪）→ 第一轮写「需要细看」时才 `--window` 按 25 fps 摊开 0.4~1.0 s 窗口再评 → 回收落账。
 
 **四条纪律**：
 

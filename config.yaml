@@ -182,6 +182,7 @@ env:
   #   base_frame_size 42 = joint_pos 12 + joint_vel 12 + rpy 3 + ang_vel 3 + last_traj 12
   #   + 结构固定块 6（机身系线速度 3 + 三轴指令 3）
   #   + gait_phase 2 + step_height 1 + vel_filter 2 [+ gait_cmd 2]
+  #   [+ privileged_foot_contact 4：仅 critic，不计入 actor 输入]
   # 当前配置（gait_cmd=false）= 53 维；gait_cmd 打开 = 55 维；history_len=1 ⇒
   # 整帧就是这两个数（历史上这里写的 51/55 都算错过）。
   # 每一项都有真机出处（编码器 / IMU / 上一步动作 / 本体感觉估计 / 上层指令），
@@ -209,6 +210,12 @@ env:
     # 权重迁移方式重新引入)。gait_freq/swing band 字段保留(obs 关闭时
     # _sample_gait_cmd 仍采样但只喂先验生成,不进观测)。
     gait_cmd: false
+    # 4 维**只给 critic** 的足端-地形接触（逐足 0/1）—— 非对称 actor-critic 的
+    # 特权块。actor 绝不允许看到它（盲走契约不变；见 doc/env.md 的信息来源清单与
+    # experience.md §11 的信息源审计）：打开后每帧 +4 维、critic 输入 +4，但 actor
+    # 网络输入维数**不变**（robotdog/asymmetric.py 负责切分）。关闭（默认）= 与
+    # 历史 checkpoint 逐位一致的对称 AC。
+    privileged_foot_contact: false
     # 历史帧数。实测 1 帧**不亏**：课程内每一级都不差、3cm/6cm 还更好
     # （92% vs 62%、22% vs 0%），课程外 3/5cm 都是 100%。50 Hz 下相邻帧几乎
     # 相同，10 帧绝大部分是冗余（10 帧 = 500 维）。
