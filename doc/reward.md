@@ -108,6 +108,34 @@
   的 1/10）；`yaw_zero_gain` 从硬编码提为字段（公式显式化，当前值不变）。
   两者都待下一轮训练验证。
 
+## 足底触觉相位条件策略（TactileStep，2026-10-20）
+
+数据面在 `robotdog/tactile.py`（测量 + 四相位机，设计见 `doc/tactile.md`）；本节只讲
+`compute_reward` 第 11 段的结算。**三个权重默认全 0，且三项都为 0 时整段跳过** ——
+不产生键、不产生计算，逐步奖励与旧实现逐位一致（`tests/test_tactile.py` 钉住）。
+
+| 项 | 门控 | 逐足公式（再对 4 足取 mean） | 默认 |
+| --- | --- | --- | --- |
+| `tactile_prelanding` | `phase==PRELANDING` | `w·clip(−vz/prelanding_vz_ref, 0, 1)²` | `0.0` |
+| `tactile_impact` | `phase==LANDING` | `w·[clip(F̄/impact_force_ref,0,2) + clip(\|ΔF̄\|/impact_delta_ref,0,2) + clip(peak/impact_peak_ref,0,2)]` | `0.0` |
+| `tactile_stance` | `phase==STANCE` | `w·[clip(Ā/stance_area_target,0,1) + margin − clip(cop_jump/stance_cop_jump_ref,0,1)]` | `0.0` |
+
+量纲与有界性（便于配权重时估量级）：
+
+- `tactile_prelanding ∈ [w, 0]`（w 为负；平方项在 `−vz ≥ prelanding_vz_ref` 时饱和）；
+- `tactile_impact ∈ [6w, 0]`（三个分量各在 [0,2]，mean 不放大）；
+- `tactile_stance ∈ [0, 2w]`（`area+margin−jump` 每足 ∈ [−1, 2]）；
+- 三项都**逐控制步**结算，按四足 mean（不是 sum）—— 与 `air_time`/`foot_lift` 同口径，
+  避免「脚数多就分多」的偏差。
+
+参考量级来自论文与本仓探针：`F̄` 峰值 ≈0.8 体重（6cm 台阶、站立/小步），`Ā` 峰值 ≈0.16
+（足底面积占比），所以默认把 impact 参考取 3.0 体重、stance 目标取 0.60 —— 训练初期
+这些项应当**接近 0/小正**，一旦频繁打满说明阈值离当前行为太远（先标定再开大）。
+
+⚠ 与既有 contact 组（`foot_scuff`/`foot_impact`/`load_share`/`com_margin`）不要同时开同类项：
+那四项按「接触事件」直接罚/奖（已否决、默认关），本组按「相位」结构化结算，同时开会
+重复惩罚同一物理事件。
+
 ## 奖励账目恒等式
 
 `compute_reward` 返回的 `terms` 每项已乘权重，`sum(terms.values())` 即未加终止奖励

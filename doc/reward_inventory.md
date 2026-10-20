@@ -41,6 +41,9 @@
 | 接触组（默认关） | `foot_impact` | 0 | **0** | — | 关（已否决） | R2；需 contact_rewards=true 才结算 |
 | 接触组（默认关） | `foot_scuff` | 0 | **0** | — | 关（已否决） | R1；需 contact_rewards=true 才结算 |
 | 接触组（默认关） | `load_share` | 0 | **0** | — | 关（已否决） | R3；需 contact_rewards=true 才结算 |
+| 触觉相位组（默认关） | `tactile_prelanding` | 0 | **0** | — | 新（2026-10-20） | PreLanding 向下速度惩罚；需 env.tactile.enabled=true 才能配 |
+| 触觉相位组（默认关） | `tactile_impact` | 0 | **0** | — | 新（2026-10-20） | Landing 冲击（力/力变化/峰值）；同上 |
+| 触觉相位组（默认关） | `tactile_stance` | 0 | **0** | — | 新（2026-10-20） | Stance 支撑质量（面积+CoP 裕度−跳变）；同上 |
 
 > **代码默认不是当前配置**：config 覆盖了上表中 5 个字段的取值。引用权重时必须用 config.yaml（或 `runs/<run>/plan.json` 的逐级覆盖），不要用 `RewardConfig()` 的默认值。
 

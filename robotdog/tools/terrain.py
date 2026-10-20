@@ -193,8 +193,12 @@ class StairSpec:
             )
         return "\n".join(out)
 
-    def height_at(self, x: float) -> float:
-        """世界坐标 x 处的解析地形高度 [m]（楼梯之外为 0）。"""
+    def height_at(self, x: float, y: float = 0.0) -> float:
+        """世界坐标 ``(x, y)`` 处的解析地形高度 [m]（楼梯之外为 0）。
+
+        ``y`` 只给有二维高度场的子类用（``robotdog/tools/rough.py``）；普通楼梯
+        的剖面只依赖 ``x``，传什么都一样 —— 参数放在这里是为了统一接口。
+        """
         if x < self.start_x:
             return 0.0
         if x < self.up_end_x:
@@ -251,6 +255,8 @@ def demo_stairs_spec(
 
 def build_terrain_xml(spec: StairSpec) -> str:
     """要注入 ``<worldbody>`` 的 MJCF 片段。"""
-    if spec.n_up == 0 and spec.n_down == 0:
+    # 判据用「有没有几何块」而不是「有没有台阶」：粗糙地面（n_up=n_down=0）
+    # 也走这条路注入方块（robotdog/tools/rough.py）。
+    if not spec.step_blocks():
         return ""
     return "\n" + spec.to_xml()

@@ -45,7 +45,8 @@
 ## `config_to_env` / `config_to_stages`
 
 - `config_to_env`：写 `env:` + `reward:` 两段进 dataclass，重建嵌套的
-  `command`（含当前值）与 `obs`，加载步态先验文件。`env.n_envs` 与
+  `command`（含当前值）、`obs` 与 `tactile`（足底触觉参数，见 `doc/tactile.md`），
+  加载步态先验文件。`env.n_envs` 与
   `env.vec_env` 是运行参数，先 pop 掉再校验，不属于 `EnvConfig`。
   **gait_amp_scale 只缩幅值**
   （保留步频），缩完过一遍 `normalize()`。

@@ -1925,3 +1925,56 @@ hi18@18 0.171、@20 0.161；hi195@18 0.173、@20 0.187 m/s；本级回放 0.157 
 `.tmp/hi_chain/{base_crawl24,eval_hi165,eval_hi18,eval_hi195}_stair*.log`；汇总表
 `.tmp/hi_chain/table.md`；评估配置 `.tmp/eval_hi.yaml`（18/20/22/24cm）与
 `.tmp/eval_trained.yaml`（16.5/18/19.5cm）。
+
+---
+
+## tactile_est — GRU 足底触觉估计器：三维力/接触可估，面积与绝对 CoP 不可估（2026-10-20，**已完成**）
+
+**目标**：从 53 维本体感觉估计触觉量（`robotdog/tactile.py` 的 `force_vec`/`contact`/
+`area_norm`/`cop_norm`），在**高台阶（16.5/18cm）**与**2–5cm 随机粗糙地面（留出种子）**上验证。
+模型/数据/复现见 `doc/tactile_estimator.md`。
+
+**数据**（`scripts/collect_tactile_data.py`，8 个 npz、~49k 步）：train = 平地/15cm 楼梯/rough
+seed0（两策略），test = **16.5cm**（hi165）、**18cm**（hi18）、**rough seed1/seed2**。
+
+**最终模型**：单层 GRU（window 20、hidden 128、40 epochs、stride 2）；验证集（按回合切 10%）
+力 RMSE **18.9 N（0.127 体重）**、MAE 9.1 N、接触 acc 0.987 / F1 0.979、val_area R² 0.41、
+val_cop R² 0.95（`.tmp/tactile_estimator/estimator_final.json`）。⚠ 历史对照（均非交付）：
+20.7 N/0.139 是 `rough.py` 改版前 collection-1 的 `estimator.pt`；24.8 N/0.166 是「数据重采后、
+训练侧修复前」的上一版。**本条目所有数字都由当前代码重跑**（`_collect3.log` → `_train_final2.log`
+→ `_eval_final4.log`，表内数值取自 `report_final.json`）。
+
+**留出地形结果**（逐地形表与分轴表都由 `scripts/eval_tactile_estimator.py` 产出，分轴写 `.axes.txt`；数字见 `.tmp/tactile_estimator/report_final.json`）：
+
+| 地形 | 力 RMSE | MAE | p95 | R² | 接触 acc | F1 | 面积 R² | CoP R² |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 16.5cm 楼梯 | 29.8 N (0.200 BW) | 18.7 N | 58.7 N | 0.571 | 0.921 | 0.897 | **−0.96** | 0.82 |
+| 18cm 楼梯 | 27.9 N (0.187 BW) | 18.1 N | 55.9 N | 0.559 | 0.931 | 0.908 | **−0.70** | 0.80 |
+| rough seed1 | 25.3 N (0.169 BW) | 11.7 N | 40.0 N | 0.793 | 0.980 | 0.967 | +0.03 | 0.92 |
+| rough seed2 | 24.0 N (0.161 BW) | 11.8 N | 40.7 N | 0.807 | 0.983 | 0.971 | +0.04 | 0.93 |
+
+分轴（留出集 RMSE/R²）：16.5cm x 25.5/0.41、y 16.2/0.48、z 41.9/0.53；18cm x 24.5/0.26、
+y 14.9/0.54、z 38.9/0.53；rough_s1 x 24.6/0.52、y 14.7/0.74、z 33.1/0.82；rough_s2
+x 22.5/0.56、y 14.6/0.73、z 31.8/0.83。**只算接触足**：16.5cm RMSE 38.1 / MAE 23.1 / p95 74.5 N；
+18cm 34.1 / 21.7 / 69.0；rough_s1 42.4 / 21.6 / 71.1；rough_s2 39.6 / 21.9 / 73.5。
+
+**消融**（window 30 / hidden 192 / 80 epochs，用 collection-1 数据、未在修复后重跑 ⇒ 只作方向参考）：
+训练地形更好（平地 12.3 N、15cm 14.6 N），留出 16.5cm 29.8 N、接触 acc 0.934 —— 与交付
+（29.8 N、0.921）相当 ⇒ **更大窗口/网络没有收益**，不采纳（按留出 16.5cm 选型，存在选择偏差）。
+
+**明确不估计/不建议用**：① 接触面积（楼梯 R² 负：棱边-踏面接合方式在观测里不可见；
+球足点接触）；② CoP 绝对数值（目标近似常数：站立 `cop_norm≈(−0.73,±0.25)`、margin 0.275，
+高 R² 只是回归常数；用 `cop_jump`/相对变化）；③ 水平分量弱（x/y R² 0.24–0.46 vs z 0.59–0.75，
+切向力依赖摩擦/滑动，观测无直接量）；④ 落地冲击峰值误差最大（|F| 到 1.8 kN），提示用
+「接触概率+差分」而非力阈值。
+
+**门禁**：新增/补充 27 条测试（`tests/test_rough_terrain.py` 11 + `tests/test_tactile_estimator.py` 15
++ `tests/test_tactile.py::ForceVectorTest` 1）；默认 tactile 关 ⇒ `eq_check` 三场景 450 步对基线
+`.tmp/eq_pre_asym.json` **0 差异**（`.tmp/eq_tactile_gate.json`）；全量
+`unittest discover -s tests` ⇒ **101 tests OK / 3 skipped**（日志 `.tmp/_unit_all4.log`）。
+`scripts/eval_tactile_estimator.py` 重跑产出 `report_final.md/.json/.axes.txt`（日志
+`.tmp/_eval_final4.log`），**本文表内数字直接取自该 `report_final.json`**（修复后重跑，与产物一致）。
+
+**产物**：`.tmp/tactile_estimator/`（`report_final.md`/`.json`、`report_final.axes.txt`、
+`estimator_final.pt`/`.json`、`data/*.npz`、`data/collection_summary.json`、`estimator_v2.pt` 消融）；
+日志 `.tmp/_collect3.log`/`_train_final2.log`/`_eval_final4.log`/`_unit_all4.log`。

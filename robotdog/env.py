@@ -1,9 +1,17 @@
 """Gymnasium 环境：Unitree Go2 盲走上箱式楼梯。
 
-**盲走（blind locomotion）**：本模块中没有任何触觉传感器、没有射线投射，
-也没有任何接触力读取。策略只能看到本体感知——关节角/角速度、机身姿态与角速度、
-上一步动作——外加一个标量，告诉它被放上去的那条楼梯有多高。它必须仅凭这些
-发现迈步的节奏。
+**历史：盲走（blind locomotion）**。到 2026-10-19 为止，本模块里没有任何触觉
+传感器、没有射线投射、也没有接触力进观测；策略只能看到本体感知（关节角/角速度、
+机身姿态与角速度、上一步动作）外加楼梯高度标量。
+
+**2026-10-20 起：逐步增加接触信息**（用户指令，正向评估接触信息的作用）。第一步
+落地 TactileStep（arXiv:2609.28959）的测量层：``robotdog/tactile.py`` 提供每足
+法向合力 F̄、接触面积 Ā、压力中心 CoP 与四相位状态机（SWING/PRELANDING/LANDING/
+STANCE），并有三个相位条件奖励（``reward.py`` 的 tactile_prelanding /
+tactile_impact / tactile_stance）。**默认全部关闭**：``EnvConfig.tactile.enabled``
+为 False 时不测量、不进 info、不进观测、奖励逐位不变；打开后可用
+``ObsConfig.tactile``（actor 16 维）或 ``ObsConfig.privileged_tactile``（仅 critic）
+接入策略。设计见 ``doc/tactile.md``。
 
 * **Action** -- 12 个关节目标角（``FL_hip .. RR_calf``）。
 * **Observation** -- ``ObsConfig``：每帧 42 个本体感知量（关节位置/速度、机身
@@ -49,6 +57,8 @@ from robotdog.go2_model import (
     quat_to_mat,
     quat_to_rpy,
 )
+from robotdog.tactile import TactileConfig, TactileSensor, TactileState
+
 from robotdog.tools.terrain import StairSpec, build_terrain_xml
 
 # --------------------------------------------------------------------------- #
@@ -81,6 +91,12 @@ class ObsConfig:
     # 但 actor 的网络输入维数不变（= actor_frame_size × history_len）。
     # 动机：critic 用仿真器真值降低价值估计方差，actor 保持盲走（doc/env.md）。
     privileged_foot_contact: bool = False
+    # 16：逐足触觉特征 [F̄, Ā, CoPx, CoPy]（TactileStep，``robotdog/tactile.py``）。
+    # **actor 可见**（真机 = 压力鞋垫，不是地形真值）。打开前必须先开
+    # ``EnvConfig.tactile.enabled``，否则构造期报错（见 Go2StairsEnv.__init__）。
+    tactile: bool = False
+    # 16：同一份触觉特征**只给 critic**（非对称 AC）——用于「接触信息该给谁」的消融。
+    privileged_tactile: bool = False
     base_frame_size: int = 42
 
     def __post_init__(self) -> None:
@@ -101,13 +117,16 @@ class ObsConfig:
         extra += 1 if self.step_height else 0
         extra += 2 if self.vel_filter else 0
         extra += 2 if self.gait_cmd else 0
+        extra += 16 if self.tactile else 0
         extra += 4 if self.privileged_foot_contact else 0
+        extra += 16 if self.privileged_tactile else 0
         return self.base_frame_size + extra
 
     @property
     def privileged_frame_size(self) -> int:
-        """每帧**只给 critic** 的特权维数（足端-地形接触 4 维；关时为 0）。"""
-        return 4 if self.privileged_foot_contact else 0
+        """每帧**只给 critic** 的特权维数（足端接触 4 + 特权触觉 16；关时为 0）。"""
+        return ((4 if self.privileged_foot_contact else 0)
+                + (16 if self.privileged_tactile else 0))
 
     @property
     def actor_frame_size(self) -> int:
@@ -330,6 +349,12 @@ class EnvConfig:
     # 只影响观测的 vel_filter 块与奖励的偏航跟踪项，不影响物理。
     yaw_rate_mode: str = "legacy"
 
+    # --- 足底触觉（TactileStep，2026-10-20） -------------------------------- #
+    # 默认 ``enabled=False``：不测量、不进 info、不进观测、奖励逐位不变。
+    # 打开后每控制步多一次接触遍历（与 ``needs_foot_force`` 同一批接触对），
+    # 并由 ``robotdog/tactile.py`` 维护 F̄/Ā/CoP 与四相位状态机。
+    tactile: TactileConfig = field(default_factory=TactileConfig)
+
     # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
@@ -348,6 +373,8 @@ class EnvConfig:
         """
         rc = self.reward
         if rc.contact_telemetry:
+            return True
+        if self.tactile.enabled:
             return True
         return bool(rc.contact_rewards
                     and (rc.foot_scuff or rc.foot_impact
@@ -386,6 +413,7 @@ class Go2StairsEnv(gym.Env):
                 f"可选 'legacy'（旧口径，有 bug，仅用于复现）、"
                 f"'body_z'（机体系 z 分量）或 'world'（世界系偏航角速度）"
             )
+        self._validate_tactile()
         # 两种模式的动作维数都是 12：residual = 逐关节残差；gait_params =
         # 前/后对各 6 个参数（amp_th, amp_ca, off_th, off_ca, hip_amp, hip_off）。
         self.num_action = 12
@@ -463,6 +491,11 @@ class Go2StairsEnv(gym.Env):
         self._foot_fn = np.zeros(nfoot)        # 本控制步**末**的法向力 [N]
         self._foot_ft = np.zeros(nfoot)        # 同刻的切向力模长 [N]
         self._foot_fn_peak = np.zeros(nfoot)   # 本控制步内（逐物理子步）的法向力峰值
+        # 足底触觉（TactileStep，2026-10-20）：测量层 + 四相位状态机。
+        # 默认 enabled=False：step() 里连 update() 都不调用，零额外开销。
+        self._tactile_sensor = TactileSensor(self.cfg.tactile, self.model,
+                                             self.data, self.meta)
+        self._tactile = TactileState(nfoot)
         # 步态先验时钟（自回合开始起的秒数）+ gait_params 模式的步态时钟（周期数）。
         self._gait_t = 0.0
         self._gait_phase = 0.0
@@ -794,7 +827,8 @@ class Go2StairsEnv(gym.Env):
 
     @property
     def terrain_height_under_base(self) -> float:
-        return self.stair.height_at(float(self.base_pos[0]))
+        return self.stair.height_at(float(self.base_pos[0]),
+                                    float(self.base_pos[1]))
 
     @property
     def yaw(self) -> float:
@@ -835,14 +869,28 @@ class Go2StairsEnv(gym.Env):
         学到「按 ``step_height`` 抬够高」这条相关性，没有任何观测项直接等于它。
         """
         feet = self.foot_pos
-        return feet[:, 2] - self.meta.foot_radius - self._terrain_height(feet[:, 0])
+        return (feet[:, 2] - self.meta.foot_radius
+                - self._terrain_height(feet[:, 0], feet[:, 1]))
 
-    def _terrain_height(self, x: np.ndarray | float) -> np.ndarray:
-        """一个或多个世界系 x 坐标处的地形高度。"""
+    def _terrain_height(self, x: np.ndarray | float,
+                        y: np.ndarray | float | None = None) -> np.ndarray:
+        """一个或多个世界系 ``(x, y)`` 坐标处的地形高度。
+
+        ``y`` 省略时按 0 处理 —— 普通楼梯剖面不依赖 y；随机粗糙地面
+        （``has_height_profile``）必须给 y，否则拿到的是走廊中线的高度。
+        """
         arr = np.atleast_1d(np.asarray(x, dtype=float))
-        if self.stair.n_up == 0 and self.stair.n_down == 0:
+        if y is None:
+            yarr = np.zeros_like(arr)
+        else:
+            yarr = np.atleast_1d(np.asarray(y, dtype=float))
+            if yarr.size == 1 and arr.size > 1:
+                yarr = np.full_like(arr, float(yarr[0]))
+        if (self.stair.n_up == 0 and self.stair.n_down == 0
+                and not getattr(self.stair, "has_height_profile", False)):
             return np.zeros_like(arr)
-        return np.array([self.stair.height_at(float(xi)) for xi in arr])
+        return np.array([self.stair.height_at(float(xi), float(yi))
+                         for xi, yi in zip(arr, yarr)])
 
     def _obs_frame(self) -> np.ndarray:
         obs_cfg = self.cfg.obs
@@ -877,10 +925,18 @@ class Go2StairsEnv(gym.Env):
             # 与 _gait_action 生成先验用的是同一组值（马尔可夫性）。
             parts.append(np.array([float(self._gait_freq_cmd),
                                    float(self._gait_swing_cmd)]))
+        if obs_cfg.tactile:
+            # 触觉特征块（actor 可见）：逐足 [F̄, Ā, CoPx, CoPy]。真机 = 压力鞋垫；
+            # 仿真替身见 robotdog/tactile.py（不查地形真值，只有接触点与接触力）。
+            parts.append(self.tactile.actor_features())
         if obs_cfg.privileged_foot_contact:
             # 特权块（仅 critic）：足端-地形接触真值（floor + stair geom）。
             # actor 的输入维数不受影响 —— 非对称切分在 robotdog/asymmetric.py。
             parts.append(self._foot_contact_now.astype(np.float64))
+        if obs_cfg.privileged_tactile:
+            # 特权触觉块（仅 critic）：与 actor 触觉同一份特征，用于消融「接触
+            # 信息给 actor 还是只给 critic」。同样由 actor_index 切掉。
+            parts.append(self.tactile.actor_features())
         return np.concatenate(parts).astype(np.float64)
 
     def _observation(self) -> np.ndarray:
@@ -900,6 +956,24 @@ class Go2StairsEnv(gym.Env):
         )
         terms["terminal"] = terminal
         return base + terminal, terms
+
+    def _validate_tactile(self) -> None:
+        """触觉开关的一致性校验（构造期就爆，而不是训练中才崩）。"""
+        tac = self.cfg.tactile
+        obs = self.cfg.obs
+        if (obs.tactile or obs.privileged_tactile) and not tac.enabled:
+            raise ValueError(
+                "obs.tactile / obs.privileged_tactile 打开时必须同时打开 "
+                "env.tactile.enabled —— 否则观测块拿到的是全 0 的假触觉。"
+            )
+        rc = self.cfg.reward
+        if (float(rc.tactile_prelanding) != 0.0
+                or float(rc.tactile_impact) != 0.0
+                or float(rc.tactile_stance) != 0.0) and not tac.enabled:
+            raise ValueError(
+                "reward.tactile_* 权重非 0 时必须打开 env.tactile.enabled —— "
+                "否则奖励读到的相位/力恒为 0（等于白给权重）。"
+            )
 
     def _contact_scan(self) -> tuple[bool, bool, np.ndarray]:
         """一次遍历 ``data.ncon`` 同时判定三类「与地形的接触」。
@@ -1003,6 +1077,15 @@ class Go2StairsEnv(gym.Env):
         return self._foot_ft
 
     @property
+    def tactile(self) -> TactileState:
+        """最近一个控制步的足底触觉读数（每足 F̄/Ā/CoP/相位）。
+
+        由 :class:`robotdog.tactile.TactileSensor` 维护；``tactile.enabled=False``
+        时始终是全 0 的占位对象（不会有人读它）。
+        """
+        return self._tactile
+
+    @property
     def foot_impact_force(self) -> np.ndarray:
         """(4,) 本控制步内**逐物理子步**取到的法向力峰值 [N]。
 
@@ -1038,13 +1121,13 @@ class Go2StairsEnv(gym.Env):
         **特权信息**（读 ``stair.height_at()`` 真值）：只服务终止判定与
         stair_progress，绝不能写进 ``_obs_frame``（盲走契约，见 doc/env.md）。
         """
-        heights = self._terrain_height(self.foot_pos[:, 0])
+        heights = self._terrain_height(self.foot_pos[:, 0], self.foot_pos[:, 1])
         return float(np.min(heights)) if heights.size else self.terrain_height_under_base
 
     def _support_height_mean(self) -> float:
         """四足下方地形高度的均值：把「最后一只脚落地时一帧跳一整个立面」的
         单帧不连续摊平（并非更宽松 —— 跨越过程中均值高于最小值，会更早触发）。"""
-        heights = self._terrain_height(self.foot_pos[:, 0])
+        heights = self._terrain_height(self.foot_pos[:, 0], self.foot_pos[:, 1])
         return float(np.mean(heights)) if heights.size else self.terrain_height_under_base
 
     def _fall_reference_height(self) -> float:
@@ -1103,7 +1186,7 @@ class Go2StairsEnv(gym.Env):
         # qpos0（base 在原点），读到的是 x=0 处的地形。当前 spawn_back>0（spawn 在
         # 第一级立面之前）时两种写法恰好都得到 0，属潜伏 bug；一旦把 spawn 点挪到
         # 台阶上（负 spawn_back / 别的地形起点）机身就会埋进台阶里。
-        ground_z = float(self.stair.height_at(x))
+        ground_z = float(self.stair.height_at(x, y))
         self.data.qpos[:] = home_qpos(self.meta, x=x, y=y,
                                       z=ground_z + self.cfg.reset_z,
                                       yaw=yaw)
@@ -1147,6 +1230,8 @@ class Go2StairsEnv(gym.Env):
         self._foot_fn[:] = 0.0
         self._foot_ft[:] = 0.0
         self._foot_fn_peak[:] = 0.0
+        # 触觉状态机随回合重置：相位从 SWING 开始、上一帧力/CoP 清零。
+        self._tactile = self._tactile_sensor.reset()
         # 步态先验时钟，单位为自回合开始起的秒数。观测里报告的相位就是本步
         # 实际使用的那一个。
         self._gait_t = 0.0
@@ -1442,6 +1527,12 @@ class Go2StairsEnv(gym.Env):
         # 特权观测块（仅 critic，见 ObsConfig.privileged_foot_contact）：每步存一份
         # 逐足接触，``_obs_frame`` 在开关打开时把它追加到帧末尾。
         self._foot_contact_now = foot_contact
+        if self.cfg.tactile.enabled:
+            # TactileStep 测量层：接触点压力 → 足底 taxel 分布 → F̄/Ā/CoP/相位。
+            # 必须在奖励之前更新：三个相位条件奖励读的就是这一帧。
+            self._tactile = self._tactile_sensor.update(
+                foot_contact, self.foot_pos, self.foot_clearance,
+                self._prev_foot_pos, self.cfg.control_dt)
         # 奖励结算之前推进势函数状态（状态机数学在 reward.py，见 doc/reward.md）。
         track_swing_peak(self, foot_contact)
         update_probe_state(self)
@@ -1512,8 +1603,10 @@ class Go2StairsEnv(gym.Env):
                 self._tracking_miss_count / max(1, self._step_count)
             ),
             "tracking_corr": float(self._tracking_quality()[1]),
+            # 粗糙地形没有「台阶高」：直接给 0，避免 5e7 这种无意义的数（只进 info）。
             "steps_mounted": int(round(
-                self._peak_terrain_height / max(self.stair.step_height, 1e-9))),
+                self._peak_terrain_height / self.stair.step_height))
+            if self.stair.step_height > 1e-9 else 0,
             "gait_prior": bool(self.cfg.gait_prior),
         }
         # 足端力遥测（2026-10-17）：只记录，不改奖励。标定 R1~R4 的阈值靠它 ——
@@ -1525,6 +1618,9 @@ class Go2StairsEnv(gym.Env):
                 "peak": [float(v) for v in self._foot_fn_peak],
                 "contact": foot_contact.astype(np.int8).tolist(),
             }
+        # 触觉遥测：F̄/Ā/CoP/相位。只写 info（不改奖励）；标定与视频叠加用。
+        if self.cfg.tactile.enabled:
+            info["tactile"] = self._tactile.as_info()
         return self._observation(), float(reward), terminated, truncated, info
 
     # ---------------------------------------------------------------- 渲染

@@ -23,6 +23,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from robotdog.tactile import LANDING, PRELANDING, STANCE
+
 # --------------------------------------------------------------------------- #
 # 权重
 # --------------------------------------------------------------------------- #
@@ -123,6 +125,20 @@ class RewardConfig:
     com_margin_tol: float = 0.15        # m，机身投影到力加权支撑中心的允许偏差
     com_margin_scale: float = 0.15      # m，罚满所需的超出量（tol+scale = 0.30 m ≈ p97）
     com_margin_flat_only: bool = True   # 楼梯的支撑多边形是跨级的，默认只罚平地
+
+    # --- 足底触觉相位条件策略（TactileStep，2026-10-20） --------------------- #
+    # ⚠ **默认全 0**：三个策略都不结算、键不进 terms，逐步奖励逐位不变。
+    #   打开前必须 env.tactile.enabled=True（Go2StairsEnv.__init__ 会校验）。
+    #   数据面（F̄/Ā/CoP/四相位）在 robotdog/tactile.py，设计见 doc/tactile.md。
+    tactile_prelanding: float = 0.0     # ① 落地前**向下**的足端速度惩罚（负权重）
+    prelanding_vz_ref: float = 0.15     # m/s，归一化参考（罚满 = 该向下速度）
+    tactile_impact: float = 0.0         # ② 落地冲击惩罚（负权重）
+    impact_force_ref: float = 3.0       # × 体重，LANDING 窗内平均法向力的参考量级
+    impact_delta_ref: float = 1.5       # × 体重/步，力变化的参考量级
+    impact_peak_ref: float = 6.0        # × 体重，LANDING 窗内峰值的参考量级
+    tactile_stance: float = 0.0         # ③ 支撑质量（面积 + CoP 裕度，正权重）
+    stance_area_target: float = 0.60    # Ā 目标：达到它面积项封顶（避免追求满掌）
+    stance_cop_jump_ref: float = 0.05   # 归一化 CoP 每步跳变的参考尺度
 
     # --- 辅助成形 ------------------------------------------------------------ #
     base_height: float = -2.0
@@ -348,7 +364,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
         # 只让**低面脚**（还没上到台面的那些，即需要爬升的腿）的峰值参与结算 ——
         # 台面上的脚不该再抬高（它们该驻留，见 foot_hold），旧写法把前脚刨立面的
         # 峰值也算进「抬高进展」，等于奖励了错的腿（§23.26）。
-        terr = env._terrain_height(env.foot_pos[:, 0])
+        terr = env._terrain_height(env.foot_pos[:, 0], env.foot_pos[:, 1])
         elev = terr > (env._support_height()
                        + rc.hold_elev_frac * float(env.stair.step_height))
         # 低足门控默认关（消融证据 §23.27）；开启必须过 stair3 250k 对照关。
@@ -369,7 +385,7 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     if rc.foot_hold != 0.0:
         if foot_contact is None:
             foot_contact = env._contact_scan()[2]
-        terr_h = env._terrain_height(env.foot_pos[:, 0])
+        terr_h = env._terrain_height(env.foot_pos[:, 0], env.foot_pos[:, 1])
         elev_h = terr_h > (env._support_height()
                            + rc.hold_elev_frac * float(env.stair.step_height))
         phi = (float(np.sum(foot_contact & elev_h))
@@ -456,6 +472,47 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
                     terms["com_margin"] = 0.0
         else:
             terms["com_margin"] = 0.0
+
+    # 11) 足底触觉相位条件策略（TactileStep，2026-10-20）。
+    #     **三个权重都为 0 时整段跳过** —— 逐步奖励逐位不变（eq_check 0 差异）。
+    #     相位机与力/面积/CoP 的测量都在 robotdog/tactile.py；这里只做结算。
+    if (rc.tactile_prelanding or rc.tactile_impact or rc.tactile_stance):
+        tac = env.tactile
+        pre = tac.phase == PRELANDING
+        landing = tac.phase == LANDING
+        stance = tac.phase == STANCE
+        if rc.tactile_prelanding:
+            # ① PreLanding compliance：只看**向下**的足端速度（向上不罚）。
+            down = np.clip(-tac.vz / max(float(rc.prelanding_vz_ref), 1e-6),
+                           0.0, 1.0)
+            terms["tactile_prelanding"] = float(rc.tactile_prelanding) * float(
+                np.mean(down ** 2 * pre))
+        else:
+            terms["tactile_prelanding"] = 0.0
+        if rc.tactile_impact:
+            # ② Landing impact：平均法向力 + 力变化 + 窗内峰值，各自按参考量级
+            #    归一化后相加（1.0 ≈ 恰好到参考量级，2.0 封顶）。
+            f_mean = np.clip(tac.force_norm / max(float(rc.impact_force_ref), 1e-6),
+                             0.0, 2.0)
+            f_delta = np.clip(
+                np.abs(tac.delta_force_norm)
+                / max(float(rc.impact_delta_ref), 1e-6), 0.0, 2.0)
+            f_peak = np.clip(tac.impact_peak / max(float(rc.impact_peak_ref), 1e-6),
+                             0.0, 2.0)
+            terms["tactile_impact"] = float(rc.tactile_impact) * float(
+                np.mean((f_mean + f_delta + f_peak) * landing))
+        else:
+            terms["tactile_impact"] = 0.0
+        if rc.tactile_stance:
+            # ③ Stance support：奖励接触面积（到目标封顶）与 CoP 裕度，罚 CoP 跳变。
+            area = np.clip(
+                tac.area_norm / max(float(rc.stance_area_target), 1e-6), 0.0, 1.0)
+            jump = np.clip(
+                tac.cop_jump / max(float(rc.stance_cop_jump_ref), 1e-6), 0.0, 1.0)
+            terms["tactile_stance"] = float(rc.tactile_stance) * float(
+                np.mean((area + tac.margin - jump) * stance))
+        else:
+            terms["tactile_stance"] = 0.0
 
     # --- 终止 -----------------------------------------------------------
     # 到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出楼梯远端摔下去。

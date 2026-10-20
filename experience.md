@@ -4748,3 +4748,127 @@ crawl_125 步态、overrides 每 +1.5cm 微增），然后每格 100 回合回�
 
 **产物**：`runs/hi165`、`runs/hi18`、`runs/hi195`；评估日志 `.tmp/hi_chain/`；汇总表
 `.tmp/hi_chain/table.md`。
+
+## 23.72 足底触觉（TactileStep）实现：默认关逐位兼容；`VISION`/相位机/三个策略落地（2026-10-20）
+
+用户要求参考 TactileStep（arXiv:2609.28959）实现两件事：**足底接触力合力 + 接触面积**
+的测量方法，以及**三个相位条件策略**；并明确盲走约束作废，从此逐步加接触信息、正向评估
+其作用（`m03052`）。
+
+**落地**：新增 `robotdog/tactile.py`（虚拟 taxel 网格 4×5、kNN 高斯扩散、`F̄/Ā/CoP/`
+`margin`、四相位机）；`ObsConfig` 新增 `tactile`（+16 actor）与 `privileged_tactile`
+（+16 仅 critic）；`RewardConfig` 新增 `tactile_prelanding/impact/stance` 三项（默认 0）；
+`info["tactile"]` 每步遥测；`config.yaml` 加 `env.tactile` 段（enabled=false）。详见
+`doc/tactile.md`。
+
+**关键设计决定**：
+
+- **默认关时必须逐位兼容**：不读接触力、不加观测维、不进 info、奖励整段跳过（三个权重
+  都为 0 ⇒ 键不进 terms）。`eq_check` 对基线 0 差异、`tests/test_env_contract` /
+  `test_asymmetric` 全绿 —— 因为本轮只是「加一个可选传感器」，不是换任务。
+- **测量只读「有真机对应物」的量**：接触力来自 `mj_contactForce`，但输出是鞋垫也能测的
+  `F̄/Ā/CoP`；**不查地形真值**（不查台阶剖面/高度）。`tactile` 因此可以进 actor，而
+  `privileged_foot_contact`/`privileged_tactile` 只能进 critic（§23.60 的边界）。
+- **相位机逐足、四态**：Swing→PreLanding→Landing→Stance；Landing 用「触地首步 + 窗口」
+  而不是按力阈值，避免站立/滑移时反复触发。
+- **三个策略按相位门控**：prelanding 只罚向下速度（平方）；impact 罚力/力变化/峰值
+  （各归一化后相加、2 封顶）；stance 奖面积（到目标封顶）+ CoP 裕度、罚 CoP 跳变。
+  都用四足 **mean** 而非 sum（与 `air_time`/`foot_lift` 同口径）。
+
+**冒烟实测**（6cm 楼梯、零动作 300 步，`.tmp/probe_tactile.py`）：四相位全部出现、触地
+298 步、`max_force=154.5 N`（≈0.8 体重）、`max_area=4.8 cm²`、CoP 有效 296 步；开 `tactile`
+观测 53→69 维（+16），`privileged_tactile` size=69 但 actor 仍 53；三个奖励项有界且符号
+正确（prelanding −0.0065 mean / impact −0.0214 / stance +0.4371）。
+
+**已知边界**：面积/CoP 是支撑质量代理；切向力未进策略（滑移检测后续）；kNN 扩散参数未
+与真机鞋垫标定；相位阈值按当前 2 Hz 爬行步态设定，换 trot 需重标。
+
+**教训**：①「加传感器」的第一验收项永远是**默认关时的逐位兼容**（否则所有历史回放/评估
+都作废）；② 触觉量的量纲（体重倍数、面积占比）要先在探针里看分布再配权重，否则奖励项
+要么恒 0（阈值太远）要么打满（太近）；③ `info` 里报相位**名**（人读）但奖励用整数比较，
+两套表示要在测试里对齐。
+
+## 23.73 足底触觉 + 四相位机的实测验收：站立/平地行走数据 + 两个已修的语义坑（2026-10-20）
+
+**数据来源**：`.tmp/tactile_report.py`（站立 = 零动作 home 姿态；平地行走 =
+`runs/ab_f_ctl/checkpoints/flat_final.zip`、平坦地面、指令 vx=0.45 m/s、150 控制步）。
+体重参考 = `m·g = 149.17 N`（模型 15.206 kg），足底虚拟面积 24.0 cm²，df=20。
+
+- **站立 3 s**：四足支撑占比 0.96–0.973；每足 F̄=0.220/0.219/0.294/0.312（合计 mean 1.008，
+  标准差来自初始落地瞬态），四足力合计 150.39 N ≈ m·g（+0.8%）；Ā=0.20（4.8 cm²）、
+  margin=0.275；CoP 恒在网格一角。**测量标定正确**：四足合力 ≈ 体重。
+- **平地行走 3 s**：支撑占比 0.25–0.31；每足 Landing 10–13 次、摆动 82–98 帧、PreLanding
+  6–23 帧；支撑 F̄=0.71–0.95（N 106–142）；Ā=0.20–0.23；margin 0.285–0.455；摆动帧
+  **F̄ 与 Ā 全为 0**（无假接触）；冲击峰值 F̄ 2.06–4.23（落地瞬态显著重于支撑）。
+- **单足时序**（第 0 足）：swing（F=0，vz=+0.58）→ prelanding（F=0，vz=−0.75）→
+  landing 首帧 F̄=1.178（175.79 N）→ 逐帧衰减到 0.54 → stance（F̄≈0.42–0.62，Ā=0.25，
+  margin 0.60）。相位机的「触地首帧 LANDING + impact_peak」工作正常。
+- **判据 12/12 PASS**：站立支撑占比/每足 F̄/合计/≈mg、行走合计、摆动无假接触、Landing 事件
+  = 支撑窗数、每窗帧数、PreLanding 存在、冲击峰值 > 支撑均值、相位转移全合法、|CoP|,Ā≤1。
+
+**两个被实测抓出来的坑（都已修）**：
+
+1. ⭐ **LANDING 窗口 off-by-one**：`impact_window_steps=5` 实际跑出 6 帧 LANDING —— 首帧置
+   `_landing_left = window`、后续每帧减 1，共 1+window 帧。判据「每窗 ≤ 5」第一次跑就 FAIL
+   暴露了它。修法：首帧置 `window-1`，窗口总帧数 = 配置值；`tests.test_tactile`（13 条）与
+   `eq_check`（默认关，0 差异）复测通过。**教训**：窗口/计数类参数必须有一条「实测帧数
+   == 配置值」的断言，否则配置名字和真实语义会悄悄错位。
+2. **CoP 绝对位置的坐标约定**：Go2 足端是球面点接触，虚拟网格是 6×4 cm 矩形；实测站立
+   CoP 恰好在网格一角（`cop_norm≈(−0.73,±0.25)`、`margin=0.275`）。它作为「接触点投影」
+   是对的（力加权中心），但**不能用绝对位置当压力中心**；`cop_jump`/`margin`/相对移动方向
+   才与网格原点无关。已写进 `doc/tactile.md` 的已知边界。
+
+**产物**：`.tmp/tactile_report/tactile_report.md`（表格 + 时间线 + 判据）、
+`standing.csv`、`walking.csv`、`excerpt_foot0.csv`；脚本 `.tmp/tactile_report.py`。
+
+## 23.74 足底触觉估计器：三维力/接触可估，面积与绝对 CoP 不可用（2026-10-20）
+
+任务：从 53 维本体感觉（关节/姿态/动作/速度/指令）估计触觉量，在 16.5/18cm 高台阶与
+2–5cm 粗糙地面（留出种子）上验证。
+
+**结论**：
+
+| 量 | 留出集 | 判决 |
+| --- | --- | --- |
+| 三维接触力（世界系） | RMSE 24–30 N（0.16–0.20 体重）、R² 0.56–0.81、MAE 12–19 N | **可估计** |
+| 接触检测（逐足 0/1） | acc 0.92–0.98、F1 0.90–0.97 | **可估计** |
+| 接触面积 | 平地 0.73、规则 15cm 楼梯 0.53 勉强可用；rough 训练分布 0.09–0.30/留出 +0.03 +0.04；楼梯留出 −0.96 / −0.70 | **整体不可用于奖励/控制**（只有平地/规则楼梯勉强） |
+| CoP | R² 0.80–0.93 | **数值假象**：目标近似常数，模型在回归常数 |
+
+**四个坑**：
+
+1. **`mj_contactForce` 是「作用在 geom1 上的力」**：接触对里若把足当 geom2，世界系力要
+   **取负**；写反会让站立时四足合力 z = −m·g（−149 N）。标定法：站立零动作 60 步，
+   断言 `sum(force_vec[:, 2]) == +m·g`（与 `force_n` 逐足一致）；测试用 40 步即可。
+2. **粗糙地形用 box 网格而不是 hfield**：解析高度与几何必须逐格一致（接触点上 hfield 的
+   插值与棱边对不齐）。代价是接口从 `height_at(x)` 扩成 `height_at(x, y)`，env / reward
+   里所有取地形高度的调用都要传足 y，否则粗糙面上会错用中线高度。另外 `rough_x1-x0` 与
+   `2*corridor_half_width` 必须**圆整成 cell 的整数倍**，否则最后一格高度与解析剖面矛盾。
+   taper 必须是**首/末列严格 0**（`ramp=arange(t)/t`）——旧写法 `(k+1)/t` 让末列留下
+   `amp/3` 的垂直落差；`taper_cells` 要夹到 `n_x//2` 以内，否则 n_x 小时会 IndexError。
+3. **面积/绝对 CoP 的信息量问题**：Go2 是球足点接触，`cop_norm` 在站立时恒在网格一角
+   `(−0.73, ±0.25)`、`margin=0.275`；面积由「哪些 taxel 被压到」决定，而楼梯棱边与踏面
+   接合方式在观测里不可见 ⇒ 同一条关节轨迹对应不同贴合。**高 R² 不等于有信息**，
+   看 R² 前先看目标方差；能用的是相对量（`cop_jump`、`margin`、相对移动方向）。
+4. **更大的窗口/网络没有更好泛化**：v2（window 30 / hidden 192 / 80 epochs，用的是
+   collection-1 数据、且未在修复后重跑 ⇒ 只作方向参考）in-sample 更好（平地 12.3 N
+   vs 交付 14.9 N），留出 16.5cm 29.8 N ≈ 交付 29.8 N、接触 acc 0.934 vs 0.921。
+   **按留出集选模型，别按训练 loss 选**（本轮按留出 16.5cm 选型 ⇒ 有选择偏差，结论只作方向）。
+
+**误差结构**：RMSE 主要来自落地冲击尖峰（单帧 |F| 到 1.8 kN；p95 远小于 max）；
+只算接触足时 RMSE 升到 34–42 N —— 踩地瞬间的力本质上由「即将发生的接触」决定，
+本体感觉有一步以上滞后。分轴：**切向 x 最弱**（R² 0.26–0.56），y 0.48–0.74、z 0.53–0.83；
+切向力依赖摩擦/滑动状态，观测里没有直接量。
+
+**门禁**：`compileall` 0；`unittest discover -s tests` ⇒ **101 tests OK / 3 skipped**
+（`.tmp/_unit_all4.log`）；默认 tactile 关 `eq_check` 三场景 450 步 ⇒ **0 差异**
+（`.tmp/eq_tactile_gate.json` 对基线 `.tmp/eq_pre_asym.json`）。**本轮在修复训练语义
+（`window_starts` 含末帧、`loss_a` 去多余 /4）与 rough taper 之后重跑了 collect→train→eval**，
+交付模型 val RMSE 18.9 N（0.127 体重）/ acc 0.987 / F1 0.979；所有文档数字以修复后的
+`.tmp/tactile_estimator/report_final.json`（日志 `_eval_final4.log`）为准。
+
+**产物**：`robotdog/tools/rough.py`、`robotdog/tactile_estimator.py`、三个 scripts、
+`tests/test_rough_terrain.py`（11 条）+ `tests/test_tactile_estimator.py`（15 条）+
+`tests/test_tactile.py::ForceVectorTest`、`doc/tactile_estimator.md`；结果
+`.tmp/tactile_estimator/{report_final.md,report_final.json,report_final.axes.txt,
+estimator_final.pt,data/}`；日志 `.tmp/_collect3.log`/`_train_final2.log`/`_eval_final4.log`。

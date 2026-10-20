@@ -29,10 +29,10 @@
 拼接规则（`_obs_frame()`）：**恒在 48 维**（42 维本体 + 两个必选块），再按
 `ObsConfig` 的开关依声明顺序追加可选块，最后沿时间堆叠 `history_len` 帧。
 当前 `config.yaml`（`history_len: 1`，gait_phase/step_height/vel_filter 开、
-gait_cmd 关）每帧 **53 维**；「全部可选开关开」的 actor 帧是 **55 维**
-（48 + gait_phase 2 + step_height 1 + vel_filter 2 + gait_cmd 2）。打开特权块
-（`privileged_foot_contact`，仅 critic）时 `frame_size`/`size` 再 **+4**，而
-`actor_size` 不变。
+gait_cmd/tactile 关）每帧 **53 维**；「全部可选开关开」的 actor 帧 = 48 + 2 + 1 + 2
++ 2 + **16（tactile）** = **71 维**。打开**只给 critic** 的块时 `frame_size`/`size`
+再 `+4`（`privileged_foot_contact`）或 `+16`（`privileged_tactile`），而 `actor_size`
+**不变**。
 
 **恒在 48 维（全部真机口径；后两块为必选项，构造期强制，改 false 直接抛
 ValueError）：**
@@ -55,14 +55,16 @@ ValueError）：**
 | `gait_phase` | 2 | 步态时钟 sin/cos | 内部时钟 | 残差策略需要知道先验处于周期哪一点（当前 config 打开） |
 | `step_height` | 1 | 本回合台阶高（m） | **任务参数**，随任务下发 | 唯一非传感器项：告诉策略「在哪条楼梯上」，但**不含下一道立面在哪** |
 | `gait_cmd` | 2 | 步态指令（freq [Hz] + swing 缩放） | 上层指令（Walk-These-Ways 式条件化） | 策略**伺服**的步态参数：楼梯档/平地档是同一策略的两个条件点，部署时 `set_gait_cmd_now()` 实时切换；P2 的教训是参数放 action、WtW 放 obs |
+| `tactile` | 16 | 逐足 `[F̄, Ā, CoPx, CoPy]`（法向合力/体重、接触面积占比、足体系 CoP） | **薄型压力鞋垫 + MLP 标定**（有真机对应物，见 `doc/tactile.md`） | 2026-10-20 起用户明确作废「盲走」硬约束，开始逐步加接触信息并正向评估；相位条件奖励与落地/支撑策略需要这些量（TactileStep） |
 
-**特权块（`privileged_foot_contact`，**只给 critic**，默认关）：**
+**特权块（只给 critic，默认关）：**
 
 | 块 | 维 | 物理量 | 真值来源 | 为什么只给 critic |
 | --- | --- | --- | --- | --- |
-| `privileged_foot_contact` | 4 | 逐足是否接触地形（足端 geom × floor/stair geom） | MuJoCo 接触对（仿真器真值） | actor 部署到真机必须盲走；critic 只是训练期的价值函数，吃特权信息降低价值方差（非对称 actor-critic，`robotdog/asymmetric.py`） |
+| `privileged_foot_contact` | 4 | 逐足是否接触地形（足端 geom × floor/stair geom） | MuJoCo 接触对（仿真器真值） | 仿真器真值在真机上没有观测口径；critic 只是训练期的价值函数，吃特权信息降低价值方差（非对称 actor-critic，`robotdog/asymmetric.py`） |
+| `privileged_tactile` | 16 | 同 `tactile` 的 `[F̄, Ā, CoP]` 测量 | 同 `tactile`（真机可测） | 同一份触觉量**先只给价值函数**做对照：评估「特权触觉」是否有增益，再决定是否进 actor |
 
-打开后每帧末尾 `+4` 维，`ObsConfig.size` 变大而 `actor_size` **不变**：`step()` 返回的
+打开后每帧末尾 `+4`/`+16` 维，`ObsConfig.size` 变大而 `actor_size` **不变**：`step()` 返回的
 观测是**全量**（critic 用），actor 的切片由 `ObsConfig.actor_index` 给出（帧优先条带，
 支持 `history_len > 1`），策略侧在 `AsymmetricActorCriticPolicy` 里 `index_select`。
 关闭（默认）时与对称 AC 的观测**逐位相同**（前向兼容的判据，见 `train.md` 的冒烟条目）。
@@ -70,25 +72,30 @@ ValueError）：**
 注意：无论开关开不开，`info["foot_contact"]`（4 个 float）**每步都在**，它是只读诊断量，
 不进观测、不进奖励/终止 —— 写对比 `info` 键集合的探针时要把它排除在外。
 
-**盲走契约（硬边界）**：**actor 的观测**里不得出现任何**地形几何真值**。`base_height`
-（机身相对正下方地形的高度）曾被实现过 —— 它等于把地形读数塞进观测；现在
-`ObsConfig.__post_init__` 构造期直接拒绝，实现分支也整体删除（「默认关掉」
-不是保证，experience.md §11）。
+**信息源约束（2026-10-20 修订）**：历史上本仓要求「盲走」—— actor 观测里不得出现任何
+接触/地形信息。**该硬约束已由用户明确作废**（TactileStep 课题起，开始逐步增加接触信息
+并正向评估其作用）。现行约束有两条：
+
+1. **进 actor 的每个量都必须有真机对应物**（编码器 / IMU / 本体感觉估计 / 上层指令 /
+   压力鞋垫）。`base_height`（机身相对正下方地形的高度）仍然被 `ObsConfig.__post_init__`
+   构造期拒绝 —— 它不是传感器量，而是仿真器把地形真值直接喂给策略（experience.md §11）。
+2. **纯仿真真值只能进奖励/终止，或经非对称 AC 只进 critic**（`privileged_foot_contact` /
+   `privileged_tactile`），不得直接进 actor 观测。
 
 特权块是这条硬边界的**唯一例外形态**：它只进 critic 的 value 网络（训练期存在、
 部署时不存在），由非对称 AC 在结构上切开（`ObsConfig.actor_index`），因此 actor 的
 输入里依然没有任何真值。**不要把特权维直接追加给 actor** —— 那就是把 `base_height`
 的事故重演一遍。
 
-**特权信息白名单**（真值只进奖励/终止，绝不进观测 —— RL 里这是允许的「上帝
-视角」，但一进观测就破坏盲走）：`foot_clearance`（足端离地）、
-`_support_height`（四足支撑面：摔倒判据与 stair_progress）、`_contact_scan`
-（接触掩码：碰撞罚与 air_time）。逐项真机等价物与审计结论见
-`experience.md` §11.4。
+**仿真真值白名单**（只进奖励/终止，或经非对称 AC 只进 critic）：
+`foot_clearance`（足端离地）、`_support_height`（四足支撑面：摔倒判据与
+stair_progress）、`_contact_scan`（接触掩码：碰撞罚与 air_time）、
+`privileged_foot_contact` / `privileged_tactile` 两个特权观测块。逐项真机等价物与
+审计结论见 `experience.md` §11.4。
 
-以上约束的是 **actor 的观测**；critic 的**特权观测**是唯一例外形态（非对称
-actor-critic，见上文特权块与 `experience.md` §23.60）：它只进 value 网络、
-部署时不存在，不进 actor 的输入。
+注意区分两类「加信息」：`tactile`（真机鞋垫可测）**可以**进 actor —— 这是本轮课题的
+研究对象；`privileged_*` 只能进 critic（训练期存在、部署不存在）。不要把特权块直接
+追加给 actor：那等于把 `base_height` 的事故重演一遍（`experience.md` §23.60）。
 
 ### 动作：从策略输出到电机
 

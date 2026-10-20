@@ -233,8 +233,8 @@ def env_config_for_model(model_path: str | Path) -> EnvConfig:
             f"模型观测维度 {dim} 无法用 EnvConfig 的观测块还原。"
             f"请把模型放回它的 runs/<name>/ 目录（读 summary.json），"
             f"或显式指定观测开关。"
-            f"（若权重是用非对称 AC 训练的、观测里含 critic 特权块，按维度反推"
-            f"在结构上不成立 —— 必须带 <模型>_env.json 才能还原。）"
+            f"（若权重是用非对称 AC / 触觉训练的（privileged_* 或 tactile 观测块），"
+            f"按维度反推在结构上不成立 —— 必须带 <模型>_env.json 才能还原。）"
         )
     print(f"[配置] 模型旁没有 summary.json，已从观测维度 {dim} 反推: "
           f"frame={obs.frame_size} history={obs.history_len}")

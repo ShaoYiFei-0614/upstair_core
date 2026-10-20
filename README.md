@@ -48,9 +48,12 @@ upstair_core/
     policy.py      checkpoint 的配置/结构/归一化恢复             → doc/policy.md
     asymmetric.py  非对称 actor-critic：actor/critic 观测切分    → doc/training.md（并入）
     gait.py        开环先验（数据化、速度参数化）                → doc/gait.md
+    tactile.py     足底触觉：F̄/Ā/CoP + 四相位机（TactileStep）  → doc/tactile.md
+    tactile_estimator.py  从本体感觉估计三维足底力/接触（GRU）    → doc/tactile_estimator.md
     go2_model.py   MJCF 装配 / 场景编译 / 元信息                 → doc/go2_model.md
     tools/         工具层（不 import 上层）
       terrain.py   楼梯几何（box + 解析剖面双投影）              → doc/terrain.md
+      rough.py     随机粗糙地形（2–5cm，box 拼高度场）           → doc/terrain.md
       paths.py     路径常量                                      → doc/paths.md
       console.py   控制台 UTF-8                                  → doc/console.md
     __init__.py / tools/__init__.py   再导出壳（无逻辑，不入 doc/）
@@ -60,6 +63,9 @@ upstair_core/
     frames.py     视频切片（粗 / 细），供视觉评审                 → doc/frames.md
     teleop.py      外部控制器遥控                                → doc/teleop.md
     cmd_demo.py    指令跟踪量化                                  → doc/cmd_demo.md
+    collect_tactile_data.py  采集触觉数据集（策略×地形）           → doc/tactile_estimator.md
+    train_tactile_estimator.py  训练 GRU 触觉估计器                → doc/tactile_estimator.md
+    eval_tactile_estimator.py   估计器逐地形评估（力/接触/面积/CoP） → doc/tactile_estimator.md
     download_go2.py 拉取 Go2 模型                                → doc/download_go2.md
   ablations/                                   消融配置（tracked；单变量分层）  → doc/ablation.md
   runs/<名字>/     训练产物（gitignored）

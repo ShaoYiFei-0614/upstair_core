@@ -27,9 +27,10 @@
 - 维度反推只能还原**可选**观测块组合（`base_lin_vel_body` / `command` 为必选
   恒在，`base_height` 被构造期禁止，均不在枚举内）
   （它不可构造）。反推成功时会打印提示 —— 调用方必须知道自己拿到的是推断值。
-- **非对称 AC 训练出的权重无法按维度反推**：`privileged_foot_contact`（critic 的
-  特权块）不在枚举里，含它的观测维（如 57）会被判为「无法还原」并中止。这类权重
-  必须依赖同目录 `<模型>_env.json`（第一层退路）。
+- **非对称 AC / 触觉训练出的权重无法按维度反推**：`privileged_foot_contact`（+4）、
+  `tactile`/`privileged_tactile`（各 +16）都不在 `_obs_config_for_dim` 的枚举里，
+  含它们的观测维（57/69）会被判为「无法还原」并中止。这类权重必须依赖同目录
+  `<模型>_env.json`（第一层退路）。
 
 ### ObsNorm：归一化统计的安全拷贝
 

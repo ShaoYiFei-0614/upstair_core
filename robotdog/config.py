@@ -234,6 +234,7 @@ def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
     env = _section(raw, "env")
     obs_raw = env.pop("obs", None)       # 嵌套子段，单独处理
     cmd_raw = env.pop("command", None)   # 嵌套子段，单独处理
+    tac_raw = env.pop("tactile", None)   # 嵌套子段，单独处理（足底触觉）
     env.pop("n_envs", None)              # 属于运行参数，不属于 EnvConfig
     env.pop("vec_env", None)             # 向量化实现选择，同属运行参数
     gait_file = env.pop("gait_file", None)
@@ -253,6 +254,12 @@ def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
         if not isinstance(obs_raw, Mapping):
             raise SystemExit("config.yaml 的 env.obs 必须是映射")
         _apply(cfg.obs, dict(obs_raw), where="env.obs")
+
+    if tac_raw is not None:
+        if not isinstance(tac_raw, Mapping):
+            raise SystemExit("config.yaml 的 env.tactile 必须是映射")
+        _apply(cfg.tactile, dict(tac_raw), where="env.tactile")
+        cfg.tactile.__post_init__()      # 网格/窗口参数的合法性校验
 
     if cfg.gait_prior:
         cfg.gait = _load_gait(gait_file)

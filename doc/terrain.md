@@ -40,3 +40,23 @@
 
 零高度台阶不能编译、平地必须走 `flat_spec` —— 见 `experience.md` §1.3 与
 `agent.md` §5。
+
+## 随机粗糙地形（`RoughSpec`，`robotdog/tools/rough.py`）
+
+2–5cm 的随机高度场，用于「不规则地面」验证。**不是** MuJoCo hfield：用一组实心 box
+逐格拼出来（格子 `cell=0.12m`、13 列 = 1.56m 走廊、x 两端 3 格线性 taper 到 0，
+**首/末列高度严格为 0** ⇒ 出口与区域外高度连续、没有垂直落差），这样
+棱边锐利、`height_at(x, y)` 的解析高度与几何**逐格严格一致**（hfield 的插值/棱边在
+接触点上对不齐）。
+
+- 名字前缀 `stair_rough_`：`compile_scene` 只把 `stair_*` 与 `floor` 当地形 geom，
+  所以它能被 `meta.stair_geom_ids` 自动认到（奖励/接触扫描不用改）。
+- `height_at(x, y)`：普通 `StairSpec` 忽略 y；`RoughSpec` 用 (x,y) 查格、区域外与
+  走廊外返回 0。**地形高度接口从单参数扩成 (x, y)**：env / reward 里取地形高度的
+  地方都必须把足的 y 一并传进来，否则在粗糙地形上会错用中线高度。
+- 参数：`amp_lo/amp_hi`（0.02/0.05）、`cell`、`rough_x0/rough_x1`、
+  `corridor_half_width`、`rough_seed`、`taper_cells`、`smooth_passes`。
+- 边界：`rough_x1 - rough_x0` 与 `corridor_half_width*2` 都会被**圆整成 cell 的
+  整数倍**（默认圆整后走廊半宽 0.78、`rough_x1 = rough_x0 + 28×0.12`；否则最后一格
+  的高度与解析剖面互相矛盾）；`taper_cells` 会被夹到 `n_x//2` 以内；区域在 `rough_x1` 之外回到
+  平地，适合「上粗糙面再回平地」的路线。
