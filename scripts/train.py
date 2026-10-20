@@ -48,6 +48,7 @@ from robotdog.config import (  # noqa: E402
 )
 from robotdog.curriculum import (  # noqa: E402
     EpisodeStats,
+    RewardTermsMeter,
     StageResult,
     StageSpec,
     format_curriculum,
@@ -93,18 +94,30 @@ def kw_call(venv, method: str, **kwargs):
 
 
 class ProgressCallback(BaseCallback):
-    """有新回合结束时（且距上次打印至少 ``log_every`` 次更新）打印一行进度。"""
+    """有新回合结束时（且距上次打印至少 ``log_every`` 次更新）打印一行进度。
+
+    ``reward_keys`` 非空时，额外按同一窗口打印「每步奖励分量均值」，并把同样的
+    均值追加到 ``terms_path``（默认 ``runs/<run>/reward_terms.jsonl``）：
+    ``{"step": int, "stage": str, "terms": {name: float}}``。这是训练期的逐项明细，
+    与 ``play.py`` 的回合级聚合互补；空列表 = 不记录（训练行为不变）。
+    """
 
     def __init__(self, *, log_every: int = 20, window: int = 50,
-                 verbose: int = 1) -> None:
+                 reward_keys: Sequence[str] = (), terms_path: Path | None = None,
+                 stage: str = "", verbose: int = 1) -> None:
         super().__init__(verbose)
         self.log_every = max(1, int(log_every))
         self.stats = EpisodeStats(window=window)
+        self.terms = RewardTermsMeter(keys=tuple(reward_keys))
+        self.terms_path = Path(terms_path) if terms_path is not None else None
+        self.stage = str(stage)
         self._last_episodes = 0
         self._last_print = 0
 
     def _on_step(self) -> bool:
-        self.stats.add_infos(self.locals.get("infos", []))
+        infos = self.locals.get("infos", [])
+        self.stats.add_infos(infos)
+        self.terms.add_infos(infos)
         new_episode = self.stats.n_total != self._last_episodes
         due = self.n_calls - self._last_print >= self.log_every
         if due and new_episode:
@@ -112,6 +125,18 @@ class ProgressCallback(BaseCallback):
             self._last_print = self.n_calls
             print(f"    [{self.num_timesteps:>9,} 步] {self.stats.format_line()}",
                   flush=True)
+            means = self.terms.drain()
+            if means:
+                summary = "  ".join(f"{k}={v:+.3f}" for k, v in means.items())
+                print(f"    [奖励/步] {summary}", flush=True)
+                if self.terms_path is not None:
+                    self.terms_path.parent.mkdir(parents=True, exist_ok=True)
+                    record = {"step": int(self.num_timesteps),
+                              "stage": self.stage,
+                              "terms": {k: round(float(v), 6)
+                                        for k, v in means.items()}}
+                    with self.terms_path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         return True
 
 
@@ -296,7 +321,14 @@ class Trainer:
                     print(f"    [warm-start] ⚠ 没有 {npath.name}，观测统计从零开始",
                           flush=True)
 
-        callbacks = [ProgressCallback(log_every=int(self.run["log_every"]))]
+        reward_keys = tuple(self.run.get("log_reward_terms") or ())
+        callbacks = [ProgressCallback(
+            log_every=int(self.run["log_every"]),
+            reward_keys=reward_keys,
+            terms_path=(self.rundir.root / "reward_terms.jsonl"
+                        if reward_keys else None),
+            stage=stage.name,
+        )]
         every = int(self.run["save_every"])
         if every > 0:
             # 中间检查点带 _env.json：从子环境读回这一级实际生效的配置

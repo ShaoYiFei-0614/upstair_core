@@ -218,6 +218,46 @@ def _nanmean(values: Iterable[float]) -> float:
 
 
 @dataclass
+class RewardTermsMeter:
+    """按**步**累计 ``info["reward_terms"]``，``drain()`` 给出窗口内每步均值。
+
+    口径说明：环境每步给的是**该步**已乘权重的 terms（见 ``reward.py`` 的
+    ``compute_reward``），含终止奖励的那一步会带 ``success``/``termination``；
+    这里只保留调用方点名的键（``keys``），没点名的项不记、没出现的项不记。
+    平均值 = 窗口内总和 / **有 reward_terms 的步数**（不是回合数），所以
+    ``termination=-5000`` 这类一次性项会被摊到步上，看的是量级而非单步值。
+    """
+
+    keys: tuple[str, ...] = ()
+    _sum: dict[str, float] = field(default_factory=dict, repr=False)
+    n_steps: int = 0
+
+    def add_infos(self, infos: Iterable[dict[str, Any]]) -> int:
+        n = 0
+        for info in infos:
+            terms = info.get("reward_terms")
+            if not isinstance(terms, dict):
+                continue
+            for key in self.keys:
+                value = terms.get(key)
+                if value is None:
+                    continue
+                self._sum[key] = self._sum.get(key, 0.0) + float(value)
+            self.n_steps += 1
+            n += 1
+        return n
+
+    def drain(self) -> dict[str, float]:
+        """取走窗口均值并清零（窗口内没有步数时返回空字典）。"""
+        if self.n_steps == 0:
+            return {}
+        means = {k: v / self.n_steps for k, v in self._sum.items()}
+        self._sum.clear()
+        self.n_steps = 0
+        return means
+
+
+@dataclass
 class StageResult:
     """一个阶段训练结束后的实测结果。"""
 

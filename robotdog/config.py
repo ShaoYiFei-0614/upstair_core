@@ -89,7 +89,8 @@ SECTION_KEYS: dict[str, frozenset[str]] = {
         "gae_lambda", "clip_range", "ent_coef", "vf_coef", "max_grad_norm",
         "target_kl", "log_std_init", "learning_rate", "norm_reward",
     }),
-    "run": frozenset({"name", "seed", "save_every", "log_every"}),
+    "run": frozenset({"name", "seed", "save_every", "log_every",
+                      "log_reward_terms"}),
     "play": frozenset({
         "episodes_video", "episodes_eval", "seed", "video_max_frames", "stages",
         "batch", "stage_height_cm",
@@ -474,6 +475,15 @@ def config_to_run(raw: Mapping[str, Any]) -> dict[str, Any]:
     run.setdefault("seed", 0)
     run.setdefault("save_every", 50_000)
     run.setdefault("log_every", 20)
+    #: ``run.log_reward_terms`` —— 训练期要逐项记录的奖励分量名（空 = 关闭）。
+    #: 合法名由 ``robotdog/reward.py::compute_reward`` 写进 terms 的键决定；
+    #: 未出现/拼错的键不会报错（该窗口只是不记它），但列表本身必须是字符串列表。
+    run.setdefault("log_reward_terms", [])
+    terms = run["log_reward_terms"]
+    if not isinstance(terms, list) or not all(isinstance(x, str) for x in terms):
+        raise SystemExit(
+            "config.yaml 的 run.log_reward_terms 必须是字符串列表"
+            f"（奖励项名，如 forward_vel），收到 {terms!r}")
     return run
 
 

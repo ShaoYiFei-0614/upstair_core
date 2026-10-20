@@ -4677,3 +4677,74 @@ save_every=0、log_every=50）上串行跑 8/12/16/20，每档 2 次，*> 直跑
   1326 步/秒、exit 0）、`runs/vecenv_bench_sub_1/`、`runs/vecenv_bench_dummy_1/`；
   trace `.tmp/trace/vecenv_subproc.jsonl`（design + task_book + gate_result）；
   单测 `tests/test_vec_env.py` 11 条（含真实 subproc 用例与 auto 解析）。
+
+## 23.69 训练期逐项奖励明细 `run.log_reward_terms`：口径与四个坑（2026-10-20）
+
+**需求**：reward 权重逐课程变（`curriculum.reward_overrides`），要能在训练 log/trace 里
+看到**选定分量**的数值，而不是只有总回报。
+
+**实现**：`robotdog/curriculum.py::RewardTermsMeter`（按步累计 `info["reward_terms"]`，
+只记点名键、没出现的键不记、`drain()` 取走即清零）；`scripts/train.py::ProgressCallback`
+在每行进度后打印 `[奖励/步] 项=均值` 并追加 `runs/<run>/reward_terms.jsonl`
+（`{"step","stage","terms"}`）；`run.log_reward_terms` 空列表 = 关闭（默认行为不变；
+`config.yaml` 里本仓默认 13 项）。
+
+**四个坑**：
+1. **进度行只在「有新回合结束」时打印**（旧行为），所以短预算/长回合阶段可能**没有输出**——
+   jsonl 同样只在该事件写。要严格「每 N 次 update 一条」，得把打印从回合事件上解耦。
+2. **均值按步、不按回合**：`termination=-5000`、`success=+500`、`stair_progress` 这类一次性项
+   会被摊薄（除以窗口步数），绝对值不可读；看趋势应看「出现频率 × 值」。
+3. **训练 env 的 `info["reward_terms"]` 是未归一化的逐项奖励**（`norm_reward` 只改送回 PPO 的
+   标量），与 `play.py` 的回合级聚合同源；不要和 `VecNormalize` 的 return 混在一起比较。
+4. **拼错键静默不记**（reward 项集合会随代码演化，配置不该因此僵死），但
+   `run.log_reward_terms` 本身类型错误必须 `SystemExit`（非字符串列表）。
+
+**验证**：`tests/test_reward_terms_log.py` 7 条；`runs/rt_smoke_1/reward_terms.jsonl` 46 行
+（9 级×2000 步冒烟，覆盖 stair3→stair9；平地级无回合结束故无行——坑 1 的实证）。
+
+---
+
+## 23.70 单 seed 的「预算裁剪」判决不可靠：平地 −38% 预算 → stair3 起分岔（2026-10-20）
+
+场景：按「保守方案」把平地 4 级预算 1.45M→0.9M（整链 7.45M→6.9M，−7.4%），其余逐字段不变，
+与 `runs/asym_upstairs` 对照（详见 `train.md`「预算对照」一节）。
+
+- **平地本级看着没问题**：flat_4 回放 97.5%（40 回合）vs 基线 100%；四个平地级训练窗口
+  96–98% vs 96–100%，差异在 n=40/单 seed 的噪声内。
+- **下游质变**：新跑 stair3 学成「0.05 m/s 慢蹭、超时 95%」（基线是「尝试-摔倒 57.5%」），
+  于是 stair4_5/6/7.5/9 成功率 **0% vs 86–100%**（回放复核同样 0%，超时 80–95%）。
+- **归因**：两跑唯一差异是平地步数（→ PPO 更新次数与 RNG 序列不同）；平地被削后
+  stair3 收敛到**不同局部解**。所以不能把下游崩溃归因于「平地预算不足」，也不能据此砍预算：
+  **单 seed 对预算裁剪没有分辨力**（这个 pipeline 在楼梯首个 stage 就敏感放大）。
+- **判据/成本**：要判「平地可减」需 2 seed × 2 臂 ≈ 6h：判 stair4_5/6 回放不比基线低 >8 点、
+  平地不劣；否则保留 1.45M。**预算裁剪要用多 seed 判决，不能用「本级没掉点」推整链安全。**
+- **附带两条工程教训**：① 长训练必须 `Tee-Object` 落盘 —— 本次重启只把日志留在工具 job 流里，
+  事后才靠 `reward_terms.jsonl` 反推进度；② `reward_terms.jsonl` 的 `step` 是**本级内步数**
+  （每级重建 PPO 归零），跨级比较要按 `stage` 分组。
+
+另外：`runs/budget_cons_v1/reward_terms.jsonl` 已验证 **6665 行 / 9 级 / 每行 13 项 / 键集合唯一 /
+级内 step 单调**，控制台 `[奖励/步]` 同步打印 —— 训练期逐项奖励明细功能可用。
+
+## 23.71 加训能把爬楼能力边界往外推「约 +2cm/级」，再往外是断崖（2026-10-20）
+
+在 crawl24（15cm）上做链式加训 16.5→18→19.5cm（每级 1.2M 步、tread 0.30、
+crawl_125 步态、overrides 每 +1.5cm 微增），然后每格 100 回合回放 18/20/22/24cm：
+
+- 15cm 权重在 18cm 是 **0%**（摔 97%）；+1.5cm 加训（hi165）后 18cm **81%**；
+  再训到 18cm（hi18）后 18cm **98%**、20cm（+2cm）**64%**、22cm 1%；
+- 训到 19.5cm（hi195）后 20cm **82%**、22cm **0%**；本级 19.5cm 反而只有 77%；
+- 22/24cm 全模型 0–1%，全部「走两步就摔」，不是「上不去但站稳」。
+
+**规律**：这套配方下，**能力边界 ≈ 训练高度 +2cm**；+3cm 起断崖式 0%。想再往上必须
+**逐级加训**（+1.5cm/级），不能指望外推。**本级训不稳时边界由相邻级继承**（hi195 本级 77%，
+但 18cm 92%、20cm 82%）⇒ **每级训完先回放本级，本级不过关不要往上加**，否则「名义训练高度」
+会高估能力。
+
+**工程教训**：① 链式脚本的 checkpoint 路径要同时兼容「单级直接放 `checkpoints/<stage>_final.zip`」
+和「子目录 `checkpoints/<stage>/<stage>_final.zip`」两种布局（第一版只 glob 子目录，hi165 训完
+直接 abort，白等 17min）；② 机器空闲时 1.2M 步只要 ~17.5min（~1110 步/秒），与历史 42min
+不可比，报 `wall` 要写清机器状态；③ 三层网络 + 53 维短观测，能力带很窄，**每加 1.5cm 都值得
+单独回放验证**，不要连加多级再看。
+
+**产物**：`runs/hi165`、`runs/hi18`、`runs/hi195`；评估日志 `.tmp/hi_chain/`；汇总表
+`.tmp/hi_chain/table.md`。

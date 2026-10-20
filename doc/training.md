@@ -87,6 +87,14 @@ DummyVecEnv(n_envs) | SubprocVecEnv(n_envs) → VecMonitor → VecNormalize
 `scripts/train.py` 在 `observation_dim(warm_start) != 环境观测维` 时自动走兼容路径，
 同维时行为与旧实现完全一致；`--warm-norm off` 仍是「统计从零开始」的显式选择。
 
+### 训练期逐项奖励记录（`ProgressCallback`）
+
+`run.log_reward_terms` 非空时，`ProgressCallback` 在每行进度之后打印同一窗口的逐项奖励均值，
+并追加一行 JSON 到 `runs/<run>/reward_terms.jsonl`（`{"step", "stage", "terms"}`）。聚合器是
+`robotdog/curriculum.py::RewardTermsMeter`，口径 = 窗口内总和 / **有 `reward_terms` 的步数**
+（一次性项会被摊薄；与 `play.py` 的回合级聚合互补）。空列表 = 不记录，训练行为与开销都不变；
+记录本身不改变奖励或训练（纯观测侧）。
+
 ### 运行目录（`RunDir`）
 
 `runs/<name>/` 的路径集合。**构造时不建目录**：调用方需要先检查「目录已存在」

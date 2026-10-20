@@ -14,6 +14,15 @@ run:
   save_every: 50000
   # 每多少步更新打印一次进度行
   log_every: 20
+  # 逐项奖励明细（**训练期**）：非空时，每打印一行进度就同时打印
+  # `[奖励/步] 项=窗口均值`，并把同一份均值追加到 runs/<run>/reward_terms.jsonl
+  # （一行一个窗口：{"step", "stage", "terms"}）。空列表 = 关闭（行为不变）。
+  # 均值口径 = 窗口内该项总和 / 有 reward_terms 的步数（一次性项会被摊薄）。
+  # 合法名 = robotdog/reward.py 写进 info["reward_terms"] 的键；contact 组默认
+  # 关闭故不列。要看别的项（如 success/termination）直接加名字即可。
+  log_reward_terms: [forward_vel, command_follow, foot_lift, air_time, probe_lift,
+                     stair_progress, alive, torque, joint_vel, action_rate,
+                     orientation, body_collision, leg_collision]
 
 
 # --- 课程 -----------------------------------------------------------------

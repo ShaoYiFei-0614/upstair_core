@@ -58,3 +58,11 @@
 只留有语义的开关（回合数、seed、帧上限、渲染哪些阶段、批次标签）。相机/分辨率/
 帧率/缩放**故意不进 yaml** —— 它们是「看画面」的事，留成旋钮只会让人以为调它
 有意义（固定为 `scripts/play.py` 的模块常量）。
+
+## run 段
+
+`name` / `seed` / `save_every` / `log_every` 之外，`log_reward_terms` 控制**训练期**的逐项奖励
+明细：非空字符串列表 = 打开（`ProgressCallback` 按窗口打印 `[奖励/步] 项=均值`，并追加
+`runs/<run>/reward_terms.jsonl`），空列表 = 关闭（默认）。合法名 = `reward.py::compute_reward`
+写进 `info["reward_terms"]` 的键；拼错的键静默不记（reward 项集合随代码演化，配置不该因此僵死），
+但列表本身类型错误会 `SystemExit`。

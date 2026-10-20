@@ -41,7 +41,7 @@ upstair_core/
   models/unitree_go2/                          vendored Go2 MJCF（永不修改）
   robotdog/                                    核心包
     env.py         Go2StairsEnv：时序/观测/指令/成功/终止/渲染   → doc/env.md
-    reward.py      ★ 全部奖励数学 + 势函数状态机                 → doc/reward.md
+    reward.py      ★ 全部奖励数学 + 势函数状态机                 → doc/reward.md（项清单 doc/reward_inventory.md）
     config.py      config.yaml → EnvConfig + 阶段表              → doc/config.md
     curriculum.py  课程数据类与报表                              → doc/curriculum.md
     training.py    向量环境 / PPO / RunDir / 权重加载            → doc/training.md
