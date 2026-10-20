@@ -13,13 +13,26 @@ PPO 训练的四块胶水：向量环境、PPO 构造、运行目录、权重加
 ### 向量环境（`make_vec_env`）
 
 ```
-DummyVecEnv(n_envs) → VecMonitor → VecNormalize
+DummyVecEnv(n_envs) | SubprocVecEnv(n_envs) → VecMonitor → VecNormalize
 ```
 
-两个顺序决策都有理由：
+三个决策都有理由：
 
-- **单进程 `DummyVecEnv`** 是平台约束（沙箱禁 Windows 命名管道，`SubprocVecEnv`
-  不可用；`mj_step` 不释放 GIL，线程池无收益）。
+- **默认 `auto`：训练走多进程、单环境走单进程**。`env.vec_env` 默认 `auto`：
+  `n_envs > 1`（训练默认 8）解析成 `SubprocVecEnv`，把采样摊到多核；`n_envs == 1`
+  （评估 / 遥操作 / 加载权重）解析成 `DummyVecEnv` —— `SubprocVecEnv` 的
+  `venv.envs[0]` 只是 worker 代理，拿不到真实 env 的 `set_command_now` 等直接调用。
+  解析规则在 `robotdog/training.py::resolve_vec_env`，config 层只做取值校验。
+  2026-10-20 的 50k 单级 A/B（8 env，seed 0）：learn SPS 579/568（dummy）vs
+  1408/1406（subproc），即 **2.43–2.48×**；含构建 / spawn / 保存的 e2e 为
+  **2.08–2.10×**，50k 下启动税约占 19%。默认翻转后同配置 20k 冒烟：
+  **438（dummy） vs 1292（subproc）步/秒 ≈2.95×**。受限 Windows 沙箱禁止命名管道时
+  spawn 起不来，用 `env.vec_env: dummy` 显式回退；`tests/test_vec_env.py` 的
+  **11 条契约**覆盖两种实现与 auto 解析。详见 `train.md`。
+- **`subproc` 用 spawn**：普通 Windows（允许管道）下用 spawn，每个 worker
+  重新 import 主模块，启动有数秒成本；工厂因此是模块级 `_make_env`（不是嵌套
+  闭包），且每个 env 仍各自 deepcopy cfg。`mj_step` 不释放 GIL，所以并行只能
+  是多进程，线程池没有收益。
 - **`VecMonitor` 放在 `VecNormalize` 里面**：这样 `info["episode"]["r"]` 保持
   未归一化的真实回报，报表读到原始数值。
 

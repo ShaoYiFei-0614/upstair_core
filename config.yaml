@@ -115,7 +115,9 @@ curriculum:
 
 # --- 环境 -----------------------------------------------------------------
 env:
-  n_envs: 8                  # 向量环境数；单进程 DummyVecEnv
+  n_envs: 8                  # 向量环境数
+  vec_env: auto              # auto（默认）：训练 n_envs>1 用 subproc（多进程），
+                             # 单环境评估/遥控自动 dummy；可强制 dummy / subproc
   episode_length_s: 20.0
   action_scale: 0.60         # residual 模式的残差权限 [rad]（gait_params 模式不使用）
   # ⭐ 2026-10-14 回到 **residual**（12 维逐关节残差 + 固定先验，sub9_v5 同款）。

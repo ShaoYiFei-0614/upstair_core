@@ -1,7 +1,10 @@
 """训练基础设施：向量化环境 + PPO + 运行目录 + 模型加载。
 
-**单进程约束**：沙箱禁止 Windows 命名管道，``SubprocVecEnv`` 不可用，只能
-``DummyVecEnv`` 串行推进；``mj_step`` 不释放 GIL，线程池没有收益。
+**向量化选择**：``env.vec_env`` 默认 ``auto`` —— 训练（``n_envs > 1``，默认 8）
+用 ``SubprocVecEnv``（Windows 下 spawn）把 env 采样摊到多核；单环境评估/遥控/
+权重加载（``n_envs == 1``）自动退回 ``DummyVecEnv``（``venv.envs[0]`` 必须是真
+env，脚本里有直接访问 ``set_command_now`` 的路径）。必要时可用 ``dummy`` 强制
+单进程。``mj_step`` 不释放 GIL，线程池没有收益，所以并行必须是进程级。
 **观测归一化必须开、奖励归一化默认开**：不归一化时关节速度与关节角量纲差三个
 数量级、critic 拟合不动；惩罚主导时残差学不起来。实测依据见 ``experience.md`` §4。
 """
@@ -14,6 +17,7 @@ import json
 import pickle
 import warnings
 import zipfile
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -23,6 +27,7 @@ import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import (
     DummyVecEnv,
+    SubprocVecEnv,
     VecEnv,
     VecMonitor,
     VecNormalize,
@@ -59,12 +64,35 @@ def make_env_fn(
     ``set_commands``。
     """
 
-    def _init() -> Go2StairsEnv:
-        return Go2StairsEnv(stair=stair,
-                            cfg=copy.deepcopy(cfg) if cfg is not None else None,
-                            seed=seed)
+    return partial(_make_env, stair, cfg, seed)
 
-    return _init
+
+def _make_env(stair: StairSpec | None,
+              cfg: EnvConfig | None,
+              seed: int) -> Go2StairsEnv:
+    """模块级工厂：``SubprocVecEnv`` 用 cloudpickle 序列化后必须在 worker 里
+    重新 import 到这个符号，嵌套闭包在 spawn 下不可靠。"""
+    return Go2StairsEnv(stair=stair,
+                        cfg=copy.deepcopy(cfg) if cfg is not None else None,
+                        seed=seed)
+
+
+def resolve_vec_env(n_envs: int, vec_env: str = "auto") -> str:
+    """把 ``env.vec_env`` 配置值解析成实际实现（``dummy`` / ``subproc``）。
+
+    ``auto``（默认）：训练（``n_envs > 1``，默认 8）用 ``subproc``，把采样摊到
+    多核；单环境（评估 / 遥控 / 加载权重）用 ``dummy`` —— ``SubprocVecEnv`` 的
+    ``venv.envs[0]`` 只是 worker 代理，拿不到真实 env 的属性与 ``set_command_now``
+    之类的直接调用。显式写 ``dummy`` / ``subproc`` 时不做任何猜测。
+    """
+    value = str(vec_env).strip().lower()
+    if value == "auto":
+        return "subproc" if n_envs > 1 else "dummy"
+    if value not in ("dummy", "subproc"):
+        raise ValueError(
+            f"vec_env 必须是 'auto' / 'dummy' / 'subproc'，收到 {vec_env!r}"
+        )
+    return value
 
 
 def make_vec_env(
@@ -76,17 +104,27 @@ def make_vec_env(
     normalize: bool = True,
     monitor: bool = True,
     norm_reward: bool = True,
+    vec_env: str = "auto",
+    start_method: str = "spawn",
 ) -> VecEnv:
-    """``DummyVecEnv(n_envs) → VecMonitor → VecNormalize``。
+    """``DummyVecEnv(n_envs) | SubprocVecEnv(n_envs) → VecMonitor → VecNormalize``。
 
+    ``vec_env`` 取 ``auto``（默认）/ ``dummy`` / ``subproc``：``auto`` 在
+    ``n_envs > 1``（训练，默认 8）时用多进程，单环境时退回单进程 —— 解析规则见
+    :func:`resolve_vec_env`。
     ``VecMonitor`` 放在 ``VecNormalize`` **里面**，这样 ``info["episode"]["r"]``
     保持未归一化的真实回报，报表读到的就是原始数值。
     """
     if n_envs < 1:
         raise ValueError("n_envs must be >= 1")
-    venv: VecEnv = DummyVecEnv(
-        [make_env_fn(stair, cfg, seed + i) for i in range(n_envs)]
-    )
+    impl = resolve_vec_env(n_envs, vec_env)
+    env_fns = [make_env_fn(stair, cfg, seed + i) for i in range(n_envs)]
+    if impl == "dummy":
+        venv: VecEnv = DummyVecEnv(env_fns)
+    else:
+        # Windows 的默认 start method 不可用；spawn 需要 worker 重新 import
+        # 主模块，因此 env 工厂必须是模块级函数（见 _make_env）。
+        venv = SubprocVecEnv(env_fns, start_method=start_method)
     if monitor:
         venv = VecMonitor(venv)
     if normalize:
@@ -125,6 +163,8 @@ def build_ppo(
 ) -> PPO:
     """构造 PPO。
 
+    ``device`` 以 ``cuda`` 开头但当前 torch 没有 CUDA 时直接报错：SB3 的
+    ``get_device`` 会静默回退 CPU，配置写着 cuda 却按 CPU 跑是最难发现的假象。
     ``log_std_init=-2.0``（归一化动作单位下 std ≈ 0.135）是折中：默认 0.0 让残差
     每步顶满 ``action_scale``、等于纯噪声；过小则残差恒零、退化成纯开环步态。
     ``batch_size`` 与样本数不整除时 SB3 会 warn —— 对只做 ``predict`` 的推理场景
@@ -136,6 +176,12 @@ def build_ppo(
     checkpoint 自描述的一部分）。``None``（默认）⇒ 仍是 SB3 ``MlpPolicy``，
     与历史训练逐位一致（前向兼容的判据）。
     """
+    if str(device).startswith("cuda") and not th.cuda.is_available():
+        raise RuntimeError(
+            "device 以 cuda 开头，但 torch.cuda.is_available() 为 False；"
+            "当前 torch 是 CPU 版或驱动不可用。请安装 CUDA 版 torch，"
+            "或把 ppo.device 改回 cpu。"
+        )
     policy_class: Any = "MlpPolicy"
     policy_kwargs: dict[str, Any] = dict(
         net_arch=dict(pi=list(net_arch), vf=list(net_arch)),
@@ -468,6 +514,7 @@ __all__ = [
     "load_policy",
     "make_env_fn",
     "make_vec_env",
+    "resolve_vec_env",
     "policy_state_dict",
     "restore_vecnormalize",
     "restore_vecnormalize_compat",

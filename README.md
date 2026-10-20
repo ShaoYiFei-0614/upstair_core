@@ -55,7 +55,7 @@ upstair_core/
       console.py   控制台 UTF-8                                  → doc/console.md
     __init__.py / tools/__init__.py   再导出壳（无逻辑，不入 doc/）
   scripts/
-    train.py       训练入口（逐级循环）                          → doc/train.md
+    train.py       训练入口（逐级循环）                          → doc/training.md
     play.py        评估 / 视频                                    → doc/play.md
     frames.py     视频切片（粗 / 细），供视觉评审                 → doc/frames.md
     teleop.py      外部控制器遥控                                → doc/teleop.md
@@ -80,7 +80,8 @@ config.yaml ──config.py──► EnvConfig + StageSpec[]
               │    ▲
               │    └── gait.py（先验目标角）＋ go2_model.py（MJCF/元信息）
               ▼
-        SB3 PPO（training.py 组装，DummyVecEnv 单进程）
+        SB3 PPO（training.py 组装；env.vec_env 默认 auto：训练用 SubprocVecEnv×n_envs(8)，
+        单环境评估/遥控用 DummyVecEnv）
                                 ▼
         runs/<name>/  checkpoint 三件套（zip + vecnormalize.pkl + _env.json）
                                 ▼
@@ -114,6 +115,11 @@ python -m venv .venv
 ```bat
 .venv\Scripts\python.exe -m py_compile robotdog/*.py robotdog/tools/*.py scripts/*.py
 .venv\Scripts\python.exe -X utf8 .tmp\eq_check.py .tmp\eq_new.json   :: 行为等价回归
+
+:: 改了 env.vec_env / 向量化 / 训练链路
+.venv\Scripts\python.exe -X utf8 tests\test_vec_env.py -v
+.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v
+:: 另需两臂 2000 步冒烟与 50k A/B（命令与判据见 doc/training.md「向量环境」；实测数字见 train.md「vec_env A/B」）
 ```
 
 `eq_check.py` 跑 450 步 × 3 场景，与存档 JSON 逐项对比 `reward_terms` —— 碰过
@@ -125,3 +131,10 @@ env / reward / gait 的改动**必须**逐位为 0（有意的行为变化除外
 * 能力带约 3–6 cm；9 cm 以上当前翻不过（`experience.md` §21）。
 * 单次训练成功率有 ±18 pt 的种子方差，下结论前同 seed 集合至少各跑 3 次（§14）。
 * 评估至少 40 回合，10 回合能给出 ±15 pt 的错觉（§5.7）。
+* 吞吐数字口径：训练日志的 `X 步/秒` 只计 `model.learn()`，不含环境构建与
+  spawn 冷启动；跨 vec_env 对比时同时看 `summary.json` 的 `wall_seconds`。
+* 默认 `env.vec_env: auto`：训练（`n_envs>1`，默认 8）走 `SubprocVecEnv`，
+  评估/遥控（`n_envs==1`）走 `DummyVecEnv`；受限沙箱（禁止命名管道）用
+  `env.vec_env: dummy` 回退。
+* 本机 50k 单级 A/B（8 env，seed 0）：subproc 的 learn SPS 是 dummy 的
+  **2.43–2.48 倍**，含构建/spawn 的 e2e 是 **2.08–2.10 倍**；详见 `train.md`。

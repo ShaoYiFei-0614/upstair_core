@@ -44,6 +44,7 @@ from robotdog.config import (  # noqa: E402
     config_to_stages,
     load_config,
     n_envs as cfg_n_envs,
+    vec_env as cfg_vec_env,
 )
 from robotdog.curriculum import (  # noqa: E402
     EpisodeStats,
@@ -60,6 +61,7 @@ from robotdog.training import (  # noqa: E402
     RunDir,
     build_ppo,
     make_vec_env,
+    resolve_vec_env,
     restore_vecnormalize,
     restore_vecnormalize_compat,
     save_vecnormalize,
@@ -167,12 +169,13 @@ class Trainer:
     """
 
     def __init__(self, cfg: EnvConfig, rundir: RunDir, *, run: dict[str, Any],
-                 ppo: dict[str, Any], n_envs: int) -> None:
+                 ppo: dict[str, Any], n_envs: int, vec_env: str = "auto") -> None:
         self.cfg = cfg
         self.rundir = rundir
         self.run = run
         self.ppo = ppo
         self.n_envs = n_envs
+        self.vec_env = vec_env
         self.last_stats = EpisodeStats(window=200)
         # ⭐ config.yaml 的奖励基线（没叠任何课程覆盖的那一份）：
         # make_env 每级开始前把它抄回子环境，保证覆盖是「从基线叠」。
@@ -195,6 +198,7 @@ class Trainer:
             cfg=stage_cfg,
             seed=int(self.run["seed"]),
             norm_reward=bool(self.ppo.get("norm_reward", True)),
+            vec_env=self.vec_env,
         )
         # 指令课程：无条件下发这一级的采样范围（观测那 3 维恒定，PPO 结构不用重建）。
         kw_call(venv, "set_commands",
@@ -376,6 +380,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     stages = config_to_stages(raw)
     name = args.run_name or str(run["name"])
     n_envs = cfg_n_envs(raw)
+    vec_env = cfg_vec_env(raw)
+    vec_env_impl = resolve_vec_env(n_envs, vec_env)
 
     for stage in stages:
         if stage.timesteps < MIN_STAGE_STEPS:
@@ -387,7 +393,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     rundir.ensure()
 
     print(f"[配置] {Path(args.config)}")
-    print(f"[运行] {rundir.root}  (seed={run['seed']}, n_envs={n_envs})")
+    print(f"[运行] {rundir.root}  (seed={run['seed']}, n_envs={n_envs}, "
+          f"vec_env={vec_env} → {vec_env_impl})")
     print(f"[观测] 每帧 {cfg.obs.frame_size} 维 × history {cfg.obs.history_len} "
           f"= {cfg.obs.size} 维")
     if cfg.obs.privileged_frame_size > 0:
@@ -421,7 +428,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(format_curriculum(stages))
     print(flush=True)
 
-    trainer = Trainer(cfg, rundir, run=run, ppo=ppo, n_envs=n_envs)
+    trainer = Trainer(cfg, rundir, run=run, ppo=ppo, n_envs=n_envs,
+                      vec_env=vec_env)
     results = []
     warm: str | None = getattr(args, "warm_start", None)
     if warm:

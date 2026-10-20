@@ -23,6 +23,10 @@
 - 非 dataclass 段（`ppo:` / `run:` / `play:` / `curriculum:`）是脚本自己 `.get()`
   的，没有那层结构 —— 所以有 `SECTION_KEYS` 白名单补查。校验挂在
   `config_to_env()` 里，因为它是三个脚本共同的第一步。
+- `env.n_envs` / `env.vec_env` 是运行参数（不是环境物理属性），由
+  `n_envs()` / `vec_env()` 读取；后者接受 `auto` / `dummy` / `subproc`，默认
+  `auto`（训练 `n_envs>1` → `subproc`，单环境评估/遥控 → `dummy`；解析见
+  `robotdog/training.py::resolve_vec_env`）。
 
 ## 每级归一化（课程向量的展开）
 
@@ -41,7 +45,9 @@
 ## `config_to_env` / `config_to_stages`
 
 - `config_to_env`：写 `env:` + `reward:` 两段进 dataclass，重建嵌套的
-  `command`（含当前值）与 `obs`，加载步态先验文件。**gait_amp_scale 只缩幅值**
+  `command`（含当前值）与 `obs`，加载步态先验文件。`env.n_envs` 与
+  `env.vec_env` 是运行参数，先 pop 掉再校验，不属于 `EnvConfig`。
+  **gait_amp_scale 只缩幅值**
   （保留步频），缩完过一遍 `normalize()`。
 - `config_to_stages`：展开课程。阶段名由高度决定，重名自动去重
   （`flat` / `flat_2` / …）—— checkpoint 与 tensorboard 按阶段名分目录，重名会

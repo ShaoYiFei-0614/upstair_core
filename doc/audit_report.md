@@ -107,9 +107,14 @@ e0.step() 5 次后：e1._command == e0._command == [0.9203, 0.0702, 0.154]（wan
 所以同一步内碰巧自洽。但它是隐患：一旦换成 `SubprocVecEnv`/异步向量化，或用 `env_method` 按环境下发不同指令，
 就会静默串台；课程切级时 `set_commands` 只改一个 cfg 也依赖「所有 env 用同一套」这个巧合。
 
-修法：`make_env_fn` 给每个 env `copy.deepcopy(cfg)`。`scripts/train.py:204` 的
+**2026-10-19 更新**：`SubprocVecEnv` 已在允许命名管道的 Windows 上实测可跑
+（spawn + 模块级工厂 + 每 env deepcopy cfg），默认仍是 dummy。可运行性由
+`tests/test_vec_env.py`（9 条，直接脚本运行）与 `unittest discover`（52 条）证明；
+50k 单级 A/B 已测得 learn **2.45×**、e2e **2.1×**（8 env，seed 0），详见 `train.md`。
+
+修法：`make_env_fn` 给每个 env `copy.deepcopy(cfg)`。`scripts/train.py:209-212` 的
 `venv.env_method("set_reward_overrides"/"set_commands", ...)` 是**逐环境**下发，deepcopy 后仍然每级都生效
-（已实测确认 8 个 env 的覆盖一致）。
+（2-env 探针确认广播与 `indices=[0]` 隔离；8-env 由两臂 9×2000 冒烟及其中间 checkpoint 的对账确认）。
 测试：`CommandStateTest.test_envs_do_not_share_command_state`。
 
 ### 2.5 B4 —— `reset` 的播种高度取了错误参照点

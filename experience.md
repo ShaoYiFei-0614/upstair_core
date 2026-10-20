@@ -4554,3 +4554,126 @@ actor/critic 输入维拼接、reward 项开关、课程采样器）。
 
 产物：`runs/abl_l{0..3}/`；日志 `.tmp/ablation/*`；跑批 `.tmp/run_ablation_pairs.py`；
 不触发证据 `.tmp/_probe_contact_fire.log`；详见 `train.md` 的「ablation 训练对照」条目。
+
+## 23.66 SubprocVecEnv 实测：learn 2.45× / e2e 2.1×；管道重定向会吃掉 15%（2026-10-20）
+
+**问题**：cProfile 显示 8-env 训练里环境采样占 `learn` 的 93%、`mj_step` 本身约 27%，
+策略前向约 6%、PPO update 约 7%；`mj_step` 不释放 GIL，线程池没有收益。于是把
+`DummyVecEnv` 换成 `SubprocVecEnv`（Windows spawn）做受控 A/B。
+
+**结果**（单级平地、50k 步、`n_envs=8`、seed 0、两臂 plan.json 逐字段相同）：
+
+| 臂 | 墙钟 | summary wall | learn SPS | e2e SPS |
+| --- | ---: | ---: | ---: | ---: |
+| dummy #1 / #2 | 91.2 / 92.7 s | 88.6 / 90.4 s | 579 / 568 | 548 / 539 |
+| subproc #1 / #2 | 43.9 / 44.1 s | 41.4 / 41.7 s | 1408 / 1406 | 1139 / 1134 |
+
+learn 倍率 2.432 / 2.475（均值 ≈2.45），e2e 倍率 2.08–2.10。50k 下 spawn + 构建 +
+保存约 4–8 s，占 subproc 墙钟约 19%，预算越长越摊薄。`upstairs_v1` 的 7.45M 步按此
+推算约 3.6–3.8 h → 1.5–1.8 h，但这是推算，完整九级课程没有复跑。
+
+**六条能复用的经验**：
+
+1. **多进程真的能跑，前提是工厂可序列化**。Windows 用 `spawn`，worker 会重新 import
+   主模块；工厂必须是模块级 `_make_env` + `functools.partial`（嵌套闭包在
+   `SubprocVecEnv` 下会 pickle 失败）。每个 env 仍要 `deepcopy(cfg)`，否则
+   `CommandState._now` 会在 8 个 env 间串台（审计 B3）。
+2. **逐环境 setter 经管道仍然生效**。`train.py` 的 `set_commands` /
+   `set_reward_overrides` 走 `VecNormalize → VecMonitor → SubprocVecEnv.env_method`；
+   `runs/smoke_vec_s_20261019/checkpoints/flat/flat_2000_steps_env.json` 的 5 个奖励覆盖
+   与 4 个指令量程与 `plan.json` 逐项一致。**不要把 `<阶段>_final_env.json` 当证据**：
+   它按设计写 `config.yaml` 基线（`scripts/train.py:146-154`、`:320`），中间 checkpoint
+   才写 `live_cfg`。
+3. **SB3 的 1.9e-6 差异不是串台**。同一批动作下 `obs` 逐位相同，但 `reward` 有
+   `1.897929436722734e-06` 的差：`DummyVecEnv` 用 `np.zeros(..., dtype=np.float32)`
+   缓冲（`dummy_vec_env.py:49`），`SubprocVecEnv` 用 `np.stack(rews)` 得 float64
+   （`subproc_vec_env.py:140`）。显式 cast 回 float32 后 `REW_CAST_MAXDIFF=0.0`，
+   18 项 `reward_terms` 也逐项相同。判等价时先看 dtype，再怀疑物理。
+4. **显存/CUDA 不是这条链路的瓶颈**。PPO 网络只有 [512,256,128]，策略前向约 6%；
+   把网络放 CUDA 最多动这 6–13%，而环境采样仍在 CPU。当前 `.venv` 是
+   `torch 2.14.1+cpu`，所以加了 `build_ppo` 的 CUDA guard，避免 SB3
+   `get_device()` 在 `torch.cuda.is_available()=False` 时静默回退 CPU。
+5. **计时不要经过 PowerShell 管道/Start-Job**。`2>&1 | Out-File` 或 `Start-Job` 下
+   dummy 只有 502/493/494 步/秒（直跑 579/568），且 PowerShell 5 按 GBK 解码
+   Python 的 UTF-8 输出，日志变成 UTF-16 乱码。**用 `*>` 直跑**；本次有效日志都是
+   UTF-16，Python 读要 `encoding='utf-16'`。这与 §5.8 的编码坑同源。
+6. **受限沙箱会拒绝 Windows 命名管道**。普通 workspace-write 下
+   `SubprocVecEnv` 构造报 `PermissionError: [WinError 5]`（`multiprocessing.connection.Pipe`
+   → `_winapi.CreateFile`）；本会话用 danger-full-access 才跑通。默认保持 `dummy`
+   是兼容性选择，不是性能结论。
+
+**不能说的话**：n=1、单机、50k 单级平地，只能证明这条链路的吞吐；不能据此说
+subproc 训练出的策略更好/更差。两臂均回报差 23% 是采样顺序不同导致的轨迹差异，
+不是能力差异；能力仍要 ≥40 回合、`--sampled-command`、多 seed 回放。
+
+**视觉**：`ab_subproc_5` 的 flat 50k 权重渲了 250 帧 / 12.5 fps 实时 MP4
+（`runs/ab_subproc_5/videos/flat/flat.mp4`），`smoke_vec_s` 的 stair9 渲了 37 帧
+（`runs/smoke_vec_s_20261019/videos/stair9_9cm/stair9_9cm.mp4`）。粗切片与 25 帧窗口
+显示机身直立、步态周期性摆动、平地前进 `8.35m；stair9 在 151 步摔倒，与 2k 步权重
+的 0% 成功率一致。狗在画面里偏小，**步态细节（足端高度/触地）判不清**，只判
+「渲染链路与地形/指令一致」。
+
+**产物**：`runs/ab_{dummy,subproc}_{4,6}/`、`runs/smoke_vec_{d,s}_20261019/`、
+`runs/smoke_ws_20261019/`；日志 `.tmp/ab_*.log`、`.tmp/smoke_*.log`；
+配置 `.tmp/ab_vec_*.yaml`、`.tmp/smoke_vec_*.yaml`；详见 `train.md` 的
+「vec_env A/B」条目。
+
+## 23.67 n_envs 扩展曲线：16 是单臂甜点，20 只多 1.5% e2e 却多 1.9GB（2026-10-20）
+
+承接 §23.66：subproc 把采样摊到多进程后，继续加 n_envs 的边际收益如何？在同一
+单级平地（50k、seed 0、n_steps=256、batch_size=512、net_arch=[512,256,128]、
+save_every=0、log_every=50）上串行跑 8/12/16/20，每档 2 次，*> 直跑。
+
+| n_envs | 墙钟 s（2 rep） | learn SPS 均值 | e2e SPS 均值 | RSS MB |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 46.7 / 47.1 | 1310 | 1066 | 4070 |
+| 12 | 43.8 / 42.9 | 1492.5 | 1154 | 5988 |
+| 16 | 41.6 / 41.1 | 1671 | 1209 | 7901 |
+| 20 | 40.6 / 40.9 | 1813.5 | 1227 | 9828 |
+
+**四条经验**：
+
+1. **加速有，但递减**：learn 8→12 +13.9%、12→16 +12.0%、16→20 +8.5%；e2e
+   8→16 +13.4%，16→20 只 +1.5%。环境采样并行后，主进程 PPO update、VecMonitor/
+   VecNormalize、管道收发和 spawn 构建成本开始占主导。
+2. **16 是单臂甜点（综合）**：比 8 快 13.4% e2e，RSS 7.9GB；20 的 learn 比 16
+   再快 8.5%，但 50k 端到端只多 1.5%（固定启动约 8s 占 17%），且 9.8GB、21 个进程
+   把 20 核占满，无法并行第二臂。20 只在单臂专用机考虑，不作默认。
+3. **n_envs 不是纯速度旋钮**：n_steps 固定时，n_steps × n_envs 从 2048 涨到
+   5120，PPO 每次 update 的样本和 minibatch 数都变；50k 的均回报差异不能当能力
+   结论。若要保持同样本预算，应同步降 n_steps 并重新验证。
+4. **并发臂数要乘内存**：RSS 约 490MB/env；8 env ≈4.1GB/臂，16 env ≈7.9GB/臂。
+   两臂并发 A/B 仍应 8/臂（≈8.2GB）；单臂才用 16。dummy 下加 n_envs 不增加并行度，
+   基本不提速，仍建议 8。
+
+**边界**：50k 单级平地、2 reps、单 seed；只证明吞吐，不证明完整课程/策略能力。
+采用 16 前应先跑 ≥40 回合 --sampled-command 回放确认学习没有变差。
+
+**产物**：runs/bench{1,2}_n{8,12,16,20}_20261020/、.tmp/bench_nenv_summary.json、
+.tmp/bench{1,2}_n*.log；详见 train.md 的「n_envs 扩展」条目。
+
+## 23.68 默认向量化翻转为 auto（训练 SubprocVecEnv×8 / 单环境 DummyVecEnv）（2026-10-20）
+
+用户指令（原话）：「理解目前未提交修改，后续训练尽可能采用并行环境subproc，并将默认设置改为
+并行环境，并行环境数量为8」。承接 §23.66/§23.67 的吞吐结论，把「显式 opt-in」变成默认。
+
+- **改动**：`env.vec_env` 默认由 `dummy` 改为 `auto`；新增
+  `robotdog/training.py::resolve_vec_env(n_envs, vec_env)`：`auto` 在 `n_envs > 1`（训练，
+  默认 8）解析成 `subproc`，`n_envs == 1` 解析成 `dummy`；显式 `dummy`/`subproc` 透传，
+  非法值 `ValueError`。config 层 `vec_env()` 负责取值与校验，`scripts/train.py` 启动打印
+  `vec_env=auto → subproc`，`Trainer` 默认参数同步为 `auto`。
+- **为什么单环境必须 dummy**：`SubprocVecEnv` 的 `venv.envs[0]` 是 worker 代理，
+  `scripts/play.py` / `teleop.py` / `cmd_demo.py` / `load_policy` 里有直接调用真实 env 的
+  路径（`set_command_now`、`_observation`、`cfg` 属性）。`auto` 让训练并行、评估串行，
+  不需要在每条脚本里改 `n_envs`。
+- **实测**（同配置单级 20k 步、8 env、seed 0）：subproc **1292 步/秒 / 24.8s** vs dummy
+  **438 步/秒 / 50.4s** ⇒ **+195%（≈2.95×）**；与 §23.66 的 50k A/B（learn 2.43–2.48×、
+  e2e 2.08–2.10×）方向一致，短跑里启动税占比更小、数字偏高。
+- ⚠ **默认变了 ⇒ 与历史逐位结果不再可比**：采样顺序不同，同 seed 也不逐位相同；
+  对比实验必须「在同 vec_env 下重跑基线」，并记住 §23.65 的「同配方重训方差 ≥6 点」。
+- **边界**：沙箱禁止命名管道时 spawn 起不来，用 `env.vec_env: dummy` 回退；spawn 冷启动
+  数秒；内存约 490MB/env（8 env ≈4GB/臂，§23.67），两臂并发仍按 8/臂。
+- **产物/证据**：`runs/vecenv_auto_1/`（9×2000 冒烟，`vec_env=auto → subproc`、9 个阶段标记、
+  1326 步/秒、exit 0）、`runs/vecenv_bench_sub_1/`、`runs/vecenv_bench_dummy_1/`；
+  trace `.tmp/trace/vecenv_subproc.jsonl`（design + task_book + gate_result）；
+  单测 `tests/test_vec_env.py` 11 条（含真实 subproc 用例与 auto 解析）。

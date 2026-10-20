@@ -234,6 +234,7 @@ def config_to_env(raw: Mapping[str, Any]) -> EnvConfig:
     obs_raw = env.pop("obs", None)       # 嵌套子段，单独处理
     cmd_raw = env.pop("command", None)   # 嵌套子段，单独处理
     env.pop("n_envs", None)              # 属于运行参数，不属于 EnvConfig
+    env.pop("vec_env", None)             # 向量化实现选择，同属运行参数
     gait_file = env.pop("gait_file", None)
     gait_file_stair = env.pop("gait_file_stair", None)   # 楼梯级专用先验（可选）
     cfg = EnvConfig()
@@ -503,6 +504,22 @@ def config_to_play(raw: Mapping[str, Any]) -> dict[str, Any]:
 def n_envs(raw: Mapping[str, Any]) -> int:
     """``env.n_envs``，缺省 8。"""
     return int(_section(raw, "env").get("n_envs", 8))
+
+
+def vec_env(raw: Mapping[str, Any]) -> str:
+    """``env.vec_env``，缺省 ``auto``；只接受 auto / dummy / subproc。
+
+    ``auto``（默认）：训练（``n_envs > 1``，默认 8）用多进程 ``SubprocVecEnv``，
+    单环境评估/遥控用 ``DummyVecEnv``（解析在
+    :func:`robotdog.training.resolve_vec_env`，config 层只做取值与校验）。
+    """
+    value = str(_section(raw, "env").get("vec_env", "auto")).strip().lower()
+    if value not in ("auto", "dummy", "subproc"):
+        raise SystemExit(
+            f"config.yaml 的 env.vec_env 必须是 'auto' / 'dummy' / 'subproc'，"
+            f"收到 {value!r}"
+        )
+    return value
 
 
 def device(raw: Mapping[str, Any]) -> str:

@@ -25,7 +25,7 @@
 | --- | --- | --- |
 | 控制频率 | **50 Hz**（物理 500 Hz，`decimation=10`） | `EnvConfig.timestep/decimation` |
 | 回合长度 | 20 s = **1000 控制步** | `env.episode_length_s` |
-| 并行环境 | 8（`DummyVecEnv`） | `env.n_envs` |
+| 并行环境 | 8（当时为 `DummyVecEnv`） | `env.n_envs` |
 | 动作模式 | **residual**（12 维逐关节残差） | `env.action_mode` |
 | 残差权限 | `action_scale = 0.60 rad` | `env.action_scale` |
 | 先验步态 | 平地 `trot_natural167` / 楼梯 **`crawl_125`**（按地形自动切） | `env.gait_file*` |

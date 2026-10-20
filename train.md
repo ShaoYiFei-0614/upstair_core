@@ -1580,3 +1580,131 @@ actor 仍 53 维）。两条路线都与对照组同配方、同预算、seed 0�
 日志 `.tmp/ablation/train_l{0..3}.log`、`eval_l{0..3}.log`、`train.jsonl`、`eval.jsonl`；
 跑批脚本 `.tmp/run_ablation_pairs.py`；contact 项不触发的证据 `.tmp/_probe_contact_fire.log`。
 
+## vec_env A/B — SubprocVecEnv 吞吐验证（2026-10-20，**单 seed，n=1**）
+
+**问题**：单进程 `DummyVecEnv` 下环境采样占端到端约 93%，`mj_step` 不释放 GIL，
+线程池无收益；本条目验证「把采样摊到多进程」能否在不改奖励/课程/网络的前提下提速。
+
+**设计**：以 `upstairs_v1` 的网络与 PPO 超参为基线，取单级平地做受控 A/B
+（`heights=[0]`、50k 步、`lr=3e-4`、`command vx∈[0.2,0.6]`、`vy=0`、`yaw=0.3`、
+`n_envs=8`、`net_arch=[512,256,128]`、`n_steps=256`、`batch_size=512`、`seed=0`、
+`save_every=0`、`log_every=50`）。两臂配置仅 `run.name` 与 `env.vec_env` 不同，
+`plan.json` 的 SHA256 前缀均为 `9eaec70bc161ffd7`，逐字段相同。串行执行，避免抢核与内存。
+
+| 臂 | run | 墙钟 s | summary wall s | learn SPS | e2e SPS（含构建/spawn/保存） | 均回报 | 摔倒 | 回合 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| dummy #1 | `ab_dummy_4` | 91.2 | 88.6 | 579 | 548 | −1698.957 | 8% | 51 |
+| dummy #2 | `ab_dummy_6` | 92.7 | 90.4 | 568 | 539 | −1698.957 | 8% | 51 |
+| subproc #1 | `ab_subproc_4` | 43.9 | 41.4 | 1408 | 1139 | −2090.7 | 10% | 52 |
+| subproc #2 | `ab_subproc_5` | 44.1 | 41.7 | 1406 | 1134 | −2090.7 | 10% | 52 |
+
+- **learn SPS 倍率**：1408/579 = **2.432**、1406/568 = **2.475**，均值 **≈2.45**；
+  dummy 两次落在预期 550–760，同臂重复差 1.9% / 0.1% ⇒ 按开跑前写死的
+  `.tmp/ab_subproc/RULE.md` 判 **PASS**（min≥1.45 且 mean≥1.5）。
+- **e2e 倍率 2.08–2.10**：50k 步下 8 个 worker 的 spawn + env 构建 + 保存约 4–8 s，
+  在 subproc 的 44 s 里约占 19%；预算越长摊得越薄。
+- 两臂 `mean_return` 差 23%（−1698.957 vs −2090.7，比值 1.23，在预设 [0.7,1.4] 内）。
+  这不是能力差异：DummyVecEnv 串行与 SubprocVecEnv 并行的**采样顺序不同**，PPO 轨迹
+  因此不同；环境/奖励等价由 L2（8100 项 term 比较 DIFFS=0）单独证明。
+- **50k 只是受控吞吐基准，不是完整 `upstairs_v1` 复跑**。按本结果线性推算，7.45M 步
+  从约 3.6–3.8 h 降到约 1.5–1.8 h，属于**推算**，未实测；完整九级课程未在本轮启动。
+
+**9×2000 步冒烟（两臂，链路）**：`smoke_vec_d_20261019` 与 `smoke_vec_s_20261019`
+各 9 级 × 2000 = 18,000 步，均 exit 0，9 个阶段进入/退出、9 条「训练完成 2,000 步」、
+0 条 Traceback/MJCF/NaN；dummy 各级 3.1–4.8 s，subproc 2.2–4.1 s。2000 步权重能力
+≈随机，`flat_4` 的单回合成功率差异（100% 摔倒 vs 0%）不作能力结论。
+
+**下游配置确实到达 worker**：`runs/smoke_vec_s_20261019/checkpoints/flat/flat_2000_steps_env.json`
+里 `foot_lift=0.9`、`foot_lift_step_ratio=1.4`、`probe_lift=0.0`、`forward_overspeed=0.0`、
+`yaw_rate=8.0`，以及 `command vx_min=0.2/vx_max=0.6/vy_max=0.0/yaw_max=0.3`，与 `plan.json`
+逐项一致。注意 `<阶段>_final_env.json` 按设计写的是 `config.yaml` 基线，不写本级覆盖
+（`scripts/train.py:146-154`、`:320`）；判 setter 是否生效必须读中间 checkpoint。
+
+**warm-start 跨臂**：用 dummy 臂的 `flat_final.zip` 在 subproc 下续训
+（`smoke_ws_20261019`），日志出现「继承权重」与「装回观测统计」两行，exit 0，
+2000 步 1268 SPS / 3.7 s，说明 VecNormalize 统计与权重在两种 vec_env 间可迁移。
+
+**L4 评估链路**：`crawl24/checkpoints/stair15_final.zip` 在 15cm 锚点上仍为
+91.0% 成功 / 9.0% 摔倒 / 0.0% 超时、前进 2.83m、爬升 1.12m、速度 0.32m/s、453 步，
+与存档基线逐项一致；subproc 冒烟产物在 stair9 上跑 40 回合只验证链路
+（0% 成功、100% 摔倒、观测 53 / 动作 12、地形 9.0cm×8 级 踏面 30cm），不判能力。
+
+**方法坑（已保留失败现场）**：用 `Start-Job` 或 `2>&1 | Out-File` 跑时 dummy 被压到
+502/493/494 步/秒，且 PowerShell 5 按 GBK 解码 Python 的 UTF-8 输出，日志变成 UTF-16
+乱码；同一配置用 `*>` 直跑得 579/568 与 1408/1406。**计时必须 `*>` 直跑**，管道本身
+约 15% 开销并破坏编码。有效日志 `.tmp/ab_dummy_4.log`、`ab_dummy_6.log`、
+`ab_subproc_4.log`、`ab_subproc_5.log` 是 UTF-16，读取需 `encoding='utf-16'`。
+
+**结论**：本机允许命名管道时，`env.vec_env: subproc` 把 learn 吞吐提到 **2.45×**、
+整进程墙钟提到 **2.1×**，且不改奖励/课程/网络；默认仍是 dummy（兼容受限环境），
+subproc 是显式 opt-in。CUDA 不在本轮收益路径上：环境采样约 93%，PPO 前向/更新合计
+约 13%，且当前 `.venv` 是 `torch 2.14.1+cpu`。
+
+**产物**：`runs/ab_{dummy,subproc}_{4,6}/`（config/plan/summary/checkpoint）、
+`runs/smoke_vec_{d,s}_20261019/`、`runs/smoke_ws_20261019/`；
+日志与配置 `.tmp/ab_*.log`、`.tmp/ab_vec_*.yaml`、`.tmp/smoke_vec_*.yaml`；
+判据 `.tmp/ab_subproc/RULE.md`；视觉 `.tmp/review_frames_flat*`、`.tmp/review_frames_stair9`。
+
+## n_envs 扩展 — subproc 8/12/16/20 吞吐探针（2026-10-20）
+
+**问题**：subproc 下把 env.n_envs 从 8 继续提高，能否继续提速？拐点在哪里？
+本条目只测吞吐，不判策略能力。
+
+**设计**：以 vec_env A/B 的单级平地配置为底，heights=[0]、50k 步、seed=0、
+n_steps=256、batch_size=512、net_arch=[512,256,128]、save_every=0、
+log_every=50，只改 env.n_envs（8/12/16/20）与 run 名。每档串行跑 2 次，
+用 *> 直跑；不并发，避免抢核。注意 n_steps 固定，所以每次 update 的样本量
+n_steps × n_envs 随档位线性增大（2048→5120），这不是「同样本预算」的纯并行效率。
+
+| n_envs | 墙钟 s（rep1/rep2） | learn SPS（rep1/rep2） | e2e SPS 均值 | RSS MB（实测） |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 46.7 / 47.1 | 1326 / 1294 | 1066 | 4070 |
+| 12 | 43.8 / 42.9 | 1480 / 1505 | 1154 | 5988 |
+| 16 | 41.6 / 41.1 | 1660 / 1682 | 1209 | 7901 |
+| 20 | 40.6 / 40.9 | 1825 / 1802 | 1227 | 9828 |
+
+- learn SPS 均值：8→**1310**、12→**1492.5**、16→**1671**、20→**1813.5**。
+- 相对 8 的 e2e 增益：12 **+8.2%**、16 **+13.4%**、20 **+15.1%**；16→20 只再 **+1.5%**，
+  但 RSS 多 **1.9GB**（7.9→9.8GB），墙钟只快 0.6s。
+- 内存近似线性：**约 490MB/env**；RSS 为真实 Go2StairsEnv 建 20 步后所有 python
+  进程 WorkingSet 之和，不是训练峰值。20 env 约 21 个进程，20 逻辑核已接近饱和。
+- 8→12 的 learn 增益 +13.9%，12→16 +12.0%，16→20 +8.5%：边际收益递减。
+- 50k 的均回报/摔倒率随 n_envs 变化（−2090.7 / −3861.3 / −3615.3 / −2690.5），
+  但 50k 太短且每次 update 样本量不同，**不能当能力结论**。
+
+**建议**：默认仍用 n_envs=8（两臂并发时 2×4.1GB 可控）；单臂追速度优先 **16**
+（+13.4% e2e、7.9GB）；内存保守用 12；**20 只在「单臂、机器专用、能接受 9.8GB 与
+20 核占满」时考虑**——50k 端到端只多 1.5%（固定启动约 8s 占 17%），但长跑会摊薄
+启动，20 的 learn 比 16 再快 8.5%，代价是不能并行第二臂。dummy 下提高 n_envs 不
+增加并行度，基本不提速，仍建议 8。
+
+**产物**：runs/bench{1,2}_n{8,12,16,20}_20261020/；
+日志 .tmp/bench{1,2}_n*.log；配置 .tmp/bench_n{8,12,16,20}.yaml；
+汇总 .tmp/bench_nenv_summary.json；内存探针 .tmp/probe_nenv_mem.py、
+.tmp/probe_nenv_mem20.py。
+
+---
+
+## vec_env 默认翻转 — 训练默认 SubprocVecEnv×8（2026-10-20，**[冒烟]**）
+
+**改动**：`env.vec_env` 默认 `auto`（训练 `n_envs>1`→`subproc`，单环境→`dummy`）；
+新增 `resolve_vec_env()`；`config.yaml` 写 `vec_env: auto`；`n_envs` 保持 8。
+承接 `train.md` 的「vec_env A/B」与「n_envs 扩展」两条吞吐结论（50k A/B learn 2.43–2.48×、
+e2e 2.08–2.10×；16 env 是单臂甜点、默认仍 8）。
+
+**验证（L0–L4）**：L0 `compileall` exit 0；L1 `-m unittest tests.test_env_contract tests.test_asymmetric tests.test_ablation_levels` exit 0、`tests/test_vec_env.py` 11/11 exit 0（本机命名管道可用，真跑 subproc）；L2 `eq_check` 450 步×3 场景 vs `.tmp/eq_pre_asym.json` **EQ_DIFFS=0**；L3 `.tmp/vecenv_auto.yaml`（9 级×2000 步）→ `runs/vecenv_auto_1`：启动打印 `vec_env=auto → subproc`、9 个 `[课程] <<<`、1326 步/秒、exit 0；L4 `play.py --mode eval --run runs/vecenv_auto_1/checkpoints/stair3_final.zip --stage stair3 --sampled-command --config .tmp/eval_link.yaml` exit 0（n_envs=1 走 dummy，`观测: (53,)`）。
+
+**吞吐（同配置单级 20k 步、8 env、seed 0）**：
+
+| 臂 | 墙钟 | learn SPS |
+| --- | ---: | ---: |
+| `dummy`（`runs/vecenv_bench_dummy_1`） | 50.4 s | 438 |
+| `subproc`（`runs/vecenv_bench_sub_1`） | 24.8 s | 1292 |
+
+⇒ **+195%（≈2.95×）**；与 50k A/B 的 2.43–2.48× 同向（短跑启动税占比小、数字偏高）。
+
+**评审**：C/D/E 子代理派发在本会话不可用（工具 auto-review 触发 `CONTEXT_WINDOW_EXCEEDED`），按 skill 失败模式标「设计评审降级」，由主代理自检 L0–L5；trace 见 `.tmp/trace/vecenv_subproc.jsonl`。**L5 不适用**：只改向量化实现与默认值，不改变训练分布/奖励/观测/动作。
+
+**边界**：默认变更使「同 seed 重训」不再逐位可比（采样顺序不同）；对比实验须同 vec_env 下重跑基线（§23.65：同配方重训方差 ≥6 点）。受限沙箱用 `env.vec_env: dummy` 回退。
+
+**产物**：`runs/vecenv_auto_1/`、`runs/vecenv_bench_sub_1/`、`runs/vecenv_bench_dummy_1/`、`.tmp/vecenv_*.yaml`、`.tmp/trace/vecenv_subproc.jsonl`。
