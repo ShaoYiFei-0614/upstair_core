@@ -4872,3 +4872,173 @@ crawl_125 步态、overrides 每 +1.5cm 微增），然后每格 100 回合回�
 `tests/test_tactile.py::ForceVectorTest`、`doc/tactile_estimator.md`；结果
 `.tmp/tactile_estimator/{report_final.md,report_final.json,report_final.axes.txt,
 estimator_final.pt,data/}`；日志 `.tmp/_collect3.log`/`_train_final2.log`/`_eval_final4.log`。
+
+## 23.75 Level0/Level1 触觉奖励对照：**PL+Landing 有效、Stance 单项灾难、三项组合不如两项**（2026-10-20）
+
+**设计**：16 级课程（4 平地 + 3→19.5cm，n_up=8，tread 0.30，单臂预算 15.85M），提前达标
+= 滑窗 ≥96% 且 ≥40 回合且 ≥300k 步；4 臂 `l0_base` / `l1_pl`（PreLanding −1.0/ref 0.6 +
+Landing −2.0/refs 3,1.5,6）/ `l1_st`（Stance +1.0/area 0.35/cop_jump 0.05）/ `l1_all`；
+**actor/critic 观测都不加触觉**，仅 `env.tactile.enabled=true` 供奖励与评测使用（盲走约束不变）。
+
+**训练成本**：l0 11.54M/126min（提前达标 7/16）、l1_pl 13.71M/183min（4/16）、
+l1_st 15.58M/206min（3/16）、l1_all 9.46M/121min（11/16）。**回放（40 回合/格，采样指令）**：
+主口径 18cm×30cm 成功率 = 15% / **85%** / 0% / 70%；15×30 = 50/88/0/95；21×30（外推）= 10/35/0/0；
+25cm 与 40cm 踏面全体崩坏（最好 28%）。登级 3.95/6.70/0.03/7.00，爬升速度 0.240/0.458/0.002/0.873 级·s⁻¹。
+
+**结论**：① PreLanding+Landing 是有效增量（主口径 +70 点、爬升速度 ×1.9）；② Stance 单项把策略
+推向「蹲稳不前进」——楼梯级全 0% 成功但摔倒率低、pitch |mean| 0.62、回报为正（超时），
+不是触觉无用而是**该奖励形状错**（点足上面积/CoP 信号弱，估计器 R² 为负）；③ 三项组合反而
+不如两项（18cm 低 15 点），Stance 在组合里继续拖后腿；④ 收益只在训练踏面 30cm 上成立，
+25/40cm 无泛化；⑤ 冲击峰值在主口径没降低（1.62 vs 1.60），l1_all 最低 1.39；功耗数字不可比（失败早退）。
+
+**本轮抓出并修的坑**：
+- ⭐ `robotdog/policy.py::env_config_from_summary` **漏重建 `TactileConfig`**（只重建 obs/reward/
+  command/gait/gait_stair）⇒ `cfg.tactile` 是 dict ⇒ `_validate_tactile()` 抛
+  `AttributeError: 'dict' object has no attribute 'enabled'` ⇒ **全部 Level1 权重无法 play/eval**。
+  教训：**新增嵌套 dataclass 配置后必须同步 `env_config_from_summary` 与 `_env.json` 反序列化**，
+  否则「训练成功、回放崩溃」，而且只影响开了该开关的臂（默认关的臂全绿，最容易漏）。
+- 预览视频继承 arm 配置的 `play.episodes_video: 10`、`video_max_frames: 300` ⇒ 渲出
+  **10 回合连播、12 fps**，视觉监视器直接判定「前提错误、无法细看」。修法：每个臂单独
+  `review_<arm>.yaml`（`episodes_video=1`、`video_max_frames=600`），重渲得到单回合 25fps。
+  教训：**渲染配置要显式覆盖，不要从训练配置继承**（训练配置里的 play 段是给默认流程的）。
+- HUD 的「登踏/前进/实测 vy·wz」是**回合末值统刷在每帧**，四个监视器都指出不能当逐帧遥测；
+  判断过程必须从画面推，不能读 HUD 数字。
+- `l0_base` 的 `_env.json` 里 `tactile.enabled=false` ⇒ 评测拿不到冲击/滑移/棱边指标，与 Level1
+  不可比。修法：**评测时统一 `cfg.tactile.enabled = True`（奖励权重仍 0）**，重跑 l0 9 格对齐口径。
+- 口径：单 seed；每 checkpoint 只测对应高度（21cm 用 19.5cm 末级权重，是外推不是训练过 21cm）；
+  40 回合/格 ⇒ 约 ±5 点。视觉是 n=1 单回合复核，不是成功率。
+
+**产物**：`doc/introduce_tactile.md`（设计/训练/评测/视觉全表）、`runs/<arm>/`（16 级 checkpoint、
+`promotions.json`、`summary.json` 含 `extras.trained_steps/promoted`）、`.tmp/level01/`
+（configs、logs、train_table.md、eval_table.md、eval/matrix_final.json、review2/）、
+评测脚本 `.tmp/eval_level01.py`。
+
+## 23.76 复现性追问三连：课程超参 ≠ 延伸链超参；奖励与指标不同口径；功耗随速度（2026-10-20）
+
+**Q1：`l0_base` 为什么复现不出「upstairs_v1 → crawl24 → hi165/18/195」链？**
+同高度 100 回合回放：`l0_base` 15/16.5/18/19.5 = **57/0/18/46%**；链 = 91（900k 96）/98/98/77%。
+`l0` 的窗口 3–9 cm 全部 96%（**提前达标**，仅 300–486k 步）⇒ 低层楼梯预算被砍到 1/4–1/2，
+所以「96% 跳级」**有关但不是主因**：10.5 cm 起每级跑满 1.2M 仍只有 30/14/56/54/2/2/10%。
+主因是**把课程模式的配方套进延伸链**：① LR：链延伸 9e-5/8e-5/7e-5（`train.md:789-796`），
+`l0` 用课程表 2e-4 到 19.5 cm（`scripts/train.py:284`）；10.5 cm 处 overrides 与预算都相同，
+仅 LR 差 ⇒ 30% vs 96%；② overrides 线性外推（15 cm 1.65/2.4/1.7 vs 链 1.8/2.4/1.8），
+高台阶抬腿欠激励；③ 链每级用回放挑 warm-start（850k/900k/1.1M/final，`train.md:781-787`），
+`l0` 固定传 `_final`；④ 单 run 16 级 vs 5 个独立 run（优化器/RNG/norm 边界重置）。
+**教训：一个配方 = 超参 + 奖励 ramp + warm-start 选取 + 课程边界，缺一项就不能叫「同配方复现」。**
+
+**Q2：罚了冲击/CoP，指标为什么反着走？** 因为**奖励与评测不是同一个量**：
+① 冲击奖励只在 LANDING 5 帧、对 4 足平均、clipped（>6 BW 封顶）；评测 `impact_p95` 是**全步**
+每步四足最大 `F̄` 的 95 分位。实测 `l1_pl`：mean 0.753 vs 0.794（↓）、max 7.27 vs 12.80（↓43%）、
+p95 1.622 vs 1.602（↑1.2%）；触地专项探针 p95 1.60 vs 1.325（↑21%）、max 14.37 vs 26.81（↓46%）
+⇒ 惩罚压掉的是**极端尖峰**，而 p95 是「常规落地」的秩统计，且 `l1_pl` 爬得快 1.9×、支撑帧更多。
+② stance 奖励 = `area + margin - cop_jump`，**没有足端滑移项**；`l1_st` 的 `cop_jump` 降了
+（0.0338 vs 0.0386），`slip_mean` 反升（2.98 vs 2.26 mm）。原因是**按帧发奖、不要求前进**：
+站桩每回合拿 `command_follow +6439`（vy=0/wz=0 的跟踪白给）+ stance +108 + alive 150，总
+**+3786** 而登级 0 ⇒ 「蹲稳不动」局部最优；原地倒脚令支撑相足端位移变大。
+**教训：正奖励项必须与「前进」耦合；零指令跟踪项在站桩时不该白给；指标要按奖励口径报告。**
+
+**Q3：落地更轻为什么功耗更高？** 因为功耗随**爬升速度**走，不随冲击走：18×30 下
+`l1_pl` 314 W / `l0` 188 W，爬升 0.0945/0.0549 m/s（1.72×），但**每米爬升机械功 3326 vs 3424 J
+（−2.9%，持平）**；跨 36 格 `power~levels_per_s +0.44`（`l1_pl` 内 +0.76）、`power~impact_p95 −0.10`。
+`l0` 的「高冲击」是摔倒时的极大尖峰（max 12–27 BW），摔倒回合平均功率反而低。
+**教训：能耗比较用「每米/每级焦耳」，不要用瞬时功率；`Σ|τq̇|` 是机械功率不是电池功率。**
+
+数据：`.tmp/q1_evals/{summary,summary_l0_matched2}.json`、`.tmp/q2_probe/{touchdown,reward_breakdown}.json`、
+`.tmp/_q23_analyze.py`（36 格相关）、`.tmp/_q3_energy.py`（每米能量）；完整表见 `doc/introduce_tactile.md` §8。
+
+## 23.77 训练并发不是看 CPU：`SubprocVecEnv` 的 8 个 worker 会吃光 15.7GB（2026-10-21）
+
+**事故**：同一时刻跑了 4 个 8-env 训练（`l1_st2`、`chain_repl`、`lr2e4`、`lr9e5`，
+机器 15.67 GB / 20 逻辑核）。两个 run 先后报 `MemoryError`（`import` 阶段）与
+`OSError: [WinError 1114] 动态链接库(DLL)初始化例程失败 ... torch/lib/shm.dll`；
+另两个训练在 10:09 后无输出，全部被系统杀掉。`runs/lr2e4`、`runs/lr9e5` 只剩 `trace.jsonl`；
+`l1_st2` 到 `flat_4`、`chain_repl` 到 `flat_2`（已归档到 `runs/_oom_20261021/`）。
+
+- **根因**：`robotdog/training.py::resolve_vec_env` 在 `n_envs > 1` 时选 `SubprocVecEnv`
+  （Windows spawn）⇒ **每个 run 派生 8 个 python 子进程**（各 ~0.4–0.6 GB，含 MuJoCo）。
+  2 run 并发 = 16 worker ≈ 8–10 GB，再加系统/工具进程就打穿 15.7 GB。
+- **误判风险**：`shm.dll` 的 DLL 初始化失败在日志里很像「torch 装坏了」，实际是内存耗尽；
+  先数 python.exe 里有多少 `multiprocessing.spawn` 子进程。
+- **修法（已落）**：发车脚本加资源闸门 —— 发下一个 run 前等「可用物理内存 ≥ 6 GB
+  且没有其它 `scripts/train.py`」，并把 `lr9e5` 从 batch 1 改到 batch 2（**串行**）。
+  实现见 `.tmp/run_stance_lr_chain.py::free_gb/train_procs/wait_resources`。
+- **口径**：评估/回放（`n_envs == 1`）走 `DummyVecEnv`，可并发；训练一律**串行 1 个 run**，
+  除非显式把 `n_envs` 降下来并接受训练配方变化。已写进 `doc/train.md`「并发与内存」。
+## 23.78 受控 LR A/B：LR 是 15cm 崩级的**头号原因**（2026-10-21）
+
+设置：单级 1.2M、同 warm-start、seed 0、只改 `curriculum.learning_rate`（`ppo.learning_rate` 同步）、
+100 回合 `--sampled-command` 回放。
+
+- **13.5cm**（warm-start crawl22/stair12）：2e-4 **90.0%** vs 9e-5 **93.0%**（Δ+3pp）⇒ 天花板，
+  两臂都 ≥0.85 ⇒ 按任务书 invalid_condition 上移一级。**低层 LR 不敏感**。
+- **15cm**（warm-start crawl23/stair13_5 850k）：2e-4 **55.0%**、9e-5 **93.0%**、7e-5 **85.0%**。
+  **+38pp（9e-5 − 2e-4）**；9e-5 与 7e-5 的差在 n=100 噪声内。
+- **因果闭环**：L0 课程的 15cm 回放 57% ≈ 本次 2e-4 臂 55% ⇒「课程统一 2e-4」**单独**就能
+  复现 L0 崩盘；overrides 外推/warm-start 选取/单 run-vs-多 run 都不是必要条件（它们是次要因素）。
+- **复现性**：`lr15_7e5`（crawl24 复刻）训练滑窗 82% 与 crawl24 一致；终局回放 85.0% vs 历史
+  91.0%（Δ6pp）——**单 seed 下「同配方」不等于「同权重」**，跨 run 比较要按同协议重跑两臂。
+- **教训**：① 高台阶（≥15cm）用 2e-4 会让策略「学会摔」而不是「学会爬」——LR 决定的是
+  能不能保住起点；② 低台阶（≤13.5cm）LR 不敏感，**LR 实验必须放在难度接近能力边界的一级**，
+  否则测到的是天花板；③ 这条与 Q1 的排序一致，但当时只是「相关性」，现在是受控证据。
+
+产物：`runs/lr2e4/`、`runs/lr9e5/`、`runs/lr15_2e4/`、`runs/lr15_9e5/`、`runs/lr15_7e5/`；
+日志 `.tmp/stance_lr_chain/`、`.tmp/phase_seq/`、`.tmp/lr_ab/eval_*.log`；表见
+`doc/introduce_tactile.md` §9.7.1、`train.md` 的 `lr_ab` 节。
+
+## 23.79 停摆归因：不是触觉配方，是 stair3 的**起点权重**；但「R1 起点」修好崩级、赔掉踏面泛化（2026-10-22）
+
+**背景**：R2 配方（链式 LR + 2.1 覆盖）的 `l1_all_v3` 从 0 训练时，stair3 复现「不摔不爬」停摆
+（0%、0% 摔、跑满 1.2M、均回报 +4158）；而 R1 的 `l1_all` 同级 96% 提前达标。两轮在 stair3 的
+训练配置**逐字段相同**（差异全在 ≥10.5cm 的 LR/覆盖与日志项）。
+
+**交叉诊断**（`l1_all_v3r1`）：R2 配置 + R2 协议，从 **R1 的 `flat_4_final.zip`** 起跑 12 级
+（stair3→19.5cm，跳过平地）。结果：
+- **stair3 100%/0% 摔、500k 步提前达标** ⇒ R2 配方本身不会造成停摆；
+- 3–13.5cm 全部 96–100% 提前达标；15/16.5/18/19.5cm = 84/80/78/58%（R1 对应 96/72/74/**0%**）
+  ⇒ **19.5cm 崩级被修好**（0 → 58%），15cm 反而变差（R2 该级 LR 7e-5 vs R1 2e-4）；
+- 但 9 格泛化均值 **29.7%**，低于 R1 `l1_all`（37.8%）与 R2 三臂（43.6–63.3%）；塌陷集中在
+  **窄踏面 25cm**（15/25 27.5% vs R1 85%，18/25 5% vs 62.5%）与 21cm 多数格。
+
+**教训**：
+1. **「不摔不爬」停摆是初始化 × 协议 × seed 的分叉，不是奖励配方必死。** 同一份 R2 配方，
+   换一个只差 100k 平地训练的起点，stair3 从 0% 变 100%。定位这类问题要**先做交叉初始化**
+   （改一个变量），而不是先改奖励/调 LR。
+2. **提前达标（promote）是课程元参数，它会改变后续所有级的初始权重**：R1 的 300k/40 回合让
+   flat_4 停在不同的权重上（差异小到平地指标看不出：96/96 vs 96/100），却决定了 stair3 的分叉。
+   改 promote 协议 = 改了整条链的初始化分布，必须当作变量记录。
+3. **训练窗口 ≠ 泛化**：v3r1 窗口 12/12 级全部健康（低层 96–100%），9 格泛化只有 29.7%，
+   且**在训练踏面（30cm）之外塌陷**（25cm 尤甚）。「会爬 30cm 台阶」和「会爬楼梯」是两件事，
+   泛化结论必须来自多踏面 × 多高度对齐评测（9 格 × 40 回合），不能只看训练窗口。
+4. **能耗口径**：本臂成功回合口径最低（276.8 J/级），但能耗/m 2235 J 仍高于 `l1_st_v2` 的
+   1896 J（失败回合多、每米更贵）；跨臂比较用「成功回合口径」或能耗/m，不能只挑一个口径。
+5. n=1、40 回合/格 ⇒ ±5–7 点，不能下「某配方更强」的判决；当前单 seed 最强仍是 `l1_st_v2`
+   （9 格 63.3%、18×30 95%、能耗/m 1896 J 最低）。
+
+**产物**：`runs/l1_all_v3r1/`、`.tmp/seeds3/eval/l1_all_v3r1/matrix.json`、
+`.tmp/seeds3/seed_report.md`、对照脚本 `.tmp/_cmp_v3r1.py`；停摆证据
+`.tmp/seeds3/attempt2_l1_all_v3_stall/`。
+
+## 23.80 四臂最终对比（触觉奖励）：stance v1 单 seed 最优；冲击类奖励无收益（2026-10-22）
+
+- **口径**：9 格（15/18/21cm × 25/30/40cm，40 回合/格、`--sampled-command`、seed 0）；
+  主口径 18cm×30cm。完整数据见 `doc/introduce_tactile.md`（本版本唯一记录）。
+- **结果**：9 格平均成功率 `l1_st_v2` **63.3%** > `l0_v2` 52.8% > `l1_pl_v2` 43.6% >
+  `l1_all_v3r1` 29.7%；主口径 18×30：`l1_pl_v2` 100% ≈ `l0_v2` 97.5% ≈ `l1_st_v2` 95% >
+  `l1_all_v3r1` 72.5%。`l1_st_v2` 的能耗/级 272.4 J、棱边踩踏 0.42%、滑移 1.34 mm/s、
+  横滚峰峰 0.418 rad 全部最优或次优。
+- **结论**：① stance v1 的「稳定支撑」奖励在**广域平均**上确实带来收益（+10.5 点 vs 无触觉），
+  且把「踩稳→少滑→少棱边→更省力」串成同向指标；② PreLanding/Landing 的**冲击收益没有
+  可测证据**（四臂 impact p95 1.37–1.51 BW，差异在噪声内），`l1_pl_v2` 只在 18×30 单格
+  突出，25/40cm 踏面明显差 ⇒ 泛化不成立；③三项全开 `l1_all_v3r1` 在 12 级课程 + R1 起点下
+  垫底，**不可当三项全开上限**（要判它必须 R2 配方从 0 重训，先解 stair3 停摆）。
+- **边界**：21cm 高度对所有臂都接近能力边界（21/40 全臂 0–2.5%）；40cm 宽踏面普遍比 25/30cm
+  更难（步幅/跨级失配）。下一轮优先补「宽踏面 + 高台阶」的课程，而不是加大奖励权重。
+- **口径教训**：①能耗/级只在成功回合有定义，跨臂比较必须同时给成功率，否则「失败多=省电」
+  会反向骗人；②单回合渲染视频的成败不代表评测成功率（采样指令 + 单回合方差），视频只用来看姿态；
+  ③n=1 seed、40 回合/格 ⇒ ±5–7 点二项噪声，排序只在多格同向且差距 >~10 点时成立。
+- **补记（五臂版，2026-10-22 晚）**：把 R1 第一版的 `l1_all`（16 级从 0、楼梯 LR 2e-4、
+  `foot_lift ≤1.8`、promote 96%/40 回合/300k）也纳入对比后：9 格平均 37.8%、18×30 70.0%、
+  横滚稳定性最差（9 格 |mean| 0.261 / 峰峰 1.131 rad）、主口径功耗最高 315 W、滑移最差
+  （2.5 mm/s），但 15/25 单格 85%、棱边踩踏 0.42% 并列最好 ⇒ **三项全开在 R1 配方下同样
+  没有叠加优势，且姿态更晃**。R1 与 R2 在 LR/奖励覆盖/promote 协议上不同，只能作参考列，
+  不可与 R2 四臂做严格归因。

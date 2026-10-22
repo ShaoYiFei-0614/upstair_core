@@ -20,6 +20,7 @@ import numpy as np
 
 from robotdog.env import CommandConfig, EnvConfig, ObsConfig, RewardConfig
 from robotdog.gait import GaitParams
+from robotdog.tactile import TactileConfig
 from robotdog.tools.terrain import StairSpec, demo_stairs_spec, flat_spec
 
 
@@ -98,6 +99,11 @@ def env_config_from_summary(summary_path: str | Path) -> EnvConfig:
         # dict，直接塞给 EnvConfig 会让 ``env._command`` 变成 dict，
         # ``set_command_now`` 当场 AttributeError。必须重建。
         env_kw["command"] = _rebuild(CommandConfig, env_kw["command"])
+    if isinstance(env_kw.get("tactile"), dict):
+        # 触觉配置也是嵌套 dataclass（2026-10-20 加入）。JSON 往返后是普通 dict，
+        # 直接塞给 EnvConfig 会让 ``cfg.tactile.enabled`` 当场 AttributeError ——
+        # Level1 四个臂的权重（tactile.enabled=true）在 play.py / 评测脚本里都会踩到。
+        env_kw["tactile"] = _rebuild(TactileConfig, env_kw["tactile"])
     if isinstance(env_kw.get("gait"), dict):
         env_kw["gait"] = GaitParams.from_dict(env_kw["gait"])
     if isinstance(env_kw.get("gait_stair"), dict):

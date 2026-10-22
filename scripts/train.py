@@ -62,11 +62,13 @@ from robotdog.training import (  # noqa: E402
     RunDir,
     build_ppo,
     make_vec_env,
+    replay_success_rate,
     resolve_vec_env,
     restore_vecnormalize,
     restore_vecnormalize_compat,
     save_vecnormalize,
     set_parameters_compat,
+    warm_select_stages,
 )
 
 #: 只打印进度，不训练的最小步数（避免把 0 步的配置跑成死循环）。
@@ -104,7 +106,9 @@ class ProgressCallback(BaseCallback):
 
     def __init__(self, *, log_every: int = 20, window: int = 50,
                  reward_keys: Sequence[str] = (), terms_path: Path | None = None,
-                 stage: str = "", verbose: int = 1) -> None:
+                 stage: str = "", verbose: int = 1,
+                 promote_rate: float = 1.1, promote_min_steps: int = 0,
+                 promote_min_episodes: int = 0) -> None:
         super().__init__(verbose)
         self.log_every = max(1, int(log_every))
         self.stats = EpisodeStats(window=window)
@@ -113,6 +117,13 @@ class ProgressCallback(BaseCallback):
         self.stage = str(stage)
         self._last_episodes = 0
         self._last_print = 0
+        # 提前达标（Level0/1 课程协议）：窗口成功率 ≥ promote_rate 且样本足够
+        # 时主动结束本级（返回 False 让 SB3 停 learn），下一级从当前权重重启。
+        # 默认 1.1 = 永不触发，历史行为逐位不变。
+        self.promote_rate = float(promote_rate)
+        self.promote_min_steps = int(promote_min_steps)
+        self.promote_min_episodes = int(promote_min_episodes)
+        self.promoted = False
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
@@ -137,6 +148,17 @@ class ProgressCallback(BaseCallback):
                                         for k, v in means.items()}}
                     with self.terms_path.open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if (not self.promoted and 0.0 < self.promote_rate <= 1.0
+                and self.num_timesteps >= self.promote_min_steps
+                and self.stats.n_total >= self.promote_min_episodes
+                and self.stats.n_window >= min(30, self.stats.n_total)
+                and self.stats.success_rate >= self.promote_rate):
+            self.promoted = True
+            print(f"    [课程] ⏫ 提前达标：窗口成功率 "
+                  f"{self.stats.success_rate:.1%} ≥ {self.promote_rate:.0%}，",
+                  f"{self.stats.n_total} 回合 / {self.num_timesteps:,} 步 ⇒ 本级提前结束",
+                  flush=True)
+            return False
         return True
 
 
@@ -202,6 +224,10 @@ class Trainer:
         self.n_envs = n_envs
         self.vec_env = vec_env
         self.last_stats = EpisodeStats(window=200)
+        # 提前达标阈值（main 从 --promote-* 命令行注入；默认永不触发）。
+        self.promote_rate = 1.1
+        self.promote_min_steps = 0
+        self.promote_min_episodes = 0
         # ⭐ config.yaml 的奖励基线（没叠任何课程覆盖的那一份）：
         # make_env 每级开始前把它抄回子环境，保证覆盖是「从基线叠」。
         self._reward_baseline = copy.deepcopy(cfg.reward)
@@ -322,13 +348,17 @@ class Trainer:
                           flush=True)
 
         reward_keys = tuple(self.run.get("log_reward_terms") or ())
-        callbacks = [ProgressCallback(
+        progress = ProgressCallback(
             log_every=int(self.run["log_every"]),
             reward_keys=reward_keys,
             terms_path=(self.rundir.root / "reward_terms.jsonl"
                         if reward_keys else None),
             stage=stage.name,
-        )]
+            promote_rate=self.promote_rate,
+            promote_min_steps=self.promote_min_steps,
+            promote_min_episodes=self.promote_min_episodes,
+        )
+        callbacks = [progress]
         every = int(self.run["save_every"])
         if every > 0:
             # 中间检查点带 _env.json：从子环境读回这一级实际生效的配置
@@ -353,7 +383,11 @@ class Trainer:
         save_env_json(target, self.cfg, step_height=stage.step_height,
                       stage=stage.name)
         self.last_stats = callbacks[0].stats
-        print(f"    训练完成 {stage.timesteps:,} 步  {sps:.0f} 步/秒", flush=True)
+        # 提前达标时 actual < budget；把两者都带回，供台账记录「训练轮数」。
+        self.last_stats.promoted = bool(progress.promoted)
+        self.last_stats.trained_steps = int(getattr(model, "num_timesteps", 0))
+        print(f"    训练完成 {self.last_stats.trained_steps:,} 步  {sps:.0f} 步/秒"
+              f"{'（提前达标）' if progress.promoted else ''}", flush=True)
         return model, self.last_stats
 
 
@@ -376,6 +410,18 @@ def parse_args(argv: Sequence[str] | None = None):
     ap.add_argument("--warm-start", default=None,
                     help="第一级从哪个 checkpoint 继承权重（跨 run 续训用；"
                          "例如从 runs/<旧 run>/checkpoints/stair9_final.zip 出发只训更高台阶）")
+    ap.add_argument("--promote-rate", type=float, default=1.1,
+                    help="提前达标阈值：本级滑窗成功率 ≥ 该值（且满足 --promote-min-*）"
+                         "就提前结束本级、进入下一级；>1 或 <=0 表示关闭（默认 1.1）")
+    ap.add_argument("--promote-min-steps", type=int, default=300000,
+                    help="提前达标前本级至少训练多少步")
+    ap.add_argument("--promote-min-episodes", type=int, default=40,
+                    help="提前达标前本级至少完成多少回合")
+    ap.add_argument("--select-warm-start", action="store_true",
+                    help="每级结束后回放同级 checkpoint，取最优作为下一级 warm-start"
+                         "（chain 复刻的选取规则，见 doc/introduce_tactile.md §9；默认关）")
+    ap.add_argument("--select-episodes", type=int, default=40,
+                    help="--select-warm-start 每份候选 checkpoint 的回放回合数")
     ap.add_argument("--warm-norm", default="auto", choices=("auto", "on", "off"),
                     help="warm-start 时是否把权重旁边那份 *_vecnormalize.pkl 的观测统计"
                          "一起装回：auto = 有就装（默认）、on = 必须有、off = 不装"
@@ -399,6 +445,23 @@ def _result(stage: StageSpec, stats: EpisodeStats, wall: float, path: Path,
         episodes=int(stats.n_total),
         obs_size=int(cfg.obs.size),
     )
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+
+
+def _append_run_trace(rundir: Any, event: dict[str, Any]) -> None:
+    """把 rollout 层事件追加到 ``runs/<run>/trace.jsonl``（失败不影响训练）。"""
+    try:
+        rec = {"ts": _now_iso(), "layer": "rollout"}
+        rec.update(event)
+        path = Path(rundir.root) / "trace.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # pragma: no cover - Trace 不能拖垮训练
+        pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -462,7 +525,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     trainer = Trainer(cfg, rundir, run=run, ppo=ppo, n_envs=n_envs,
                       vec_env=vec_env)
+    trainer.promote_rate = float(getattr(args, "promote_rate", 1.1))
+    trainer.promote_min_steps = int(getattr(args, "promote_min_steps", 0))
+    trainer.promote_min_episodes = int(getattr(args, "promote_min_episodes", 0))
+    if 0.0 < trainer.promote_rate <= 1.0:
+        print(f"[课程] 提前达标协议: 滑窗成功率 ≥ {trainer.promote_rate:.0%} 且 "
+              f"≥ {trainer.promote_min_episodes} 回合 / "
+              f"{trainer.promote_min_steps:,} 步 ⇒ 提前结束本级", flush=True)
+    select_warm_start = bool(getattr(args, "select_warm_start", False))
+    select_episodes = int(getattr(args, "select_episodes", 40))
+    # 只有「确实要为下一级选起点」时才回放候选：1-based 序号下是 1..n-1。
+    # 最后一级不选（否则 Trace 会写一条从未发生的 warm_select）；单级配置恒空集。
+    selectable = set(warm_select_stages(len(stages)))
+    if select_warm_start:
+        print(f"[课程] warm-start 选取协议: 每级结束后回放同级 checkpoint "
+              f"各 {select_episodes} 回合，取成功率最高（并列取步数少）者", flush=True)
     results = []
+    promotions: list[dict[str, Any]] = []
     warm: str | None = getattr(args, "warm_start", None)
     if warm:
         print(f"[课程] 第一级从外部 checkpoint 继承权重: {warm}", flush=True)
@@ -470,6 +549,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     for i, stage in enumerate(stages, start=1):
         print(f"[课程] >>> 第 {i}/{len(stages)} 级 '{stage.name}' ({stage.label}) "
               f"{stage.summary()}", flush=True)
+        _append_run_trace(rundir, {"event": "stage_start", "stage": stage.name,
+                                   "step_height": float(stage.spec.step_height),
+                                   "tread": float(stage.spec.tread),
+                                   "learning_rate": float(stage.learning_rate),
+                                   "budget_steps": int(stage.timesteps),
+                                   "warm_start": str(warm) if warm else None})
         venv = trainer.make_env(stage, warm_start=warm)
         t0 = time.time()
         try:
@@ -483,11 +568,81 @@ def main(argv: Sequence[str] | None = None) -> int:
         wall = time.time() - t0
         path = rundir.checkpoints / f"{stage.name}_final.zip"
 
-        results.append(_result(stage, stats, wall, path, cfg))
+        res = _result(stage, stats, wall, path, cfg)
+        trained = int(getattr(stats, "trained_steps", stage.timesteps))
+        promoted = bool(getattr(stats, "promoted", False))
+        res.extras.update({"trained_steps": trained, "promoted": promoted,
+                           "budget_steps": int(stage.timesteps)})
+        results.append(res)
+        if promoted:
+            promotions.append({"stage": stage.name, "trained_steps": trained,
+                               "budget_steps": int(stage.timesteps),
+                               "episodes": int(stats.n_total),
+                               "success_rate": float(stats.success_rate)})
         warm = str(path)
+        # 只有「确实要为下一级选起点」时才回放候选（1-based 1..n-1）；最后一级不选
+        # （否则 Trace 会写一条从未发生的 warm_select，读者会误认为选过）。
+        if select_warm_start and i in selectable:
+            cands = sorted((rundir.checkpoints / stage.name).glob(
+                f"{stage.name}_*_steps.zip"))
+            # 只取预算后 40% 的候选 + final：链历史用「850k/900k/1.1M/final」这类
+            # 后段候选（train.md 的选取协议），全量 glob 会在 16 级上多花数小时。
+            budget = int(stage.timesteps)
+            floor_steps = int(0.6 * budget)
+
+            def _steps_of(zip_path) -> int | None:
+                digits = "".join(ch for ch in zip_path.stem.split("_")[-2]
+                                if ch.isdigit())
+                return int(digits) if digits else None
+
+            cands = [c for c in cands
+                     if (_steps_of(c) is None or _steps_of(c) >= floor_steps)]
+            if path.is_file():
+                cands.append(path)
+            ranked: list[tuple[float, float, Path, dict[str, float]]] = []
+            for cand in cands:
+                m = replay_success_rate(cand, stair=stage.spec,
+                                        episodes=select_episodes)
+                ranked.append((m["success_rate"], -m["mean_steps"], cand, m))
+                print(f"    [warm-select] {cand.name}: "
+                      f"成功率={m['success_rate']:.1%} 摔倒={m['fall_rate']:.1%} "
+                      f"步数={m['mean_steps']:.0f} 前进={m['mean_distance']:.2f}m",
+                      flush=True)
+            if ranked:
+                ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+                warm = str(ranked[0][2])
+                print(f"    [warm-select] 选用 {ranked[0][2].name} 作为下一级起点",
+                      flush=True)
+        if selected := (warm if select_warm_start and i in selectable else None):
+            _append_run_trace(rundir, {"event": "warm_select", "stage": stage.name,
+                                       "chosen": str(selected),
+                                       "rule": "success desc, mean_steps asc",
+                                       "episodes": int(select_episodes)})
+        _append_run_trace(rundir, {
+            "event": "stage_end", "stage": stage.name,
+            "step_height": float(stage.spec.step_height),
+            "tread": float(stage.spec.tread),
+            "learning_rate": float(stage.learning_rate),
+            "success_rate": float(stats.success_rate),
+            "fall_rate": float(stats.fall_rate),
+            "mean_return": float(stats.mean_return),
+            "mean_length": float(stats.mean_length),
+            "trained_steps": int(getattr(stats, "trained_steps", stage.timesteps)),
+            "budget_steps": int(stage.timesteps),
+            "promoted": bool(promoted),
+            "sps": float(trained / wall) if wall > 0 else 0.0,
+            "wall_s": float(wall),
+            "checkpoint": str(path),
+        })
         print(f"[课程] <<< '{stage.name}' 成功率={stats.success_rate:.1%} "
               f"摔倒率={stats.fall_rate:.1%} 均回报={stats.mean_return:.1f} "
-              f"用时={format_seconds(wall)}", flush=True)
+              f"用时={format_seconds(wall)}"
+              f"{f' 实际步数={int(getattr(stats, "trained_steps", stage.timesteps)):,}' if promoted else ''}"
+              f"{'（提前达标）' if promoted else ''}", flush=True)
+
+    if promotions:
+        (rundir.root / "promotions.json").write_text(
+            json.dumps(promotions, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 末级权重另存为 model_final，方便 play 直接找（连同它的归一化统计与地形记录）
     if results and Path(results[-1].model_path).is_file():

@@ -416,6 +416,16 @@ reward:
   tactile_stance: 0.0         # 支撑相：接触面积达标 + 支撑裕度 的奖励
   stance_area_target: 0.60    # Ā 目标（占足底面积比例）
   stance_cop_jump_ref: 0.05   # CoP 跳变参考（越小越稳）
+  # --- L1-stance 修正（2026-10-21，doc/introduce_tactile.md §9）----------------
+  # 以下这些键**默认中性**（与历史逐位相同）；打开后共同修正两个已确认的奖励漏洞：
+  # ① 零指令通道白给（command_follow 在 vy/wz 指令为 0 时完美跟踪就记满分）；
+  # ② stance 奖励不带前进门控、不带滑移惩罚 ⇒ 「蹲稳不动」局部最优。
+  follow_zero_baseline: false  # true = 零指令通道完美跟踪只记 0 分
+  zero_cmd_eps_vy: 0.05        # m/s，「零横向指令」死区（必须盖过 wander 的 0.03）
+  zero_cmd_eps_wz: 0.10        # rad/s，「零偏航指令」死区
+  stance_min_vx: 0.0           # >0 时 tactile_stance 按 clip(前向速度/该值,0,1) 门控
+  tactile_slip: 0.0            # 支撑相足端水平位移的惩罚（负数）
+  slip_ref: 0.005              # 滑移归一化参考 [m/步]：|位移|/ref 饱和到 1
 
 
 # --- PPO ------------------------------------------------------------------

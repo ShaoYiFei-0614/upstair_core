@@ -140,6 +140,22 @@ class RewardConfig:
     stance_area_target: float = 0.60    # Ā 目标：达到它面积项封顶（避免追求满掌）
     stance_cop_jump_ref: float = 0.05   # 归一化 CoP 每步跳变的参考尺度
 
+    # --- L1-stance 修正（2026-10-21） ---------------------------------------- #
+    # 背景：只加 stance 正奖（Level1 的 l1_st）收敛到「蹲稳不动」—— stance 项
+    # 按帧发奖、不要求前进，且零指令通道（vy_max=0 / wz=0）的跟踪项每步白给
+    # +lateral_vel+yaw_rate。三项默认**中性/关闭**，逐步奖励逐位不变。
+    # 设计说明见 doc/introduce_tactile.md §9。
+    follow_zero_baseline: bool = False  # True：零指令通道按「完美跟踪=0 分」计
+    # ⚠ 「零指令」必须用**死区**判定，不能对 ``cmd_body`` 做 ``== 0.0``：
+    #   cmd_body 含 command_wander_std≈0.03 的 OU 扰动与 stair_guidance 注入的
+    #   vy/wz（env.py 每步覆盖），楼梯级几乎恒非 0（reviewer/D 审计 2026-10-21）。
+    #   死区取「比扰动大一档、比真实指令小一档」：横向 0.05 m/s、偏航 0.10 rad/s。
+    zero_cmd_eps_vy: float = 0.05       # m/s，|横向指令| < 该值视为「零指令通道」
+    zero_cmd_eps_wz: float = 0.10       # rad/s，|偏航指令| < 该值视为「零指令通道」
+    stance_min_vx: float = 0.0          # m/s；>0 时 stance 奖励 × clip(vx/min_vx,0,1)
+    tactile_slip: float = 0.0           # 支撑相足端水平滑移惩罚（负权重）
+    slip_ref: float = 0.005             # m/步，滑移罚满参考（实测支撑相≈2–3 mm/步）
+
     # --- 辅助成形 ------------------------------------------------------------ #
     base_height: float = -2.0
     joint_vel: float = -2.0e-5
@@ -232,26 +248,37 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
     # 读**滤波后**的量（与观测的 vel_filter 块同一个数，保持马尔可夫性）。
     follow = 0.0
     tail = float(rc.track_tail)
+    zero_base = bool(rc.follow_zero_baseline)
     window_vy = 0.5 * max(float(cmd.vy_max), float(rc.lateral_range_floor))
     if cmd.vy_max or rc.lateral_vel:
         vy = (env.filtered_lateral_vel if vel_filter else env.base_lin_vel_body[1])
         xy = abs(vy - float(cmd_body[1])) / window_vy
-        follow += rc.lateral_vel * max(-1.0, track_shape(xy, tail))
+        track_vy = max(-1.0, track_shape(xy, tail))
+        if zero_base and abs(float(cmd_body[1])) < float(rc.zero_cmd_eps_vy):
+            # 零横向指令：完美跟踪记 0 分，偏差记负分（而不是每步白给 +lateral_vel）
+            track_vy -= 1.0
+        follow += rc.lateral_vel * track_vy
     # 偏航项**恒在**（不受 ``yaw_max`` 门控），量程取 ``max(yaw_max, yaw_range_floor)``。
     # 门控的代价实测过：``yaw_max == 0`` 的级别里没有任何一项读 wz，策略学会
     # 以 −0.608 rad/s **恒定自转**（`.tmp/zz_cmd_response.py` 扫 wz ∈ [−0.6, +0.6]
     # 七档，实测斜率 −0.0021、范围 −0.608~−0.606，即输出与指令逐位无关），
     # 而且这个转法在后续级别里冻住 —— 加进偏航指令后它仍在转。底噪 ``floor``
     # 保证「不转」在零指令级别也有价钱，同时避免 ``yaw_max == 0`` 时除零；
-    # 加惩罚必须**有界**（下界 −1，即最差 −``yaw_rate``），理由同前进项。
+    # 加惩罚必须**有界**（下界 −1，即最差 −``yaw_rate``），理由同前进项；
+    # ⚠ ``follow_zero_baseline=True`` 且该通道指令在死区内时再 −1 ⇒ 下界 −2。
     wz = env.filtered_yaw_rate if vel_filter else env.yaw_rate
     yaw_err = abs(wz - float(cmd_body[2]))
     # ``wz = 0`` 的级别补一个零指令基线惩罚：否则「命令我不许转」没有任何价钱
     # （放大系数见 ``RewardConfig.yaw_zero_gain``）。
+    # 注意这里是「**级别量程**判零」（`command.yaw_max` 由课程下发，整级恒 0），
+    # 与下面 `zero_cmd_eps_*` 的「**采样指令**死区」是两件事，不要合并。
     if cmd.wz == 0.0:
         yaw_err = rc.yaw_zero_gain * (yaw_err + abs(wz))
     yaw_range = 0.5 * max(float(cmd.yaw_max), float(rc.yaw_range_floor))
-    follow += rc.yaw_rate * max(-1.0, track_shape(yaw_err / yaw_range, tail))
+    track_yaw = max(-1.0, track_shape(yaw_err / yaw_range, tail))
+    if zero_base and abs(float(cmd_body[2])) < float(rc.zero_cmd_eps_wz):
+        track_yaw -= 1.0
+    follow += rc.yaw_rate * track_yaw
     terms["command_follow"] = follow
 
     # 2) 姿态稳定奖励 -- 惩罚 roll 与 pitch -----------------------------
@@ -474,9 +501,10 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
             terms["com_margin"] = 0.0
 
     # 11) 足底触觉相位条件策略（TactileStep，2026-10-20）。
-    #     **三个权重都为 0 时整段跳过** —— 逐步奖励逐位不变（eq_check 0 差异）。
+    #     **四个权重都为 0 时整段跳过** —— 逐步奖励逐位不变（eq_check 0 差异）。
     #     相位机与力/面积/CoP 的测量都在 robotdog/tactile.py；这里只做结算。
-    if (rc.tactile_prelanding or rc.tactile_impact or rc.tactile_stance):
+    if (rc.tactile_prelanding or rc.tactile_impact or rc.tactile_stance
+            or rc.tactile_slip):
         tac = env.tactile
         pre = tac.phase == PRELANDING
         landing = tac.phase == LANDING
@@ -509,10 +537,29 @@ def compute_reward(env, action: np.ndarray, trunk_contact: bool,
                 tac.area_norm / max(float(rc.stance_area_target), 1e-6), 0.0, 1.0)
             jump = np.clip(
                 tac.cop_jump / max(float(rc.stance_cop_jump_ref), 1e-6), 0.0, 1.0)
-            terms["tactile_stance"] = float(rc.tactile_stance) * float(
-                np.mean((area + tac.margin - jump) * stance))
+            stance_term = float(np.mean((area + tac.margin - jump) * stance))
+            # 「真的在前进」才付支撑分：否则原地蹲稳也能拿满（l1_st 的教训）
+            min_vx = float(rc.stance_min_vx)
+            if min_vx > 0.0:
+                vx_fwd = max(0.0, float(env.base_lin_vel_body[0]))
+                stance_term *= min(1.0, vx_fwd / min_vx)
+            terms["tactile_stance"] = float(rc.tactile_stance) * stance_term
         else:
             terms["tactile_stance"] = 0.0
+        if rc.tactile_slip:
+            # ④ 支撑相足端水平滑移（本次控制步的足端位移，仅支撑足结算）
+            prev = getattr(env, "_prev_foot_pos", None)
+            if prev is None:
+                terms["tactile_slip"] = 0.0
+            else:
+                disp = np.linalg.norm(
+                    np.asarray(env.foot_pos)[:, :2]
+                    - np.asarray(prev)[:, :2], axis=1)
+                slip_n = np.clip(disp / max(float(rc.slip_ref), 1e-6), 0.0, 1.0)
+                terms["tactile_slip"] = float(rc.tactile_slip) * float(
+                    np.mean(slip_n * stance))
+        else:
+            terms["tactile_slip"] = 0.0
 
     # --- 终止 -----------------------------------------------------------
     # 到达顶部 / 平地目标会*成功*结束回合，而不是让机器人走出楼梯远端摔下去。

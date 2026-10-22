@@ -969,7 +969,8 @@ class Go2StairsEnv(gym.Env):
         rc = self.cfg.reward
         if (float(rc.tactile_prelanding) != 0.0
                 or float(rc.tactile_impact) != 0.0
-                or float(rc.tactile_stance) != 0.0) and not tac.enabled:
+                or float(rc.tactile_stance) != 0.0
+                or float(getattr(rc, "tactile_slip", 0.0)) != 0.0) and not tac.enabled:
             raise ValueError(
                 "reward.tactile_* 权重非 0 时必须打开 env.tactile.enabled —— "
                 "否则奖励读到的相位/力恒为 0（等于白给权重）。"

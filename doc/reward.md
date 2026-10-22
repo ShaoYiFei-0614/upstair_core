@@ -67,7 +67,7 @@
 | 项 | 实现公式 | 每步理论界 | 平地零残差 | 3cm 被挡 | 已训策略 3cm 回合 |
 | --- | --- | --- | --- | --- | --- |
 | `forward_vel` | `10 × (max(−1, shape(\|v−cmd\|/0.25)) − min(1·err₊/0.45, 2))`，`err₊ = max(0, err)`（超速侧才加罚）；v 取机身系实测，cmd 取世界系指令的**机体系投影**（`command_body()` 每步现算） | [−30, +10] | **−0.34**（min −10：慢走对高档 cmd 饱和） | **−7.8**（被挡住，任务性惩罚） | −748~+1584/回合 |
-| `command_follow` | `6·shape_vy(窗口 0.5·vy_max) + 4·shape_wz(窗口 0.5·max(yaw_max, 0.30))`；`cmd.wz = 0` 时误差按 `yaw_zero_gain(1.5) × (\|err\|+\|wz\|)` 放大；求和、vy 门控 | [−10, +10] | **−3.54**（yaw 通道饱和于 −4：3×\|wz\| > 0.15 即触顶） | −3.54 | −1456~+979/回合 |
+| `command_follow` | `6·shape_vy(窗口 0.5·vy_max) + 4·shape_wz(窗口 0.5·max(yaw_max, 0.30))`；`cmd.wz = 0` 时误差按 `yaw_zero_gain(1.5) × (\|err\|+\|wz\|)` 放大；求和、vy 门控；`follow_zero_baseline=True` 时零指令通道（死区内）再各 −1，界变 **[−20, +10]**（零偏航级另叠加 `yaw_zero_gain`） | [−10, +10]（默认）/ [−20, +10]（基线开且指令在死区） | **−3.54**（yaw 通道饱和于 −4：3×\|wz\| > 0.15 即触顶） | −3.54 | −1456~+979/回合 |
 | `orientation` | `−1.2 × (roll² + pitch²)` | ≤ 0 | −0.005 | −0.094（顶立面前倾） | — |
 | `pitch_posture` | `−10 × min(max(0, −pitch − tol), 0.4)`，`tol = 0.14 + 1.2×台阶高`（rad）—— **只罚抬头侧** | [−4, 0] | 0（−7.1° 在死区内） | 0（高台阶死区放宽） | 抬头 −10.4° 时 ≈ −0.4/步 |
 
@@ -111,26 +111,49 @@
 ## 足底触觉相位条件策略（TactileStep，2026-10-20）
 
 数据面在 `robotdog/tactile.py`（测量 + 四相位机，设计见 `doc/tactile.md`）；本节只讲
-`compute_reward` 第 11 段的结算。**三个权重默认全 0，且三项都为 0 时整段跳过** ——
+`compute_reward` 第 11 段的结算。**四个权重默认全 0，且四项都为 0 时整段跳过** ——
 不产生键、不产生计算，逐步奖励与旧实现逐位一致（`tests/test_tactile.py` 钉住）。
+
+> 2026-10-21 更新：新增 `tactile_slip`，并给 `tactile_stance` 加「真的在前进」门控。
+> 背景：l0/l1 的 A/B 里 `l1_st`（只加 stance）训练窗口**全级 0%**、回放蹲在第一级不动 ——
+> 因为 stance 按帧无条件发奖，而「零指令通道」的 `command_follow` 还白给正项，
+> 「蹲稳不动」成了回报最高的局部最优（`doc/introduce_tactile.md` §8.3）。
 
 | 项 | 门控 | 逐足公式（再对 4 足取 mean） | 默认 |
 | --- | --- | --- | --- |
 | `tactile_prelanding` | `phase==PRELANDING` | `w·clip(−vz/prelanding_vz_ref, 0, 1)²` | `0.0` |
 | `tactile_impact` | `phase==LANDING` | `w·[clip(F̄/impact_force_ref,0,2) + clip(\|ΔF̄\|/impact_delta_ref,0,2) + clip(peak/impact_peak_ref,0,2)]` | `0.0` |
-| `tactile_stance` | `phase==STANCE` | `w·[clip(Ā/stance_area_target,0,1) + margin − clip(cop_jump/stance_cop_jump_ref,0,1)]` | `0.0` |
+| `tactile_stance` | `phase==STANCE` **且**前进门控 | `w·[clip(Ā/stance_area_target,0,1) + margin − clip(cop_jump/stance_cop_jump_ref,0,1)] · min(1, vx_fwd/stance_min_vx)` | `0.0`（`stance_min_vx=0` 即无门控） |
+| `tactile_slip` | `phase==STANCE` | `w·clip(‖Δp_xy‖/slip_ref, 0, 1)`（Δp 为本控制步足端水平位移） | `0.0`（`w<0` 为罚） |
 
 量纲与有界性（便于配权重时估量级）：
 
 - `tactile_prelanding ∈ [w, 0]`（w 为负；平方项在 `−vz ≥ prelanding_vz_ref` 时饱和）；
 - `tactile_impact ∈ [6w, 0]`（三个分量各在 [0,2]，mean 不放大）；
-- `tactile_stance ∈ [0, 2w]`（`area+margin−jump` 每足 ∈ [−1, 2]）；
-- 三项都**逐控制步**结算，按四足 mean（不是 sum）—— 与 `air_time`/`foot_lift` 同口径，
+- `tactile_stance ∈ [−w, 2w]`（`area+margin−jump` 每足 ∈ [−1, 2]，再乘前进门控 ∈[0,1]）——
+  **不是纯正奖励**：CoP 跳变打满且面积/margin 很小的一帧可以为负；
+- `tactile_slip ∈ [w, 0]`（w 为负；`clip(Δ/slip_ref,0,1)` 在单步位移 ≥ `slip_ref` 时饱和；
+  `slip_ref=0.005` m 是「站稳时单步抖动」量级，实测支撑相 mm 级滑移会接近 0.5–1.0 归一化）；
+- 四项都**逐控制步**结算，按四足 mean（不是 sum）—— 与 `air_time`/`foot_lift` 同口径，
   避免「脚数多就分多」的偏差。
 
 参考量级来自论文与本仓探针：`F̄` 峰值 ≈0.8 体重（6cm 台阶、站立/小步），`Ā` 峰值 ≈0.16
 （足底面积占比），所以默认把 impact 参考取 3.0 体重、stance 目标取 0.60 —— 训练初期
 这些项应当**接近 0/小正**，一旦频繁打满说明阈值离当前行为太远（先标定再开大）。
+
+**为什么 stance 必须门控 + 滑移要单独罚**（`l1_st` 的教训，`doc/introduce_tactile.md` §8.3）：
+
+- `tactile_stance` 按**帧**结算。不支持前进时，原地蹲低就能拿满（面积大、margin 大、CoP 稳），
+  而 `command_follow` 在**零指令通道**还会白给正项（`cmd.vy==0`/`cmd.wz==0` 时误差恒 ≈0 ⇒
+  `track_shape` 满额）⇒ 「蹲稳不动」总回报超过真正爬楼。门控用机身系前向速度
+  `vx_fwd = max(0, base_lin_vel_body[0])`，`stance_min_vx>0` 时按 `min(1, vx_fwd/stance_min_vx)`
+  线性打折，**必须同时看 `mean_distance`**（否则短促摆动也可能骗过瞬时门控）。
+- `cop_jump`/`margin` 是**压强分布**的平滑性/裕度，**不是足端滑移**。要罚「支撑相足端在地上滑」
+  必须用 `tactile_slip`（足端位移）；实测 `l1_st` 的 `cop_jump` 反降而 slip 反升，说明两者
+  不可互替。
+- 与 `follow_zero_baseline` 配套：打开后，零指令通道（`|vy_cmd| < zero_cmd_eps_vy`、
+  `|wz_cmd| < zero_cmd_eps_wz`）的跟踪项扣 1（不再白给）。**必须用死区**——`cmd_body` 含
+  `command_wander_std` 的 OU 扰动与楼梯引导注入，楼梯级几乎恒非 0，`== 0.0` 判据永不触发。
 
 ⚠ 与既有 contact 组（`foot_scuff`/`foot_impact`/`load_share`/`com_margin`）不要同时开同类项：
 那四项按「接触事件」直接罚/奖（已否决、默认关），本组按「相位」结构化结算，同时开会

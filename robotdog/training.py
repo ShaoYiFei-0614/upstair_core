@@ -502,6 +502,82 @@ class RunDir:
         return Path(str(base) + ".zip"), save_vecnormalize(model, base)
 
 
+def warm_select_stages(n_stages: int) -> list[int]:
+    """需要为「下一级」挑 warm-start 的级序号（**1-based**）：除最后一级外的所有级。
+
+    训练循环用 ``enumerate(stages, start=1)``；第 i 级训完才为第 i+1 级选起点，
+    所以可选的 i 是 ``1..n_stages-1``。最后一级之后没有下一级，**既不回放也不写
+    ``warm_select``**（否则 Trace 里会出现一条从未发生的选取，复盘时被当成事实）。
+    ``n_stages <= 1`` 时返回空列表（单级训练没有「下一级」可选）。
+    """
+    return list(range(1, max(int(n_stages), 1)))
+
+
+def replay_success_rate(
+    model_path: str | Path,
+    *,
+    cfg: EnvConfig | None = None,
+    stair: StairSpec | None = None,
+    episodes: int = 40,
+    seed: int = 0,
+    device: str = "cpu",
+) -> dict[str, float]:
+    """确定性回放 ``episodes`` 个回合，统计成功率/摔倒率/平均步数/平均前进。
+
+    训练循环里「同级多个 checkpoint 挑最优起点」用（chain 复刻的 warm-start
+    选取规则，见 ``doc/introduce_tactile.md`` §9）。走 ``load_policy`` 的同一套
+    恢复路径（配置、网络结构、观测归一化），不另搭评估管线。
+
+    口径与 ``play.py --mode eval --sampled-command`` 一致：不钉指令，沿用
+    ``reset()`` 采样的指令流；策略确定性；回合上限 = episode_length_s / control_dt。
+    """
+    from robotdog.env import Go2StairsEnv
+    from robotdog.policy import env_config_for_model, stair_from_height
+
+    ckpt = Path(model_path)
+    env_cfg = cfg or env_config_for_model(ckpt)
+    spec = stair if stair is not None else stair_from_height(0.0)
+    model, norm = load_policy(ckpt, cfg=env_cfg, stair=spec, device=device)
+    env = Go2StairsEnv(stair=spec, cfg=env_cfg, seed=int(seed))
+    max_steps = int(env_cfg.episode_length_s / env_cfg.control_dt)
+    n_eps = max(1, int(episodes))
+    succ = fall = 0
+    total_steps = 0
+    total_dist = 0.0
+    try:
+        for ep in range(n_eps):
+            obs, _ = env.reset(seed=int(seed) + ep)
+            x0 = float(env.base_pos[0])
+            done = trunc = False
+            n = 0
+            info: dict = {}
+            while not (done or trunc) and n < max_steps:
+                x = obs if norm is None else norm.normalize(obs)
+                action, _ = model.predict(x, deterministic=True)
+                obs, _r, done, trunc, info = env.step(action)
+                n += 1
+            ok = bool(info.get("is_success", False))
+            succ += int(ok)
+            fall += int(bool(done) and not ok)
+            total_steps += n
+            total_dist += float(env.base_pos[0]) - x0
+    finally:
+        env.close()
+        # ``load_policy`` 内部建了一个 VecEnv 并挂在 model 上；不关会**每候选泄漏
+        # 一个**（16 级 × ~25 候选 × 100 回合可到 OOM，而 OOM 会伪装成 MJCF
+        # 编译失败 —— experience.md 已记过两次同类事故）。
+        try:
+            model.get_env().close()
+        except Exception:  # pragma: no cover - 防御：老 checkpoint 可能没有 env
+            pass
+    return {
+        "episodes": float(n_eps),
+        "success_rate": succ / n_eps,
+        "fall_rate": fall / n_eps,
+        "mean_steps": total_steps / n_eps,
+        "mean_distance": total_dist / n_eps,
+    }
+
 # --------------------------------------------------------------------------- #
 # 报表辅助
 # --------------------------------------------------------------------------- #
@@ -516,6 +592,8 @@ __all__ = [
     "make_vec_env",
     "resolve_vec_env",
     "policy_state_dict",
+    "replay_success_rate",
+    "warm_select_stages",
     "restore_vecnormalize",
     "restore_vecnormalize_compat",
     "save_vecnormalize",
