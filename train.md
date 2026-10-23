@@ -2254,3 +2254,72 @@ R2 500k/60 回合）。用户选定诊断：**R2 配置 + R2 协议，从 R1 的
 `.tmp/tune2/eval_energy/{l1_all,l0_v2,l1_pl_v2,l1_st_v2}/`、`.tmp/seeds3/eval/l1_all_v3r1/`；
 汇总 `.tmp/final_tables.md`（`.tmp/_agg_final4.py`，五臂）；18×30 **每臂 10 回合**视频
 `runs/<arm>/videos/final4_ep10/stair18_18cm/stair18_18cm.mp4`（渲染配置 `.tmp/render18_30.yaml`）。
+
+---
+
+## l1_all_v3r1_ext1 — 15cm 起续训（+50% 预算）：把 15–18cm 推到 96%，19.5cm 只到 72%（2026-10-23，**已完成**）
+
+**动机**：v3r1 的 15–19.5cm 训练窗口只有 84/80/78/58%，怀疑是**预算不足**。做法：从
+`runs/l1_all_v3r1/checkpoints/stair15/stair15_1200000_steps.zip`（v3r1 的 15cm 级末权重）
+续训 4 级 `[15,16.5,18,19.5]cm`、每级 **1.8M**（+50%）、LR 7e-5、tread 0.30、obs 53、
+其余配方/协议与 v3r1 相同（promote 0.96 / 500k / 60）；配置 `.tmp/ext1/l1_all_v3r1_ext1.yaml`。
+
+**训练**（job `pwsh-d8e30790101e4914`，exit 0；日志 `.tmp/ext1/train.log`；76.7 min /
+实际 4,895,920 步 / 3-of-4 提前达标）：
+
+| 级 | v3r1 窗口 | **ext1 窗口** | ext1 实际步数 | 提前达标 | 用时 |
+| --- | --- | --- | --- | --- | --- |
+| 15.0cm | 84% | **96%** | 892,584 | ✓ | 14.5 min |
+| 16.5cm | 80% | **96%** | 784,800 | ✓ | 12.9 min |
+| 18.0cm | 78% | **96%** | 1,418,344 | ✓ | 22.2 min |
+| 19.5cm | 58% | **72%** | 1,800,192 | —（跑满） | 27.1 min |
+
+**评测**（`eval_arms_energy.py --runs runs/l1_all_v3r1_ext1 --episodes 40`；矩阵
+`.tmp/seeds3/eval/l1_all_v3r1_ext1/matrix.json/matrix.json`）：主口径 18cm×30cm 成功率
+**92.5%**（v3r1 72.5%）、爬升台阶 6.88（6.17）、爬升速度 0.160 m/s（0.151）、能耗/级
+265.7 J（245.0）、棱边踩踏 0.57%（1.33%）、滑移 1.4 mm/s（1.6）、俯仰/横滚峰峰
+0.706/0.646 rad（0.847/0.664）⇒ **更快更稳**，但更费电、冲击略升（0.78 vs 0.75 BW）。
+9 格平均成功率 **38.1%**（29.7%），被 21cm 三格拉低：21/25 7.5%（v3r1 10.0）、
+21/30 **5.0%（30.0）**、21/40 0%；逐格：15/25 87.5（27.5）、15/30 95.0（82.5）、
+15/40 45.0（30.0）、18/25 7.5（5.0）、18/30 92.5（72.5）、18/40 2.5（10.0）
+⇒ **续训没有抬高能力带**。
+
+**checkpoint 口径与遗忘（重要）**：上面 18cm 数字取自 `stair18_final`
+（`eval_arms_energy` 的 auto 规则：15→`stair15_final`、18→`stair18_final`、21→`model_final`）。
+ext1 的 `model_final`（19.5cm 跑满后的末权重）在 18×30 只有 **42.5%**
+（`play.py --mode eval --stage stair18 --sampled-command --config .tmp/render18_30.yaml`，
+40 回合：42.5% / 摔 57.5%）；`stair18_final` 同协议 **90.0%**（矩阵 92.5%）
+⇒ **最后一级跑满 1.8M 对 18cm 明显遗忘**，部署/演示必须按高度选 stage checkpoint。
+
+**视频**（18×30、10 回合、`--video-scale 1`、`.tmp/render18_30.yaml`）：
+`runs/l1_all_v3r1_ext1/videos/final4_ep10/stair18_18cm/stair18_18cm.mp4`（`model_final`，
+19.98MB，10 回合 4 成功/6 摔 —— 反映遗忘）与 `.../videos/ep10_stage18/stair18_18cm/
+stair18_18cm.mp4`（`stair18_final`，27.3MB，**10/10 成功**）；日志
+`.tmp/render10_ext1{,_stage18}.log`。
+
+**结论**：① 15/16.5/18cm 的「预算不足」假设**成立**（+50% 把窗口 84/80/78 推到 96%，
+主口径 72.5%→92.5%，姿态/棱边/滑移同向改善）；② 19.5cm 跑满也只到 72% ⇒ 该高度是真正的
+难点，不是预算问题；③ 21cm 泛化未改善（甚至更差）⇒ 需要课程/奖励层面改动；
+④ **按高度取 checkpoint 是必须的**（`model_final` 的 18cm 只有 42.5%）。
+
+**产物**：`runs/l1_all_v3r1_ext1/`（4 级 ckpt + final + plan/summary）；配置
+`.tmp/ext1/l1_all_v3r1_ext1.yaml`；日志 `.tmp/ext1/train.log`、`.tmp/ext1/eval.log`；
+矩阵 `.tmp/seeds3/eval/l1_all_v3r1_ext1/matrix.json/`；六臂汇总 `.tmp/final_tables.md`
+（`.tmp/_agg_final4.py` 已加 ext1 列）；`doc/introduce_tactile.md` 增 §6.1 与 ext1 视频。
+
+### 可视化对比（18cm × 30cm，10 回合/臂，2026-10-23）
+
+按同一渲染配置（`.tmp/render18_30.yaml`、`episodes_video=10`、`--sampled-command`、
+`--video-scale 1`）出片 7 条，`scripts/frames.py --coarse 12` 粗切片后由 5 个 fresh 子代理
+**盲评**（不看日志/文档）：
+
+- 视频 10 回合成功数：`l1_st_v2` 10/10、`l1_pl_v2` 9/10、`l1_all_v3r1` 9/10、`l0_v2` 8/10、
+  `l1_all`（R1）**0/10**、`ext1` `model_final` **4/10**、`ext1` `stair18_final` **10/10**。
+- 盲评：`ext1_stage18` **7.5/10 通过**；`l1_st_v2` 可疑偏通过（4/5 帧半跨唇口）；
+  `l1_all_v3r1` 6.9/10 可疑偏通过（回合 9 仅 3.2s 疑早停）；`ext1_final` 6.0/10 可疑
+  （3 登顶/3 低段塌陷）；`l1_all`（R1）**失败**（可见 6 回合全摔、0 登顶、抬腿不足+压唇口）。
+- 与数值互证：R1 的 `model_final` 失败 = 末级遗忘的视觉版；`stair18_final` 通过而
+  `model_final` 塌陷 ⇒ 部署必须按高度选 checkpoint；`st_v2/pl_v2/l0_v2/v3r1` 视觉差异在
+  姿态代价而非能否登顶。
+- 口径坑：HUD 是**回合级快照**（首帧即终局值）；12 帧对 10 回合必然漏 3–4 个回合；
+  768×432 下接触类判据不可判，成功率只能读 40 回合评测。详见 `doc/introduce_tactile.md` §9。
