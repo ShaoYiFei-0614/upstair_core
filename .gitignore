@@ -2,7 +2,6 @@
 .venv/
 runs/
 logs/
-configs/
 .generated/
 .tmp/
 
