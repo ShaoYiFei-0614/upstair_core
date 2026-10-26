@@ -56,7 +56,12 @@ from robotdog.curriculum import (  # noqa: E402
     write_summary,
 )
 from robotdog.env import EnvConfig  # noqa: E402
-from robotdog.policy import env_json_path, observation_dim, save_env_json  # noqa: E402
+from robotdog.policy import (  # noqa: E402
+    env_config_for_model,
+    env_json_path,
+    observation_dim,
+    save_env_json,
+)
 from robotdog.tools import console  # noqa: E402
 from robotdog.training import (  # noqa: E402
     RunDir,
@@ -375,7 +380,10 @@ class Trainer:
         t0 = time.time()
         model.learn(total_timesteps=stage.timesteps, callback=callbacks,
                     reset_num_timesteps=True)
-        sps = stage.timesteps / max(1e-6, time.time() - t0)
+        # sps 用**实际**训练步数：提前达标时 stage.timesteps 是预算而不是实跑步数，
+        # 用它会把吞吐高报 1.2~1.6 倍（summary.json 会照抄）。
+        trained_steps = int(getattr(model, "num_timesteps", stage.timesteps))
+        sps = trained_steps / max(1e-6, time.time() - t0)
 
         # 阶段产物：checkpoints/<阶段>_final.{zip,pkl,env.json}
         target = self.rundir.checkpoints / f"{stage.name}_final"
@@ -493,10 +501,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[观测] 每帧 {cfg.obs.frame_size} 维 × history {cfg.obs.history_len} "
           f"= {cfg.obs.size} 维")
     if cfg.obs.privileged_frame_size > 0:
-        # 非对称 AC：actor 的输入维数不含特权块（足端-地形接触只给 critic）。
+        # 非对称 AC：actor 的输入维数不含特权块（特权信息只给 critic）。
+        # 标签必须按实际开关拼：只有 privileged_foot_contact 才是「足端接触」，
+        # 隐式臂多的是 8 维估计块（|F|/mg + 面积），写错会让人按日志误判臂身份。
+        labels = []
+        if cfg.obs.privileged_foot_contact:
+            labels.append("足端接触(4)")
+        if cfg.obs.privileged_tactile:
+            labels.append("真值触觉 4x(F,A,CoP)(16)")
+        if cfg.obs.privileged_tactile_est:
+            labels.append("估计触觉 4x(|F|/mg,A)(8)")
         print(f"[观测] 非对称 AC: actor {cfg.obs.actor_size} 维 / critic "
               f"{cfg.obs.size} 维（critic 多 "
-              f"{cfg.obs.privileged_frame_size * cfg.obs.history_len} 维特权：足端-地形接触）")
+              f"{cfg.obs.privileged_frame_size * cfg.obs.history_len} 维特权："
+              f"{'+'.join(labels) or '未知'}）")
     if cfg.action_mode == "gait_params":
         print(f"[动作] gait_params 模式（12 维步态参数：前/后对各 amp_th/amp_ca/"
               f"off_th/off_ca/hip_amp/hip_off → sin 结构 + trot 相位）"
@@ -543,6 +561,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     results = []
     promotions: list[dict[str, Any]] = []
     warm: str | None = getattr(args, "warm_start", None)
+    # 外部起点必须留痕：否则「同配方从零再跑一遍」与「从某臂终点续训」在 Trace
+    # 里长得一模一样（评审 B2）。只在第 1 级生效（train_stage 的 warm 分支）。
+    external_warm = str(warm) if warm else None
     if warm:
         print(f"[课程] 第一级从外部 checkpoint 继承权重: {warm}", flush=True)
     t_start = time.time()
@@ -554,7 +575,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                                    "tread": float(stage.spec.tread),
                                    "learning_rate": float(stage.learning_rate),
                                    "budget_steps": int(stage.timesteps),
-                                   "warm_start": str(warm) if warm else None})
+                                   "warm_start": str(warm) if warm else None,
+                                   "start_mode": ("warm" if (i == 1 and external_warm)
+                                                  else ("scratch" if i == 1 else "chain")),
+                                   "external_warm": external_warm if i == 1 else None,
+                                   "warm_norm": str(getattr(args, "warm_norm", "auto"))})
+        warm_in = warm  # 本级「进来的」策略：warm-select 的基线（评审 B4）
         venv = trainer.make_env(stage, warm_start=warm)
         t0 = time.time()
         try:
@@ -599,25 +625,67 @@ def main(argv: Sequence[str] | None = None) -> int:
                      if (_steps_of(c) is None or _steps_of(c) >= floor_steps)]
             if path.is_file():
                 cands.append(path)
+            # 候选回放必须**同口径**：中间 checkpoint 的 _env.json 写的是本级
+            # live_cfg（随机指令量程），<阶段>_final_env.json 写的是基线（vx 固定），
+            # 直接读各自 env.json 会让「从中间取」被指令难度静默偏置。
+            # ⇒ 统一用本级 target 量程构造 replay cfg（所有候选同一分布）。
+            replay_cfg = copy.deepcopy(cfg)
+            replay_cfg.command.vx_min = float(stage.command_vx[0])
+            replay_cfg.command.vx_max = float(stage.command_vx[1])
+            replay_cfg.command.vy_max = float(stage.command_vy_max)
+            replay_cfg.command.yaw_max = float(stage.command_yaw_max)
+            # 候选之间只有相对排名，没有绝对参照：本级「进来的」策略若是同一观测
+            # 口径就回放一份基线，选中的 checkpoint 反而更差时记 degraded（评审 B4）。
+            baseline: dict[str, float] | None = None
+            baseline_note: str | None = None
+            if warm_in:
+                try:
+                    in_dim = int(env_config_for_model(Path(warm_in)).obs.size)
+                except Exception as exc:  # pragma: no cover - 老 checkpoint 可能没有 env.json
+                    in_dim, baseline_note = -1, f"env_json_error: {exc}"
+                if in_dim >= 0 and in_dim != int(replay_cfg.obs.size):
+                    baseline_note = f"obs_dim_mismatch {in_dim}->{replay_cfg.obs.size}"
+                elif in_dim >= 0:
+                    baseline = replay_success_rate(warm_in, cfg=replay_cfg,
+                                                   stair=stage.spec,
+                                                   episodes=select_episodes)
+                    print(f"    [warm-select] 起点基线 {Path(warm_in).name}: "
+                          f"成功率={baseline['success_rate']:.1%} "
+                          f"摔倒={baseline['fall_rate']:.1%} "
+                          f"步数={baseline['mean_steps']:.0f}", flush=True)
             ranked: list[tuple[float, float, Path, dict[str, float]]] = []
             for cand in cands:
-                m = replay_success_rate(cand, stair=stage.spec,
+                m = replay_success_rate(cand, cfg=replay_cfg, stair=stage.spec,
                                         episodes=select_episodes)
                 ranked.append((m["success_rate"], -m["mean_steps"], cand, m))
                 print(f"    [warm-select] {cand.name}: "
                       f"成功率={m['success_rate']:.1%} 摔倒={m['fall_rate']:.1%} "
                       f"步数={m['mean_steps']:.0f} 前进={m['mean_distance']:.2f}m",
                       flush=True)
+            chosen_succ = 0.0
             if ranked:
                 ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
                 warm = str(ranked[0][2])
+                chosen_succ = float(ranked[0][0])
                 print(f"    [warm-select] 选用 {ranked[0][2].name} 作为下一级起点",
                       flush=True)
         if selected := (warm if select_warm_start and i in selectable else None):
+            degraded = bool(baseline is not None
+                            and float(baseline["success_rate"]) > 0.0
+                            and float(baseline["success_rate"]) - 0.2 > chosen_succ)
+            if degraded:
+                print(f"    [warm-select] 警告: 选中 checkpoint 比起点基线低 "
+                      f"{float(baseline['success_rate']) - chosen_succ:.1%}",
+                      flush=True)
             _append_run_trace(rundir, {"event": "warm_select", "stage": stage.name,
                                        "chosen": str(selected),
                                        "rule": "success desc, mean_steps asc",
-                                       "episodes": int(select_episodes)})
+                                       "episodes": int(select_episodes),
+                                       "baseline": baseline,
+                                       "baseline_path": str(warm_in) if warm_in else None,
+                                       "baseline_note": baseline_note,
+                                       "chosen_success": chosen_succ,
+                                       "degraded": degraded})
         _append_run_trace(rundir, {
             "event": "stage_end", "stage": stage.name,
             "step_height": float(stage.spec.step_height),

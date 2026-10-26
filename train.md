@@ -2323,3 +2323,75 @@ stair18_18cm.mp4`（`stair18_final`，27.3MB，**10/10 成功**）；日志
   姿态代价而非能否登顶。
 - 口径坑：HUD 是**回合级快照**（首帧即终局值）；12 帧对 10 回合必然漏 3–4 个回合；
   768×432 下接触类判据不可判，成功率只能读 40 回合评测。详见 `doc/introduce_tactile.md` §9。
+
+## level2_priv — critic 特权触觉：显式 vs 隐式（7 臂，16 级 R2 课程）（2026-10-24，**已完成**）
+
+> 汇总数据表（训练成本 / 9 格平均 / 18×30 主口径 / 姿态与接触指标 24 项）与最终对比结论已写入 `doc/introduce_tactile.md` §13（2026-10-25）。
+
+**问题**：① 训练期把真值足底触觉（接触状态/合力/面积/CoP）只喂 critic，是否让爬楼策略更强
+（Level2 显式）？② 只用 GRU 在线估计的合力+面积（8 维，Level2 隐式）能否替代真值、差多少？
+设计见 `doc/introduce_tactile_level2.md`。
+
+**7 臂**（actor 恒 53 维，只有 critic 宽度变）：
+- `l2_l0`（critic 53）/ `l2_e0`（73，显式块 20 维）/ `l2_i0`（61，隐式块 8 维）：**从零**训练；
+- `l2_l1off`（53，L0 奖励 + 无块）/ `l2_l1all`（53，L1 三相位奖励）/
+  `l2_e1`（73）/ `l2_i1`（61）：**从 `runs/l2_l0/model_final.zip` warm start**，
+  同一 16 级课程、同 flags（`--promote-rate 0.96 --promote-min-steps 500000 --promote-min-episodes 40`
+  `--select-warm-start --select-episodes 10 --warm-norm auto`）。
+- 隐式块 = numpy 手写 3×128 GRU 前向（`robotdog/tactile_estimate_obs.py`，权重
+  `artifacts/tactile_est_C3c_s0.npz` 由 `scripts/export_tactile_estimator.py` 从 v7 .pt 导出），
+  输入 actor 53 帧 + 12 维执行器力矩，输出 4×(|F_res|/mg)+4×Ā；stride=2（25 Hz）。
+  对拍 torch 最大差 4.2e-7；关键坑：torch GRU 的 n 门偏置在 r 门**里面**
+  （`n=tanh(W_in x+b_in + r⊙(W_hn h+b_hn))`），先把 b_ih+b_hh 融合会系统性偏 0.1。
+
+**门禁**（`robotdog/policy.py:108-112` 的 estimator dict 重建是曾致命 bug，必须保留为回归项）：
+L0–L4 PASS、L5 **SUSPECT**（12cm 楼梯 F̄ corr 0.685/MAE 0.179；摆动相 Ā 恒 ≈0.21 而真值 0
+⇒ 隐式块无接触相位）。2 轮 fresh 独立评审：第 1 轮 9 条 blocker 全修后第 2 轮 PASS。
+
+**成本**（串行，8 SubprocVecEnv）：l0 11.56M 步/130.5min/1476 SPS；l1off 9.11M/100.7/1508；
+l1all 9.63M/133.5/1202；e0 10.39M/144.2/1201；i0 10.08M/176.2/**954**；e1 8.68M/118.9/1217；
+i1 9.54M/188.2/**845**。全部 16 级、45 次 warm-select 无退化选点。合计 ≈16.6h + 评估 98min。
+隐式臂 SPS −35%（numpy GRU 每 2 步前向），属实现成本不入算法对比。
+
+**9 格（15/18/21cm × 25/30/40cm，40 回合/格；两 seed 合并 80 格均值）**：
+
+| 臂 | 9 格均值 | 95%CI | 18×30 | 摔倒率 | impact_mean |
+|---|---|---|---|---|---|
+| l2_l0 | 61.1% | [57.5,64.6] | 100% | 35.3% | 0.78 |
+| l2_l1off | 59.0% | [55.4,62.6] | 97.5% | 40.0% | 0.76 |
+| l2_l1all | 59.0% | [55.4,62.6] | 100% | 38.1% | 0.76 |
+| l2_e0 | 46.7% | [43.0,50.3] | 92.5% | 50.0% | 0.72 |
+| l2_i0 | 53.1% | [49.4,56.7] | 90% | 45.0% | 0.73 |
+| l2_e1 | 60.0% | [56.4,63.5] | 100% | 39.7% | 0.79 |
+| l2_i1 | **67.9%** | [64.4,71.2] | 97.5% | **31.9%** | 0.78 |
+
+**四个结论**（全部 n=1 训练种子，只报方向）：
+1. **从零加特权触觉是负收益**：显式 −14.4pp、隐式 −8.1pp（摔倒率 50.0/45.0 vs L0 35.3），
+   两臂课程都走完、提前发车不少 ⇒ 不是训不动，是策略对 25/40cm 等非常规踏面更脆。
+2. **L1 三相位奖励从零训不进楼梯**：stair3 满 1.2M 步窗口 0.00、6/6 候选 checkpoint 全 0%，
+   与历史 `runs/l1_all_v2` 同型（2 次复现、同 seed）。改从 L0 终点 warm start 后正常收敛；
+   同起点下 L1 奖励本身对 9 格均值 **+0.0pp**（18×30 +2.5，5/9 格更好）。
+3. **L1 存在时隐式块方向最好**：i1 67.9% / 摔倒率 31.9%，比同起点对照 +8.9pp；
+   但逐格 4 好 3 坏 2 平、增益由 15cm/40cm(+56.2) 与 18cm/40cm(+75.0) 两格驱动，
+   18cm/25cm 反而 −37.5 ⇒ 能力重分布，不能写成普遍提升。
+4. **显式块在 L1 上中性**（+1.0pp，5/9 好，摔倒率 39.7≈40.0%）；显式−隐式 @L1 −7.9pp，
+   但两者信息量（20 vs 8 维）、力语义（F_normal vs |F_res|）、Ā 语义、归一化状态都不同，
+   不能当「编码方式」结论。
+
+**坑与口径**：① 训练期 50 回合滑窗 ≠ 评估成功率，排序也不一致（l1off stair19_5 窗口 0.96
+但 18cm/40cm 0%）；② `--promote-min-steps 500000` 是**本级**步数，flat 四级预算
+250/400/400/400k 全部被锁死、warm 臂各多付 ≈1.45M 步；③ warm 臂 `stage_end.success_rate` 与
+从零臂不可比（obs_rms count 11.14M、ret_rms var 1.54e7，新增特权维 1.2M 步内几乎不归一化）；
+④ 评估 seed 0 vs 1 只改 63 格中 15 格成功率 ⇒ 评估噪声小，臂间差异是策略属性；
+⑤ `scripts/frames.py` 的 fNNN caption 压住 HUD 前 3 行，导致一个盲评只能判 INSUFFICIENT。
+
+**视觉 + Trace 盲评**（18cm×30cm 10 回合，4 fresh 子代理）：i1 CONSISTENT、l1off CONSISTENT、
+l0 CONSISTENT、e1 INSUFFICIENT（HUD 被 caption 遮挡）；**无 CONFLICT**。
+
+**产物**：`runs/l2_*/`（7 臂 ckpt/plan/summary/trace + review18 视频）；
+`.tmp/level2/{configs,gate_l0_l2.py,monitor_arm.py,stat_line.py,summarize.py,baseline_l0final.py}`；
+矩阵 `.tmp/level2/eval_matrix{,_seed1}/matrix.json`；报告 `.tmp/level2/trace_report.md` +
+`trace_summary.json`；agent trace `.tmp/trace/level2_priv_tactile.jsonl`；
+设计 `doc/introduce_tactile_level2.md`。**未做**：第二个训练 seed（4 关键臂约 10–14h）——
+这是把「隐式 +8.9pp」从方向升级为结论的唯一门槛。
+

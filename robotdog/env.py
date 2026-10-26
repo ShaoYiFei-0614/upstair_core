@@ -36,12 +36,14 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import gymnasium as gym
 import mujoco
 import numpy as np
 from gymnasium import spaces
 
+from robotdog import paths
 from robotdog.gait import GaitParams
 from robotdog.reward import (
     RewardConfig,
@@ -58,6 +60,11 @@ from robotdog.go2_model import (
     quat_to_rpy,
 )
 from robotdog.tactile import TactileConfig, TactileSensor, TactileState
+from robotdog.tactile_estimate_obs import (
+    EST_BLOCK_SIZE,
+    EstimateObsConfig,
+    TactileEstimateObserver,
+)
 
 from robotdog.tools.terrain import StairSpec, build_terrain_xml
 
@@ -97,6 +104,12 @@ class ObsConfig:
     tactile: bool = False
     # 16：同一份触觉特征**只给 critic**（非对称 AC）——用于「接触信息该给谁」的消融。
     privileged_tactile: bool = False
+    # 8：**估计出来的**触觉块，只给 critic（Level2「隐式」臂）：
+    # 4 足 |F|/mg + 4 足 Ā，来自 robotdog/tactile_estimate_obs.py 在线的 GRU 前向
+    # （输入 = actor 帧 + 12 维执行器力矩，即真机可得的量，不读地形真值）。
+    # 与上面 16 维显式块的信息缺口：没有接触 0/1、没有 CoP，且是估计值不是测量值。
+    # 打开时 EnvConfig.estimator.enabled 必须为 true（构造期校验）。
+    privileged_tactile_est: bool = False
     base_frame_size: int = 42
 
     def __post_init__(self) -> None:
@@ -120,13 +133,15 @@ class ObsConfig:
         extra += 16 if self.tactile else 0
         extra += 4 if self.privileged_foot_contact else 0
         extra += 16 if self.privileged_tactile else 0
+        extra += EST_BLOCK_SIZE if self.privileged_tactile_est else 0
         return self.base_frame_size + extra
 
     @property
     def privileged_frame_size(self) -> int:
-        """每帧**只给 critic** 的特权维数（足端接触 4 + 特权触觉 16；关时为 0）。"""
+        """每帧**只给 critic** 的特权维数（接触 4 + 显式触觉 16 + 隐式估计 8）。"""
         return ((4 if self.privileged_foot_contact else 0)
-                + (16 if self.privileged_tactile else 0))
+                + (16 if self.privileged_tactile else 0)
+                + (EST_BLOCK_SIZE if self.privileged_tactile_est else 0))
 
     @property
     def actor_frame_size(self) -> int:
@@ -355,6 +370,13 @@ class EnvConfig:
     # 并由 ``robotdog/tactile.py`` 维护 F̄/Ā/CoP 与四相位状态机。
     tactile: TactileConfig = field(default_factory=TactileConfig)
 
+    # --- 隐式触觉估计（Level2「隐式」臂，2026-10-23） --------------------- #
+    # 默认 ``enabled=False``：不构造估计器、不做任何前向，热路径逐位不变。
+    # 打开后每控制步多一次 3×128×20 的滑窗 GRU 前向（numpy，约 1 ms/步；
+    # ``stride=2`` 减半）。产出的 8 维块**只给 critic**（见
+    # ObsConfig.privileged_tactile_est），actor 的输入维数不变。
+    estimator: EstimateObsConfig = field(default_factory=EstimateObsConfig)
+
     # --- 观测 / 奖励 ------------------------------------------------------- #
     obs: ObsConfig = field(default_factory=ObsConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
@@ -496,6 +518,27 @@ class Go2StairsEnv(gym.Env):
         self._tactile_sensor = TactileSensor(self.cfg.tactile, self.model,
                                              self.data, self.meta)
         self._tactile = TactileState(nfoot)
+        # 隐式触觉估计器（Level2「隐式」臂）：权重来自 .npz，numpy 前向；
+        # 只有 cfg.estimator.enabled 时才构造（导入 torch 的路径完全不碰）。
+        self._est_obs: TactileEstimateObserver | None = None
+        self._est_block = np.zeros(EST_BLOCK_SIZE, dtype=np.float64)
+        self._est_actor_width = int(self.cfg.obs.actor_frame_size)
+        if self.cfg.estimator.enabled:
+            est_path = Path(str(self.cfg.estimator.path))
+            if not est_path.is_absolute():
+                est_path = paths.WORKSPACE / est_path   # 与 gait_file 同口径：相对仓根
+            self._est_obs = TactileEstimateObserver.from_npz(
+                est_path,
+                n_actor=self._est_actor_width,
+                stride=self.cfg.estimator.stride,
+            )
+            ref = float(self.cfg.estimator.force_ref_n)
+            if abs(ref - float(self._est_obs.force_ref_n)) > 1e-6:
+                raise ValueError(
+                    f"env.estimator.force_ref_n={ref} 与 checkpoint 里的 "
+                    f"{self._est_obs.force_ref_n} 不一致 —— 归一化尺度不同会让块"
+                    "的量纲失真（.npz 里存了训练时的值，一般不必手改）。"
+                )
         # 步态先验时钟（自回合开始起的秒数）+ gait_params 模式的步态时钟（周期数）。
         self._gait_t = 0.0
         self._gait_phase = 0.0
@@ -937,6 +980,10 @@ class Go2StairsEnv(gym.Env):
             # 特权触觉块（仅 critic）：与 actor 触觉同一份特征，用于消融「接触
             # 信息给 actor 还是只给 critic」。同样由 actor_index 切掉。
             parts.append(self.tactile.actor_features())
+        if obs_cfg.privileged_tactile_est:
+            # 隐式块（仅 critic）：GRU 估计器输出的 4 足 |F|/mg + 4 足 Ā。
+            # 每步在 step()/reset() 里重算并写回 ``self._est_block``。
+            parts.append(self._est_block)
         return np.concatenate(parts).astype(np.float64)
 
     def _observation(self) -> np.ndarray:
@@ -965,6 +1012,18 @@ class Go2StairsEnv(gym.Env):
             raise ValueError(
                 "obs.tactile / obs.privileged_tactile 打开时必须同时打开 "
                 "env.tactile.enabled —— 否则观测块拿到的是全 0 的假触觉。"
+            )
+        est = self.cfg.estimator
+        if obs.privileged_tactile_est and not est.enabled:
+            raise ValueError(
+                "obs.privileged_tactile_est 打开时必须同时打开 env.estimator.enabled "
+                "并给 env.estimator.path —— 否则每帧末尾是 8 维全 0 的假估计块。"
+            )
+        if est.enabled and not obs.privileged_tactile_est:
+            raise ValueError(
+                "env.estimator.enabled 打开但 obs.privileged_tactile_est=False："
+                "估计器每步都要算一遍却没有任何消费者，等于白付 CPU；"
+                "请二选一（要隐式触觉臂就同时打开，否则关掉 estimator）。"
             )
         rc = self.cfg.reward
         if (float(rc.tactile_prelanding) != 0.0
@@ -1249,6 +1308,12 @@ class Go2StairsEnv(gym.Env):
         self.filtered_lateral_vel = float(self.base_lin_vel_body[1])
         self.filtered_yaw_rate = float(self.yaw_rate)
         frame = self._obs_frame()
+        if self._est_obs is not None:
+            # 估计器窗口用「首帧重复」填满（与 collect_tactile_data 的回合起点一致；
+            # 填零会让 GRU 看到远低于训练分布的输入，给出系统性偏置的初值）。
+            frame[-EST_BLOCK_SIZE:] = self._est_obs.reset(
+                frame[:self._est_actor_width], self.data.actuator_force.copy())
+            self._est_block = frame[-EST_BLOCK_SIZE:]
         for _ in range(self.cfg.obs.history_len):
             self._hist.append(frame.copy())
 
@@ -1575,7 +1640,15 @@ class Go2StairsEnv(gym.Env):
         # 足端 xy 位移必须恰好在一个控制步上测量，所以这个快照每一步都要
         # 推进。
         self._prev_foot_pos = self.foot_pos.copy()
-        self._hist.append(self._obs_frame())
+        frame = self._obs_frame()
+        if self._est_obs is not None:
+            # 隐式触觉块（仅 critic）：输入 = 本帧的 actor 部分 + 本步执行器力矩，
+            # 输出写回帧尾。窗口包含本帧，所以这一步的块含当前状态（stride=2 时
+            # 只在偶数步重算，奇数步沿用上一块）。
+            frame[-EST_BLOCK_SIZE:] = self._est_obs.update(
+                frame[:self._est_actor_width], self.data.actuator_force.copy())
+            self._est_block = frame[-EST_BLOCK_SIZE:]
+        self._hist.append(frame)
 
         info = {
             "reward_terms": terms,
